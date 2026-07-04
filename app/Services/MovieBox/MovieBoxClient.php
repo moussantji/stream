@@ -31,6 +31,8 @@ class MovieBoxClient
 
     protected string $clientInfo;
 
+    protected string $language;
+
     protected string $secretKey;
 
     protected int $tokenTtl;
@@ -73,6 +75,7 @@ class MovieBoxClient
         $this->proxy = $config['proxy'] ?? null;
         $this->userAgent = $config['user_agent'];
         $this->clientInfo = $config['client_info'];
+        $this->language = $config['language'] ?? 'en';
         $this->secretKey = $config['secret_key'];
         $this->tokenTtl = (int) $config['token_ttl'];
         $this->cacheTtl = (int) $config['cache_ttl'];
@@ -295,6 +298,7 @@ class MovieBoxClient
         $headers = [
             'User-Agent' => $this->userAgent,
             'Accept' => $accept,
+            'Accept-Language' => $this->language.'-'.strtoupper($this->language).','.$this->language.';q=0.9',
             'Content-Type' => $contentType,
             'Connection' => 'keep-alive',
             'X-Client-Token' => Signer::clientToken($ts),
