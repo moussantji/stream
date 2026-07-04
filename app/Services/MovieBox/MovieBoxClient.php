@@ -135,14 +135,27 @@ class MovieBoxClient
     /**
      * Downloadable / streamable video files (direct MP4 URLs, all resolutions,
      * paginated across episodes for series).
+     *
+     * For a series episode, pass $season/$episode so the API scopes the result
+     * to that episode instead of returning the full flat list of every episode
+     * (which otherwise pushes later seasons past the pagination window).
      */
-    public function resource(string $subjectId, int $resolution = 1080, int $page = 1, int $perPage = 20): array
-    {
-        return $this->getData(
-            self::RESOURCE,
-            ['subjectId' => $subjectId, 'resolution' => $resolution, 'page' => $page, 'perPage' => $perPage],
-            context: 'resource'
-        );
+    public function resource(
+        string $subjectId,
+        int $resolution = 1080,
+        int $page = 1,
+        int $perPage = 20,
+        ?int $season = null,
+        ?int $episode = null,
+    ): array {
+        $params = ['subjectId' => $subjectId, 'resolution' => $resolution, 'page' => $page, 'perPage' => $perPage];
+
+        if ($season !== null && $episode !== null && ! ($season === 0 && $episode === 0)) {
+            $params['se'] = $season;
+            $params['ep'] = $episode;
+        }
+
+        return $this->getData(self::RESOURCE, $params, context: 'resource');
     }
 
     /** External subtitle files for a specific resource (video file). */

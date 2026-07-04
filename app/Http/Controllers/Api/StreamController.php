@@ -73,13 +73,20 @@ class StreamController extends Controller
     protected function resolveVideoFiles(string $subjectId, int $season, int $episode, array &$diag): array
     {
         $isMovie = $season === 0 && $episode === 0;
-        $maxPages = $isMovie ? 1 : 6;
+        // For series: request more per page and scan deeper, because `resource`
+        // returns a flat list of every episode across all seasons. A tight cap
+        // would leave later seasons/episodes past the pagination window and
+        // surface as "no stream available" when switching seasons.
+        $perPage = $isMovie ? 20 : 60;
+        $maxPages = $isMovie ? 1 : 20;
         $matched = [];
         $page = 1;
 
         do {
             try {
-                $res = $this->client->resource($subjectId, 1080, $page, 20);
+                $res = $isMovie
+                    ? $this->client->resource($subjectId, 1080, $page, $perPage)
+                    : $this->client->resource($subjectId, 1080, $page, $perPage, $season, $episode);
             } catch (\Throwable $e) {
                 report($e);
                 $diag["resource_page_$page"] = ['ok' => false, 'error' => class_basename($e).': '.$e->getMessage()];
@@ -102,10 +109,20 @@ class StreamController extends Controller
             }
 
             foreach ($list as $it) {
-                if (is_array($it)
-                    && (int) ($it['se'] ?? -1) === $season
-                    && (int) ($it['ep'] ?? -1) === $episode
-                    && ! empty($it['resourceLink'])) {
+                if (! is_array($it) || empty($it['resourceLink'])) {
+                    continue;
+                }
+
+                // When the API honours the se/ep scoping it may return the
+                // episode's files without se/ep markers — accept those as-is.
+                $carriesSeEp = array_key_exists('se', $it) || array_key_exists('ep', $it);
+                if (! $carriesSeEp) {
+                    $matched[] = $it;
+
+                    continue;
+                }
+
+                if ((int) ($it['se'] ?? -1) === $season && (int) ($it['ep'] ?? -1) === $episode) {
                     $matched[] = $it;
                 }
             }
