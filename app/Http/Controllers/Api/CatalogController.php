@@ -216,6 +216,7 @@ class CatalogController extends Controller
         }
 
         $cast = is_array($detail) ? $this->normalizeCast($detail['staffList'] ?? []) : [];
+        $dubs = is_array($detail) ? $this->normalizeDubs($detail['dubs'] ?? []) : [];
 
         // No dedicated recommendation endpoint in the mobile API; surface a few
         // titles that share the primary genre instead.
@@ -238,10 +239,44 @@ class CatalogController extends Controller
                 'isSeries' => $isSeries || $seasons !== [],
                 'seasons' => $seasons,
                 'cast' => $cast,
+                'dubs' => $dubs,
                 'recommendations' => $recommendations,
                 'detailAvailable' => is_array($detail),
             ],
         ]);
+    }
+
+    /**
+     * Normalize the dub (audio-language) list. Each dub is a *separate*
+     * subjectId, so switching language means playing a different subject.
+     *
+     * @param  array<int,mixed>  $dubs
+     * @return array<int,array<string,mixed>>
+     */
+    protected function normalizeDubs(array $dubs): array
+    {
+        $out = [];
+        foreach ($dubs as $dub) {
+            if (! is_array($dub) || empty($dub['subjectId'])) {
+                continue;
+            }
+
+            $label = (string) ($dub['lanName'] ?? '');
+            if (stripos($label, 'original') === 0 || $label === '') {
+                $label = 'Original';
+            } else {
+                $label = trim(str_ireplace('dub', '', $label));
+            }
+
+            $out[] = [
+                'subjectId' => (string) $dub['subjectId'],
+                'label' => $label,
+                'code' => strtolower((string) ($dub['lanCode'] ?? '')),
+                'original' => (bool) ($dub['original'] ?? false),
+            ];
+        }
+
+        return $out;
     }
 
     /** Health probe for the MovieBox backend connection. */

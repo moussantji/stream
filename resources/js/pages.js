@@ -194,16 +194,42 @@ export async function detailPage(app, params) {
     });
 
     const firstSeason = seasons[0];
-    const playTarget = isSeries && firstSeason
-        ? watchHref(item, firstSeason.season, 1)
-        : watchHref(item);
+
+    // Audio versions (dubs). Each dub is a separate subjectId, so switching
+    // language means playing a different subject. Default to French if present.
+    const dubs = data.dubs || [];
+    const frenchDub = dubs.find((d) => (d.code || '').startsWith('fr') || /fran/i.test(d.label || ''));
+    let activeSubjectId = frenchDub ? frenchDub.subjectId : item.subjectId;
+    const currentItem = () => ({ ...item, subjectId: activeSubjectId });
+
+    const play = () => navigate(isSeries && firstSeason
+        ? watchHref(currentItem(), firstSeason.season, 1)
+        : watchHref(currentItem()));
+
+    let versionRow = null;
+    if (dubs.length > 1) {
+        const buttons = dubs.map((d) => el('button', {
+            class: `season-tab ${d.subjectId === activeSubjectId ? 'active' : ''}`,
+            text: d.label + (d.original ? ' (VO)' : ''),
+            onclick: (e) => {
+                activeSubjectId = d.subjectId;
+                versionRow.querySelectorAll('.season-tab').forEach((b) => b.classList.remove('active'));
+                e.target.classList.add('active');
+            },
+        }));
+        versionRow = el('div', { style: 'margin-bottom:16px' }, [
+            el('div', { class: 'section-title', style: 'font-size:15px;margin:0 0 8px', text: 'Version / Langue' }),
+            el('div', { class: 'season-tabs' }, buttons),
+        ]);
+    }
 
     const info = el('div', { class: 'detail-info' }, [
         el('h1', { class: 'detail-title', text: item.title }),
         el('div', { class: 'detail-meta' }, [el('span', { class: 'badge', text: item.typeLabel }), ...meta]),
         item.description ? el('p', { class: 'detail-desc', text: item.description }) : null,
+        versionRow,
         el('div', { class: 'detail-actions' }, [
-            el('button', { class: 'btn btn-primary', html: `${PLAY_SVG} <span>${isSeries ? 'Play S' + firstSeason?.season + ' E1' : 'Play'}</span>`, style: 'display:flex;gap:8px;align-items:center', onclick: () => navigate(playTarget) }),
+            el('button', { class: 'btn btn-primary', html: `${PLAY_SVG} <span>${isSeries ? 'Play S' + firstSeason?.season + ' E1' : 'Play'}</span>`, style: 'display:flex;gap:8px;align-items:center', onclick: play }),
             favBtn,
         ]),
     ]);
@@ -222,7 +248,7 @@ export async function detailPage(app, params) {
     // Seasons / episodes
     if (isSeries && seasons.length) {
         body.appendChild(el('h2', { class: 'section-title', text: 'Episodes' }));
-        body.appendChild(episodesBlock(item, seasons));
+        body.appendChild(episodesBlock(currentItem, seasons));
     }
 
     // Cast
@@ -242,7 +268,7 @@ export async function detailPage(app, params) {
     }
 }
 
-function episodesBlock(item, seasons) {
+function episodesBlock(getItem, seasons) {
     const wrap = el('div', { class: 'episodes' });
     const gridEl = el('div', { class: 'episode-grid' });
 
@@ -251,7 +277,7 @@ function episodesBlock(item, seasons) {
         season.episodes.forEach((ep) => {
             gridEl.appendChild(el('button', {
                 class: 'episode-btn', text: `E${ep}`,
-                onclick: () => navigate(watchHref(item, season.season, ep)),
+                onclick: () => navigate(watchHref(getItem(), season.season, ep)),
             }));
         });
     };
