@@ -3,6 +3,7 @@
 namespace App\Support;
 
 use App\Services\MovieBox\SubjectType;
+use App\Support\TextSanitizer;
 
 /**
  * Flattens the various raw item shapes returned by the MovieBox backend
@@ -58,8 +59,8 @@ class ItemNormalizer
             'subjectId' => (string) $subjectId,
             'subjectType' => $type,
             'typeLabel' => SubjectType::resolve($type)->label(),
-            'title' => $get('title') ?? $raw['title'] ?? 'Untitled',
-            'description' => $get('description'),
+            'title' => TextSanitizer::title($get('title') ?? $raw['title'] ?? null),
+            'description' => TextSanitizer::description($get('description')),
             'cover' => self::cover($raw, $subject),
             'genres' => self::genres($get('genre')),
             'releaseDate' => $releaseDate ?: null,

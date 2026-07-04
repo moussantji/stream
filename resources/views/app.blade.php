@@ -26,9 +26,6 @@
                 <a href="/films" data-link data-nav="/films">Films</a>
                 <a href="/series" data-link data-nav="/series">Séries &amp; Émissions</a>
                 <a href="/animation" data-link data-nav="/animation">Animation</a>
-                <a href="/tv" data-link data-nav="/tv">TV en direct</a>
-                <a href="/populaires" data-link data-nav="/populaires">Populaires</a>
-                <a href="/local" data-link data-nav="/local">Catalogue</a>
                 <a href="/library" data-link data-nav="/library" data-auth-only>Ma liste</a>
             </nav>
 

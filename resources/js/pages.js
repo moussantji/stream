@@ -491,15 +491,30 @@ export async function watchPage(app, params) {
 
     clear(app);
 
-    const shell = el('div', { class: 'player-shell' }, [loadingState('Preparing stream…')]);
+    const shell = el('div', { class: 'player-shell' }, [loadingState('Préparation du flux…')]);
     const toolbar = el('div', { class: 'player-toolbar' });
     const label = season > 0 ? `${item.title} — S${season} E${episode}` : item.title;
 
-    app.appendChild(el('div', { class: 'watch-wrap' }, [
-        el('button', { class: 'btn btn-ghost', text: '← Back', onclick: () => navigate(detailHref(item)) }),
-        el('h1', { class: 'watch-title', text: label || 'Now Playing' }),
+    // Left column: video player + toolbar.
+    const main = el('div', { class: 'watch-main' }, [
+        el('h1', { class: 'watch-title', text: label || 'Lecture en cours' }),
         shell,
         toolbar,
+    ]);
+
+    // Right column: seasons / episodes selector (series only).
+    const layout = el('div', { class: 'watch-layout' }, [main]);
+    if (season > 0) {
+        const side = el('aside', { class: 'watch-side' });
+        layout.appendChild(side);
+        buildEpisodeSidebar(side, item, season, episode);
+    } else {
+        layout.classList.add('solo');
+    }
+
+    app.appendChild(el('div', { class: 'watch-wrap' }, [
+        el('button', { class: 'btn btn-ghost', text: '← Retour', onclick: () => navigate(detailHref(item)) }),
+        layout,
     ]));
 
     let startTime = 0;
@@ -570,6 +585,72 @@ export async function watchPage(app, params) {
     // Clean up when navigating away
     const cleanup = () => { player.destroy(); window.removeEventListener('popstate', cleanup); };
     window.addEventListener('popstate', cleanup);
+}
+
+// Builds the seasons/episodes selector shown to the right of the player.
+async function buildEpisodeSidebar(side, item, activeSeason, activeEpisode) {
+    clear(side);
+    side.appendChild(el('h3', { text: 'Saisons & épisodes' }));
+
+    const body = el('div', {}, [loadingState('Chargement des épisodes…')]);
+    side.appendChild(body);
+
+    let seasons = [];
+    try {
+        const data = await api.detail({
+            subjectId: item.subjectId,
+            detailPath: item.detailPath,
+            subjectType: item.subjectType,
+            title: item.title,
+            cover: item.cover,
+        });
+        seasons = data.seasons || [];
+    } catch {
+        clear(body);
+        body.appendChild(emptyState('Épisodes indisponibles'));
+        return;
+    }
+
+    if (!seasons.length) {
+        clear(body);
+        body.appendChild(emptyState('Aucun épisode à afficher'));
+        return;
+    }
+
+    clear(body);
+
+    const listWrap = el('div', { class: 'episode-list' });
+
+    const renderSeason = (season) => {
+        clear(listWrap);
+        season.episodes.forEach((ep) => {
+            const isActive = season.season === activeSeason && ep === activeEpisode;
+            listWrap.appendChild(el('button', {
+                class: `episode-btn ${isActive ? 'active' : ''}`,
+                text: `E${ep}`,
+                onclick: () => navigate(watchHref(item, season.season, ep)),
+            }));
+        });
+    };
+
+    if (seasons.length > 1) {
+        const tabs = el('div', { class: 'season-tabs' }, seasons.map((s) =>
+            el('button', {
+                class: `season-tab ${s.season === activeSeason ? 'active' : ''}`,
+                text: `Saison ${s.season}`,
+                onclick: (e) => {
+                    tabs.querySelectorAll('.season-tab').forEach((t) => t.classList.remove('active'));
+                    e.target.classList.add('active');
+                    renderSeason(s);
+                },
+            })));
+        body.appendChild(tabs);
+    }
+
+    body.appendChild(listWrap);
+
+    const current = seasons.find((s) => s.season === activeSeason) || seasons[0];
+    renderSeason(current);
 }
 
 // ---------- LIBRARY ----------

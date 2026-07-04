@@ -90,6 +90,17 @@ class CatalogRepository
     }
 
     /**
+     * Public entry point to persist an explicit list of normalized items
+     * (used by the catalog:import command).
+     *
+     * @param  array<int,array<string,mixed>>  $items
+     */
+    public function saveItems(array $items): void
+    {
+        $this->persistItems(['items' => $items]);
+    }
+
+    /**
      * Persist every individual item found anywhere in a response payload into
      * the catalog_items table (upsert by subject_id).
      */

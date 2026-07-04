@@ -34,6 +34,14 @@ return [
     // table (a growing local library, queryable and API-independent).
     'persist_items' => filter_var(env('MOVIEBOX_PERSIST_ITEMS', true), FILTER_VALIDATE_BOOL),
 
+    // On the first web request after the app boots, import the whole catalog
+    // (films / séries / animation) and dump it to storage/app/catalog/*.json.
+    'import_on_boot' => filter_var(env('MOVIEBOX_IMPORT_ON_BOOT', true), FILTER_VALIDATE_BOOL),
+
+    // Minimum seconds between two automatic boot imports (avoids re-importing
+    // on every request; the import runs after the response is sent).
+    'import_interval' => (int) env('MOVIEBOX_IMPORT_INTERVAL', 21600),
+
     // Outbound request timeout, seconds.
     'timeout' => (int) env('MOVIEBOX_TIMEOUT', 30),
 
