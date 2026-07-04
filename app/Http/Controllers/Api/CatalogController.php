@@ -197,10 +197,22 @@ class CatalogController extends Controller
 
         $suggestions = [];
         try {
-            $data = $this->client->search($validated['q'], 0, 1, 8);
+            $data = $this->client->search($validated['q'], 0, 1, 12);
             foreach ($data['items'] ?? [] as $item) {
-                if (! empty($item['title'])) {
-                    $suggestions[] = ['word' => $item['title'], 'type' => (int) ($item['subjectType'] ?? 0)];
+                if (! is_array($item)) {
+                    continue;
+                }
+                $normalized = ItemNormalizer::one($item);
+                if (empty($normalized['title']) || $normalized['title'] === 'Untitled') {
+                    continue;
+                }
+                // Keep hentai/adult (blocked keywords) out of autocomplete.
+                if (ContentFilter::isBlocked($normalized)) {
+                    continue;
+                }
+                $suggestions[] = ['word' => $normalized['title'], 'type' => (int) ($normalized['subjectType'] ?? 0)];
+                if (count($suggestions) >= 8) {
+                    break;
                 }
             }
         } catch (\Throwable $e) {

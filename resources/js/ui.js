@@ -94,25 +94,39 @@ export function card(item, opts = {}) {
 const CHEVRON_L = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>';
 const CHEVRON_R = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>';
 
-// Horizontal carousel with prev/next scroll arrows.
+// Horizontal carousel with prev/next scroll arrows + mouse-wheel scrolling.
 export function carousel(cardNodes) {
     const scroller = el('div', { class: 'row-scroller' }, cardNodes);
-    const scrollByPage = (dir) => scroller.scrollBy({ left: dir * scroller.clientWidth * 0.9, behavior: 'smooth' });
+    const step = () => Math.max(220, scroller.clientWidth * 0.85);
+    const go = (dir) => scroller.scrollBy({ left: dir * step(), behavior: 'smooth' });
 
-    const prev = el('button', { class: 'row-nav prev', 'aria-label': 'Précédent', html: CHEVRON_L, onclick: () => scrollByPage(-1) });
-    const next = el('button', { class: 'row-nav next', 'aria-label': 'Suivant', html: CHEVRON_R, onclick: () => scrollByPage(1) });
+    const prev = el('button', { class: 'row-nav prev', type: 'button', 'aria-label': 'Précédent', html: CHEVRON_L });
+    const next = el('button', { class: 'row-nav next', type: 'button', 'aria-label': 'Suivant', html: CHEVRON_R });
+    prev.addEventListener('click', () => go(-1));
+    next.addEventListener('click', () => go(1));
 
     const viewport = el('div', { class: 'row-viewport' }, [prev, scroller, next]);
 
-    // Hide arrows when there's nothing more to scroll in that direction.
+    // Show arrows only when the row actually overflows; hide the one at the end.
     const sync = () => {
         const max = scroller.scrollWidth - scroller.clientWidth - 2;
-        prev.classList.toggle('hidden-nav', scroller.scrollLeft <= 2);
-        next.classList.toggle('hidden-nav', scroller.scrollLeft >= max);
+        const scrollable = max > 4;
+        viewport.classList.toggle('has-nav', scrollable);
+        prev.classList.toggle('hidden-nav', !scrollable || scroller.scrollLeft <= 2);
+        next.classList.toggle('hidden-nav', !scrollable || scroller.scrollLeft >= max);
     };
     scroller.addEventListener('scroll', sync, { passive: true });
-    // Defer initial sync until laid out.
+    window.addEventListener('resize', sync);
     requestAnimationFrame(sync);
+    setTimeout(sync, 400); // re-check after posters/layout settle
+
+    // Turn vertical wheel gestures into horizontal scrolling over the row.
+    scroller.addEventListener('wheel', (e) => {
+        if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+            scroller.scrollLeft += e.deltaY;
+            e.preventDefault();
+        }
+    }, { passive: false });
 
     return viewport;
 }

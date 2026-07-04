@@ -147,18 +147,20 @@ video.hero-bg { pointer-events: none; }
     scrollbar-width: thin;
 }
 .row-nav {
-    position: absolute; top: 0; bottom: 18px; width: 48px; z-index: 6;
-    display: flex; align-items: center; justify-content: center;
-    background: linear-gradient(90deg, rgba(11,11,15,.85), rgba(11,11,15,.15));
-    border: none; color: #fff; opacity: 0; transition: opacity .15s;
+    position: absolute; top: 38%; transform: translateY(-50%);
+    width: 44px; height: 44px; border-radius: 50%; z-index: 6;
+    display: grid; place-items: center;
+    background: rgba(0, 0, 0, .7); border: 1px solid rgba(255, 255, 255, .18); color: #fff;
+    opacity: 0; transition: opacity .15s, background .15s, transform .1s;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, .5);
 }
-.row-nav.next { background: linear-gradient(270deg, rgba(11,11,15,.85), rgba(11,11,15,.15)); }
-.row-viewport:hover .row-nav { opacity: 1; }
+/* Visible whenever the row is scrollable (obvious it can move). */
+.row-viewport.has-nav .row-nav { opacity: .92; }
+.row-nav:hover { background: var(--accent); transform: translateY(-50%) scale(1.08); }
 .row-nav.hidden-nav { opacity: 0 !important; pointer-events: none; }
-.row-nav.prev { left: 0; }
-.row-nav.next { right: 0; }
-.row-nav svg { width: 30px; height: 30px; filter: drop-shadow(0 2px 4px rgba(0,0,0,.6)); }
-.row-nav:hover svg { transform: scale(1.15); transition: transform .12s; }
+.row-nav.prev { left: 6px; }
+.row-nav.next { right: 6px; }
+.row-nav svg { width: 24px; height: 24px; }
 @media (max-width: 720px) { .row-nav { display: none; } }
 .grid {
     display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
