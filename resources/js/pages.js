@@ -535,7 +535,7 @@ export async function watchPage(app, params) {
         return;
     }
 
-    if (!data.sources.length && !data.hls.length) {
+    if (!data.sources.length && !data.hls.length && !(data.dash && data.dash.length)) {
         clear(shell);
         shell.appendChild(el('div', { class: 'player-message' }, [
             emptyState('No stream available', 'This title may be restricted by the provider or only available in the app.'),

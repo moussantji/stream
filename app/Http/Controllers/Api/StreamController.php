@@ -7,7 +7,9 @@ use App\Services\MovieBox\MovieBoxClient;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Str;
 
 class StreamController extends Controller
 {
@@ -56,10 +58,12 @@ class StreamController extends Controller
         // streaming endpoint (play-info). The provider's own web player streams
         // from here, and it often carries episodes that were never published as
         // downloadable files (e.g. S4 E1/E2 when only E3 is downloadable).
+        $dash = [];
         if ($sources === []) {
             $stream = $this->resolvePlayInfo($sourceSubjectId, $v['season'], $v['episode'], $diag, $debug);
             $sources = $stream['sources'];
             $hls = $stream['hls'];
+            $dash = $stream['dash'];
             if ($subtitles === [] && $stream['subtitles'] !== []) {
                 $subtitles = $stream['subtitles'];
             }
@@ -68,8 +72,9 @@ class StreamController extends Controller
         $payload = [
             'sources' => $sources,
             'hls' => $hls,
+            'dash' => $dash,
             'subtitles' => $subtitles,
-            'hasResource' => $sources !== [] || $hls !== [],
+            'hasResource' => $sources !== [] || $hls !== [] || $dash !== [],
         ];
 
         if ($debug) {
@@ -318,15 +323,17 @@ class StreamController extends Controller
     }
 
     /**
-     * Adaptive streaming fallback via the play-info endpoint. Extracts HLS
-     * (m3u8) and/or MP4 URLs generically since the response shape varies.
+     * Adaptive streaming fallback via the play-info endpoint. Extracts MP4,
+     * HLS (m3u8) and DASH (mpd) URLs; CloudFront-cookie-protected DASH/HLS is
+     * routed through our signing proxy so the browser can play it (no CORS /
+     * cookie issues).
      *
      * @param  array<string,mixed>  $diag
-     * @return array{sources:array<int,array<string,mixed>>,hls:array<int,string>,subtitles:array<int,array<string,mixed>>}
+     * @return array{sources:array<int,array<string,mixed>>,hls:array<int,string>,dash:array<int,string>,subtitles:array<int,array<string,mixed>>}
      */
     protected function resolvePlayInfo(string $subjectId, int $season, int $episode, array &$diag, bool $debug = false): array
     {
-        $out = ['sources' => [], 'hls' => [], 'subtitles' => []];
+        $out = ['sources' => [], 'hls' => [], 'dash' => [], 'subtitles' => []];
 
         try {
             $data = $this->client->playInfo($subjectId, $season, $episode);
@@ -353,10 +360,11 @@ class StreamController extends Controller
             }
         }
         if ($streams === []) {
-            $streams[] = $data; // maybe a single top-level url
+            $streams[] = $data;
         }
 
         $hls = [];
+        $dash = [];
         $mp4 = [];
         foreach ($streams as $s) {
             if (! is_array($s)) {
@@ -373,20 +381,26 @@ class StreamController extends Controller
                 continue;
             }
 
-            $resolution = (int) ($s['resolution'] ?? $s['quality'] ?? 0);
+            $resolution = (int) ($s['resolution'] ?? $s['resolutions'] ?? $s['quality'] ?? 0);
             $format = strtoupper((string) ($s['format'] ?? $s['streamType'] ?? ''));
+            $signCookie = (string) ($s['signCookie'] ?? '');
 
-            if (stripos($url, '.m3u8') !== false || $format === 'HLS') {
-                $hls[] = $url;
+            if (stripos($url, '.mpd') !== false || $format === 'DASH') {
+                $proxied = $this->proxifyStream($url, $signCookie);
+                if ($proxied !== null) {
+                    $dash[] = $proxied;
+                }
+            } elseif (stripos($url, '.m3u8') !== false || $format === 'HLS') {
+                // Route cookie-protected HLS through the proxy too; otherwise
+                // it is directly playable by hls.js.
+                $hls[] = $signCookie !== '' ? ($this->proxifyStream($url, $signCookie) ?? $url) : $url;
             } elseif (stripos($url, '.mp4') !== false || $format === 'MP4') {
                 $mp4[] = ['resourceLink' => $url, 'resolution' => $resolution];
-            } elseif (stripos($url, '.mpd') !== false || $format === 'DASH') {
-                // DASH/MPD is not playable by the current hls.js-based player.
-                $diag['playInfoDash'] = true;
             }
         }
 
-        $out['hls'] = array_values(array_unique($hls));
+        $out['hls'] = array_values(array_unique(array_filter($hls)));
+        $out['dash'] = array_values(array_unique(array_filter($dash)));
         $out['sources'] = $this->normalizeSources($mp4);
 
         $subs = $data['subtitles'] ?? $data['captions'] ?? $data['extCaptions'] ?? [];
@@ -395,6 +409,130 @@ class StreamController extends Controller
         }
 
         return $out;
+    }
+
+    /**
+     * Build a same-origin proxy URL for a CloudFront-signed manifest so the
+     * browser can fetch the manifest AND its segments through us (the signature
+     * — a wildcard over the whole folder — is attached server-side).
+     */
+    protected function proxifyStream(string $url, string $signCookie): ?string
+    {
+        $parts = parse_url($url);
+        if (empty($parts['host']) || empty($parts['path'])) {
+            return null;
+        }
+
+        // Signature query: prefer the signed cookie, else reuse the URL's query.
+        $query = '';
+        $ttl = 7200;
+        if ($signCookie !== '') {
+            $cookie = $this->parseSignCookie($signCookie);
+            $query = 'Policy='.($cookie['CloudFront-Policy'] ?? '')
+                .'&Signature='.($cookie['CloudFront-Signature'] ?? '')
+                .'&Key-Pair-Id='.($cookie['CloudFront-Key-Pair-Id'] ?? '');
+            $ttl = $this->signatureTtl($cookie['CloudFront-Policy'] ?? '');
+        } elseif (! empty($parts['query'])) {
+            $query = $parts['query'];
+        }
+
+        $token = Str::random(28);
+        Cache::put("mvsig:$token", ['host' => $parts['host'], 'query' => $query], $ttl);
+
+        return url('/api/mv/'.$token.'/'.ltrim($parts['path'], '/'));
+    }
+
+    /**
+     * Proxy a manifest/segment from the media CDN, attaching the CloudFront
+     * signature stored under $token. Manifests are rewritten so any absolute
+     * CDN URLs also flow back through this proxy.
+     */
+    public function proxy(Request $request, string $token, string $path): Response
+    {
+        $sig = Cache::get("mvsig:$token");
+        abort_unless(is_array($sig), 404, 'Stream link expired — reload the page.');
+
+        $host = (string) $sig['host'];
+        $allowed = false;
+        foreach ((array) config('moviebox.cdn_proxy_allow', []) as $suffix) {
+            if ($suffix !== '' && str_ends_with($host, $suffix)) {
+                $allowed = true;
+                break;
+            }
+        }
+        abort_unless($allowed, 403, 'Host not allowed.');
+
+        $target = 'https://'.$host.'/'.ltrim($path, '/');
+        if (($sig['query'] ?? '') !== '') {
+            $target .= '?'.$sig['query'];
+        }
+
+        $upstream = Http::withHeaders(array_filter([
+            'User-Agent' => config('moviebox.user_agent'),
+            'Range' => $request->header('Range'),
+        ]))->timeout((int) config('moviebox.timeout', 30))->get($target);
+
+        abort_if($upstream->failed(), 502, 'Upstream media fetch failed.');
+
+        $body = $upstream->body();
+        $contentType = $upstream->header('Content-Type') ?: 'application/octet-stream';
+        $isManifest = str_ends_with($path, '.mpd') || str_ends_with($path, '.m3u8')
+            || str_contains($contentType, 'dash+xml') || str_contains($contentType, 'mpegurl');
+
+        $headers = ['Access-Control-Allow-Origin' => '*'];
+
+        if ($isManifest) {
+            // Make absolute same-CDN URLs relative to this proxy token.
+            $body = str_replace('https://'.$host.'/', url('/api/mv/'.$token).'/', $body);
+            $headers['Content-Type'] = str_ends_with($path, '.m3u8') || str_contains($contentType, 'mpegurl')
+                ? 'application/vnd.apple.mpegurl'
+                : 'application/dash+xml';
+            $headers['Cache-Control'] = 'no-store';
+        } else {
+            $headers['Content-Type'] = $contentType;
+            foreach (['Content-Range', 'Accept-Ranges', 'Content-Length'] as $h) {
+                $val = $upstream->header($h);
+                if ($val !== '') {
+                    $headers[$h] = $val;
+                }
+            }
+            $headers['Cache-Control'] = 'public, max-age=120';
+        }
+
+        return response($body, $upstream->status(), $headers);
+    }
+
+    /**
+     * @return array<string,string>
+     */
+    protected function parseSignCookie(string $signCookie): array
+    {
+        $out = [];
+        foreach (explode(';', $signCookie) as $pair) {
+            $pair = trim($pair);
+            if ($pair === '') {
+                continue;
+            }
+            [$k, $val] = array_pad(explode('=', $pair, 2), 2, '');
+            $out[trim($k)] = $val;
+        }
+
+        return $out;
+    }
+
+    /** Seconds until a CloudFront policy expires (DateLessThan), with a floor. */
+    protected function signatureTtl(string $policyB64): int
+    {
+        $json = base64_decode(strtr($policyB64, '-_~', '+/='), true);
+        if ($json !== false) {
+            $data = json_decode($json, true);
+            $exp = $data['Statement'][0]['Condition']['DateLessThan']['AWS:EpochTime'] ?? null;
+            if (is_numeric($exp)) {
+                return max(60, (int) $exp - time());
+            }
+        }
+
+        return 7200;
     }
 
     /**

@@ -44,6 +44,12 @@ Route::middleware('throttle:120,1')->group(function () {
     Route::get('subtitle', [StreamController::class, 'subtitle']);
 });
 
+// Signing proxy for CloudFront-protected DASH/HLS manifests + segments.
+// Higher throttle: a manifest pulls many segment requests during playback.
+Route::get('mv/{token}/{path}', [StreamController::class, 'proxy'])
+    ->where('path', '.*')
+    ->middleware('throttle:1000,1');
+
 // ---- Personal library (Sanctum-protected) ---------------------------------
 Route::middleware('auth:sanctum')->group(function () {
     Route::get('favorites', [LibraryController::class, 'favorites']);

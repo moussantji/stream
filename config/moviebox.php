@@ -45,6 +45,13 @@ return [
     // Outbound request timeout, seconds.
     'timeout' => (int) env('MOVIEBOX_TIMEOUT', 30),
 
+    // Host suffixes the DASH/HLS stream proxy (/api/mv/...) is allowed to fetch
+    // from. Prevents the proxy being used as an open relay.
+    'cdn_proxy_allow' => array_values(array_filter(array_map('trim', explode(',', (string) env(
+        'MOVIEBOX_CDN_PROXY_ALLOW',
+        'hakunaymatata.com'
+    ))))),
+
     // Optional outbound proxy.
     'proxy' => env('MOVIEBOX_PROXY') ?: null,
 

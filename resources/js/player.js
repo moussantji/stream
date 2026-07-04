@@ -12,6 +12,17 @@ async function loadHls() {
     return hlsModule;
 }
 
+let dashModule = null;
+async function loadDash() {
+    if (!dashModule) {
+        try {
+            const mod = await import('dashjs');
+            dashModule = mod.default || mod;
+        } catch { dashModule = false; }
+    }
+    return dashModule;
+}
+
 export class Player {
     constructor(container) {
         this.container = container;
@@ -34,13 +45,16 @@ export class Player {
      */
     async load(data) {
         this.destroyHls();
-        const { sources = [], hls = [], subtitles = [], startTime = 0, onProgress } = data;
+        this.destroyDash();
+        const { sources = [], hls = [], dash = [], subtitles = [], startTime = 0, onProgress } = data;
 
         if (sources.length) {
             this.currentSources = sources;
             this.setMp4(sources[0].url);
         } else if (hls.length) {
             await this.setHls(hls[0]);
+        } else if (dash.length) {
+            await this.setDash(dash[0]);
         } else {
             throw new Error('No playable source found for this title.');
         }
@@ -82,6 +96,18 @@ export class Player {
         }
     }
 
+    async setDash(url) {
+        const dashjs = await loadDash();
+        if (dashjs && dashjs.MediaPlayer) {
+            this.dash = dashjs.MediaPlayer().create();
+            this.dash.updateSettings({ streaming: { buffer: { bufferTimeAtTopQuality: 30 } } });
+            this.dash.initialize(this.video, url, false);
+        } else {
+            // Native MPD support is rare, but try as a last resort.
+            this.video.src = url;
+        }
+    }
+
     setSubtitles(subtitles) {
         // Remove existing tracks
         this.video.querySelectorAll('track').forEach((t) => t.remove());
@@ -104,9 +130,14 @@ export class Player {
         if (this.hls) { this.hls.destroy(); this.hls = null; }
     }
 
+    destroyDash() {
+        if (this.dash) { try { this.dash.reset(); } catch { /* ignore */ } this.dash = null; }
+    }
+
     destroy() {
         clearInterval(this._progressTimer);
         this.destroyHls();
+        this.destroyDash();
         this.video.pause();
         this.video.removeAttribute('src');
         this.video.load();
