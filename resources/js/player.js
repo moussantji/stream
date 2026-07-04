@@ -12,6 +12,19 @@ async function loadHls() {
     return hlsModule;
 }
 
+// Attach an HLS (m3u8) source to an arbitrary <video> (used for hero trailers).
+export async function attachHls(video, url) {
+    const Hls = await loadHls();
+    if (Hls && Hls.isSupported()) {
+        const hls = new Hls({ maxBufferLength: 20 });
+        hls.loadSource(url);
+        hls.attachMedia(video);
+        return hls;
+    }
+    video.src = url; // Safari / native HLS
+    return null;
+}
+
 let dashModule = null;
 async function loadDash() {
     if (!dashModule) {

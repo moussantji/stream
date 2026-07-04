@@ -4,7 +4,7 @@ import {
     el, clear, row, grid, card, carousel, skeletonRow, loadingState, errorState, emptyState,
     navigate, watchHref, detailHref, toast, openAuthModal,
 } from './ui.js';
-import { Player } from './player.js';
+import { Player, attachHls } from './player.js';
 
 // ---------- helpers ----------
 function fmtDuration(seconds) {
@@ -28,15 +28,21 @@ function historyToItem(h) {
 // Muted, autoplaying, looping trailer video used as a hero background.
 // Falls back to the poster image if the video errors.
 function trailerVideo(url, poster, cls) {
-    const v = el('video', { class: cls, src: url, loop: '', playsinline: '', preload: 'metadata' });
+    const v = el('video', { class: cls, loop: '', playsinline: '', preload: 'metadata' });
     v.muted = true;
     v.autoplay = true;
     v.setAttribute('muted', '');
     v.setAttribute('autoplay', '');
-    if (poster) {
-        v.poster = poster;
-        v.addEventListener('error', () => v.replaceWith(el('img', { class: cls, src: poster, alt: '' })), { once: true });
+    if (poster) v.poster = poster;
+
+    const fallbackToImage = () => { if (poster) v.replaceWith(el('img', { class: cls, src: poster, alt: '' })); };
+
+    if (/\.m3u8(\?|$)/i.test(url)) {
+        attachHls(v, url).catch(fallbackToImage);
+    } else {
+        v.src = url;
     }
+    v.addEventListener('error', fallbackToImage, { once: true });
     v.play?.().catch(() => {});
     return v;
 }

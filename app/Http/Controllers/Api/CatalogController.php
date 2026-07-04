@@ -566,7 +566,11 @@ class CatalogController extends Controller
         if ($debug && is_array($detail)) {
             $result['_debug'] = [
                 'detailKeys' => array_keys($detail),
-                'trailerCandidates' => $this->trailerProbe($detail),
+                'trailer' => $detail['trailer'] ?? null,
+                'preVideoAddress' => $detail['preVideoAddress'] ?? null,
+                'preVideoCover' => $detail['preVideoCover'] ?? null,
+                'stills' => array_slice((array) ($detail['stills'] ?? []), 0, 2),
+                'extractedTrailer' => $result['trailer'],
             ];
         }
 
@@ -581,99 +585,55 @@ class CatalogController extends Controller
     {
         $subject = is_array($detail['subject'] ?? null) ? $detail['subject'] : [];
 
+        // Ordered candidates: the preview clip first (preVideoAddress), then the
+        // trailer field(s). Each may be a string URL or a nested object/list.
         foreach ([
+            $detail['preVideoAddress'] ?? null,
+            $subject['preVideoAddress'] ?? null,
             $detail['trailer'] ?? null,
+            $subject['trailer'] ?? null,
             $detail['trailerUrl'] ?? null,
             $detail['previewVideo'] ?? null,
-            $subject['trailer'] ?? null,
-            $subject['trailerUrl'] ?? null,
+            $detail['trailers'] ?? null,
+            $detail['trailerList'] ?? null,
         ] as $node) {
-            $url = $this->urlFromNode($node);
+            $url = $this->deepUrl($node);
             if ($url !== null) {
                 return $url;
             }
         }
 
-        foreach (['trailers', 'trailerList', 'previews'] as $key) {
-            $list = $detail[$key] ?? $subject[$key] ?? null;
-            if (is_array($list)) {
-                foreach ($list as $node) {
-                    $url = $this->urlFromNode($node);
-                    if ($url !== null) {
-                        return $url;
-                    }
-                }
-            }
-        }
-
-        // Fall back to a deep search for any trailer/preview-keyed URL.
-        return $this->findTrailerDeep($detail, 0);
-    }
-
-    protected function urlFromNode(mixed $node): ?string
-    {
-        if (is_string($node) && preg_match('~^https?://~i', $node)) {
-            return $node;
-        }
-        if (is_array($node)) {
-            foreach (['url', 'playUrl', 'videoAddress', 'videoUrl', 'link', 'm3u8', 'mp4', 'src'] as $f) {
-                if (! empty($node[$f]) && is_string($node[$f]) && preg_match('~^https?://~i', $node[$f])) {
-                    return $node[$f];
-                }
-            }
-        }
-
         return null;
     }
 
-    protected function findTrailerDeep(mixed $data, int $depth): ?string
+    /** Find the first http(s) URL inside a string / object / list node. */
+    protected function deepUrl(mixed $node, int $depth = 0): ?string
     {
-        if ($depth > 5 || ! is_array($data)) {
+        if (is_string($node)) {
+            return preg_match('~^https?://~i', $node) ? $node : null;
+        }
+        if (! is_array($node) || $depth > 4) {
             return null;
         }
-        foreach ($data as $key => $value) {
-            if (is_string($key) && preg_match('/trailer|preview/i', $key)) {
-                $url = $this->urlFromNode($value);
-                if ($url !== null) {
-                    return $url;
-                }
+
+        // Prefer explicit URL-bearing keys.
+        foreach (['url', 'playUrl', 'videoAddress', 'address', 'videoUrl', 'link', 'm3u8', 'hlsUrl', 'mp4', 'src'] as $f) {
+            if (! empty($node[$f]) && is_string($node[$f]) && preg_match('~^https?://~i', $node[$f])) {
+                return $node[$f];
             }
-            if (is_array($value)) {
-                $found = $this->findTrailerDeep($value, $depth + 1);
-                if ($found !== null) {
-                    return $found;
-                }
+        }
+
+        foreach ($node as $value) {
+            $url = $this->deepUrl($value, $depth + 1);
+            if ($url !== null) {
+                return $url;
             }
         }
 
         return null;
     }
 
-    /**
-     * @return array<int,string>
-     */
-    protected function trailerProbe(array $detail): array
-    {
-        $hits = [];
-        $walk = function ($data, string $path) use (&$walk, &$hits) {
-            if (! is_array($data) || count($hits) > 25) {
-                return;
-            }
-            foreach ($data as $key => $value) {
-                $p = $path === '' ? (string) $key : $path.'.'.$key;
-                if (is_string($value) && preg_match('~\.(mp4|m3u8|mpd)~i', $value)) {
-                    $hits[] = $p.' => '.mb_substr($value, 0, 80);
-                } elseif (is_string($key) && preg_match('/trailer|preview/i', $key)) {
-                    $hits[] = $p.' ('.gettype($value).')';
-                } elseif (is_array($value)) {
-                    $walk($value, $p);
-                }
-            }
-        };
-        $walk($detail, '');
 
-        return $hits;
-    }
 
     // -----------------------------------------------------------------
     // Normalizers
