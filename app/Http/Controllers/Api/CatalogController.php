@@ -89,6 +89,55 @@ class CatalogController extends Controller
         return response()->json(['data' => $data]);
     }
 
+    /** Browse the locally persisted catalog (works even if the API is down). */
+    public function local(Request $request): JsonResponse
+    {
+        $q = trim((string) $request->input('q', ''));
+        $type = SubjectType::resolve($request->input('type', 'all'));
+        $page = max(1, (int) $request->input('page', 1));
+        $perPage = 40;
+
+        try {
+            $query = CatalogItem::query();
+
+            if ($type !== SubjectType::ALL) {
+                $query->where('subject_type', $type->value);
+            }
+            if ($q !== '') {
+                $query->where('title', 'like', '%'.$q.'%');
+            }
+
+            $total = (clone $query)->count();
+            $records = $query->orderByDesc('updated_at')->forPage($page, $perPage)->get();
+        } catch (\Throwable $e) {
+            report($e);
+
+            return response()->json(['data' => ['items' => [], 'total' => 0, 'pager' => null]]);
+        }
+
+        $items = $records->map(function (CatalogItem $r) {
+            $payload = is_array($r->payload) ? $r->payload : [];
+
+            return $payload + [
+                'subjectId' => $r->subject_id,
+                'subjectType' => $r->subject_type,
+                'typeLabel' => SubjectType::resolve($r->subject_type)->label(),
+                'title' => $r->title,
+                'cover' => $r->cover,
+                'year' => $r->year,
+                'imdbRating' => $r->imdb_rating,
+                'genres' => $r->genres ?? [],
+                'detailPath' => $r->detail_path,
+            ];
+        })->values()->all();
+
+        return response()->json(['data' => [
+            'items' => $items,
+            'total' => $total,
+            'pager' => ['page' => $page, 'perPage' => $perPage, 'hasMore' => $page * $perPage < $total],
+        ]]);
+    }
+
     /** Full search (also persisted for resilience). */
     public function search(Request $request): JsonResponse
     {

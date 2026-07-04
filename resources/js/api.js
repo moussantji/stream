@@ -99,6 +99,7 @@ export const api = {
     discover: () => unwrap(request('discover')),
     category: (tab) => unwrap(request('category', { params: { tab } })),
     channels: () => unwrap(request('channels')),
+    local: (params) => unwrap(request('local', { params })),
     detail: (params) => unwrap(request('detail', { params })),
 
     // ---- Streaming ----

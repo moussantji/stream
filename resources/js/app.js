@@ -1,7 +1,7 @@
 import '../css/app.css';
 import { api } from './api.js';
 import { navigate, renderAuthArea, el, clear } from './ui.js';
-import { homePage, trendingPage, searchPage, detailPage, watchPage, libraryPage, categoryPage, channelsPage } from './pages.js';
+import { homePage, trendingPage, searchPage, detailPage, watchPage, libraryPage, categoryPage, channelsPage, localPage } from './pages.js';
 
 const appRoot = document.getElementById('app');
 
@@ -25,6 +25,8 @@ function route() {
             return categoryPage(appRoot, 'animation', 'Animation');
         case path === '/tv':
             return channelsPage(appRoot);
+        case path === '/local':
+            return localPage(appRoot, params);
         case path === '/populaires':
         case path === '/trending':
             return trendingPage(appRoot, 'Les plus regardés');

@@ -34,6 +34,7 @@ Route::middleware('throttle:120,1')->group(function () {
     Route::get('discover', [CatalogController::class, 'discover']);
     Route::get('category', [CatalogController::class, 'category']);
     Route::get('channels', [CatalogController::class, 'channels']);
+    Route::get('local', [CatalogController::class, 'local']);
     Route::get('detail', [CatalogController::class, 'detail']);
     Route::get('diagnostics', [CatalogController::class, 'diagnostics']);
 

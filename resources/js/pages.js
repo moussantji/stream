@@ -134,6 +134,64 @@ export async function categoryPage(app, tab, title) {
     }
 }
 
+// ---------- LOCAL CATALOG (MySQL) ----------
+export async function localPage(app, params) {
+    const type = params.get('type') || 'all';
+    clear(app);
+
+    const container = el('div', { class: 'container' });
+    app.appendChild(container);
+    container.appendChild(el('h2', { class: 'section-title', text: 'Catalogue local' }));
+
+    const filters = [['all', 'Tous'], ['movies', 'Films'], ['tv-series', 'Séries'], ['animation', 'Animation']];
+    container.appendChild(el('div', { class: 'season-tabs' }, filters.map(([t, label]) =>
+        el('button', {
+            class: `season-tab ${t === type ? 'active' : ''}`,
+            text: label,
+            onclick: () => navigate(`/local?type=${t}`),
+        }))));
+
+    const info = el('p', { style: 'color:var(--text-dim);margin:0 0 12px' });
+    const gridWrap = el('div', {}, [loadingState('Chargement de la base locale…')]);
+    const moreWrap = el('div', { style: 'text-align:center;padding:8px 0 24px' });
+    container.appendChild(info);
+    container.appendChild(gridWrap);
+    container.appendChild(moreWrap);
+
+    let page = 1;
+    let gridEl = null;
+
+    const load = async (append) => {
+        try {
+            const data = await api.local({ type, page });
+            info.textContent = `${data.total} titre(s) enregistré(s) dans ta base`;
+
+            if (!append) { clear(gridWrap); clear(moreWrap); gridEl = null; }
+
+            if (!data.items.length && page === 1) {
+                gridWrap.appendChild(emptyState('Base locale vide', 'Navigue sur le site : chaque titre affiché est enregistré ici automatiquement.'));
+                return;
+            }
+
+            if (!gridEl) { gridEl = grid(data.items); gridWrap.appendChild(gridEl); }
+            else { data.items.forEach((it) => gridEl.appendChild(card(it))); }
+
+            clear(moreWrap);
+            if (data.pager && data.pager.hasMore) {
+                moreWrap.appendChild(el('button', {
+                    class: 'btn btn-ghost', text: 'Charger plus',
+                    onclick: () => { page += 1; load(true); },
+                }));
+            }
+        } catch (e) {
+            clear(gridWrap);
+            gridWrap.appendChild(errorState(e.message, () => load(false)));
+        }
+    };
+
+    await load(false);
+}
+
 // ---------- LIVE TV CHANNELS ----------
 export async function channelsPage(app) {
     clear(app);
