@@ -2,8 +2,6 @@
 
 namespace App\Services\MovieBox;
 
-use GuzzleHttp\Cookie\CookieJar;
-use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Cache;
@@ -11,21 +9,19 @@ use Illuminate\Support\Facades\Http;
 use Throwable;
 
 /**
- * Native PHP client for the MovieBox (aoneroom) "h5 BFF" backend.
+ * Native PHP client for the MovieBox "wefeed-mobile-bff" API.
  *
- * This mirrors the HTTP behaviour of the upstream Python project
- * `Simatwa/moviebox-api`: it bootstraps a bearer token + cookies, then calls
- * the same public endpoints for search, discovery, streaming and downloads.
- * All backend responses are wrapped as {code, message, data}; this client
- * unwraps and returns the `data` payload.
+ * Mirrors the upstream `Simatwa/moviebox-api` v3 client: every request is
+ * HMAC-signed, a bearer token is bootstrapped from the tab-operating endpoint
+ * (returned in the `x-user` response header), and requests are load-balanced
+ * across a pool of API hosts with automatic failover on retryable statuses.
  */
 class MovieBoxClient
 {
-    protected string $host;
+    /** @var list<string> */
+    protected array $hostPool;
 
-    protected string $apiHost;
-
-    protected string $scheme;
+    protected string $activeBase;
 
     protected int $timeout;
 
@@ -33,165 +29,100 @@ class MovieBoxClient
 
     protected string $userAgent;
 
-    protected int $cacheTtl;
+    protected string $clientInfo;
+
+    protected string $secretKey;
 
     protected int $tokenTtl;
 
-    protected CookieJar $cookieJar;
+    protected int $cacheTtl;
 
     protected ?string $token = null;
 
     protected bool $bootstrapped = false;
 
-    /** Short name of the active host, used for mirror labelling. */
-    public function hostLabel(): string
-    {
-        return $this->host;
-    }
+    protected const RETRY_STATUS = [403, 407, 429, 500, 502, 503, 504];
 
-    protected function tokenCacheKey(): string
-    {
-        // Per-host so mirror clients don't share aoneroom's token.
-        return 'moviebox:token:'.sha1($this->apiHost);
-    }
+    protected const TOKEN_CACHE_KEY = 'moviebox:v3:token';
+
+    // Endpoint paths --------------------------------------------------
+    protected const MAIN_PAGE = '/wefeed-mobile-bff/tab-operating';
+
+    protected const SEARCH = '/wefeed-mobile-bff/subject-api/search';
+
+    protected const SUBJECT_GET = '/wefeed-mobile-bff/subject-api/get';
+
+    protected const SEASON_INFO = '/wefeed-mobile-bff/subject-api/season-info';
+
+    protected const RESOURCE = '/wefeed-mobile-bff/subject-api/resource';
+
+    protected const PLAY_INFO = '/wefeed-mobile-bff/subject-api/play-info';
+
+    protected const EXT_CAPTIONS = '/wefeed-mobile-bff/subject-api/get-ext-captions';
 
     /**
-     * @param  array<string,mixed>  $config  Optional overrides for config/moviebox.php
+     * @param  array<string,mixed>  $config
      */
     public function __construct(array $config = [])
     {
         $config = array_merge(config('moviebox'), $config);
 
-        $this->host = $config['host'];
-        $this->apiHost = $config['api_host'];
-        $this->scheme = $config['scheme'];
+        $this->hostPool = $config['host_pool'];
+        $this->activeBase = $this->hostPool[0] ?? 'https://api6.aoneroom.com';
         $this->timeout = (int) $config['timeout'];
         $this->proxy = $config['proxy'] ?? null;
         $this->userAgent = $config['user_agent'];
-        $this->cacheTtl = (int) $config['cache_ttl'];
+        $this->clientInfo = $config['client_info'];
+        $this->secretKey = $config['secret_key'];
         $this->tokenTtl = (int) $config['token_ttl'];
-
-        $this->cookieJar = new CookieJar;
-    }
-
-    public function baseUrl(): string
-    {
-        return "{$this->scheme}://{$this->host}";
-    }
-
-    public function apiBaseUrl(): string
-    {
-        return "{$this->scheme}://{$this->apiHost}";
+        $this->cacheTtl = (int) $config['cache_ttl'];
     }
 
     // -----------------------------------------------------------------
-    // Discovery & catalog
+    // Catalog & discovery
     // -----------------------------------------------------------------
 
-    /** Landing-page content (banners, curated lists). */
-    public function home(): array
+    /** Landing-page content for a tab (0=all, 2=movies, 5=tv). */
+    public function home(int $tabId = 0, int $page = 1): array
     {
-        return $this->cached('home', fn () => $this->getData('/wefeed-h5-bff/web/home', context: 'home'));
-    }
-
-    /** Trending movies / TV series. Page is zero-indexed upstream. */
-    public function trending(int $page = 0, int $perPage = 18): array
-    {
-        return $this->cached("trending:$page:$perPage", fn () => $this->getData(
-            '/wefeed-h5-bff/web/subject/trending',
-            ['page' => $page, 'perPage' => $perPage],
-            context: 'trending'
+        return $this->cached("home:$tabId:$page", fn () => $this->getData(
+            self::MAIN_PAGE,
+            ['page' => $page, 'tabId' => $tabId, 'version' => ''],
+            context: 'home'
         ));
     }
 
     /** Full search. $subjectType 0=all, 1=movies, 2=tv-series. */
-    public function search(string $keyword, int $subjectType = 0, int $page = 1, int $perPage = 24): array
+    public function search(string $keyword, int $subjectType = 0, int $page = 1, int $perPage = 20): array
     {
+        $perPage = max(1, min(20, $perPage));
         $key = 'search:'.md5("$keyword|$subjectType|$page|$perPage");
 
-        return $this->cached($key, function () use ($keyword, $subjectType, $page, $perPage) {
-            return $this->postData(
-                $this->apiBaseUrl().'/wefeed-h5api-bff/subject/search',
-                [
-                    'keyword' => $keyword,
-                    'page' => $page,
-                    'perPage' => $perPage,
-                    'subjectType' => $subjectType,
-                ],
-                context: 'search'
-            );
-        });
-    }
-
-    /** Lightweight title suggestions for an autocomplete box. */
-    public function suggest(string $keyword, int $perPage = 10): array
-    {
-        return $this->postData(
-            $this->baseUrl().'/wefeed-h5-bff/web/subject/search-suggest',
-            ['keyword' => $keyword, 'per_page' => $perPage],
-            context: 'suggest'
-        );
-    }
-
-    /** Titles many people are searching for right now. */
-    public function popularSearch(): array
-    {
-        $data = $this->cached('popular', fn () => $this->getData(
-            '/wefeed-h5-bff/web/subject/everyone-search',
-            context: 'popular-search'
-        ));
-
-        return $data['everyoneSearch'] ?? [];
-    }
-
-    /** Editorial "hot" movies + tv lists. */
-    public function hot(): array
-    {
-        return $this->cached('hot', fn () => $this->getData(
-            '/wefeed-h5-bff/web/subject/search-rank',
-            context: 'hot'
+        return $this->cached($key, fn () => $this->postData(
+            self::SEARCH,
+            ['keyword' => $keyword, 'page' => $page, 'perPage' => $perPage, 'subjectType' => $subjectType],
+            context: 'search'
         ));
     }
 
-    /** "More like this" recommendations for a subject. */
-    public function recommend(string $subjectId, int $page = 1, int $perPage = 24): array
+    /** Full item metadata (cast, dubs, resource detectors …). */
+    public function itemDetails(string $subjectId): array
     {
-        $key = "recommend:$subjectId:$page:$perPage";
-
-        return $this->cached($key, fn () => $this->getData(
-            '/wefeed-h5-bff/web/subject/detail-rec',
-            ['subjectId' => $subjectId, 'page' => $page, 'perPage' => $perPage],
-            context: 'recommend'
+        return $this->cached("detail:$subjectId", fn () => $this->getData(
+            self::SUBJECT_GET,
+            ['subjectId' => $subjectId],
+            context: 'detail'
         ));
     }
 
-    /**
-     * Best-effort rich details (seasons/episodes, cast, reviews) parsed from
-     * the detail HTML page. Returns null if the page can't be parsed.
-     */
-    public function detail(string $detailPath, string $subjectId): ?array
+    /** Season / episode counts for a series. */
+    public function seasonInfo(string $subjectId): array
     {
-        $key = "detail:$subjectId:".md5($detailPath);
-
-        return $this->cached($key, function () use ($detailPath, $subjectId) {
-            $this->ensureBootstrapped();
-
-            $url = $this->baseUrl().'/detail/'.ltrim($detailPath, '/').'?id='.$subjectId;
-
-            try {
-                $response = $this->client()->get($url);
-            } catch (Throwable $e) {
-                report($e);
-
-                return null;
-            }
-
-            if ($response->failed()) {
-                return null;
-            }
-
-            return DetailExtractor::extract($response->body());
-        });
+        return $this->cached("seasons:$subjectId", fn () => $this->getData(
+            self::SEASON_INFO,
+            ['subjectId' => $subjectId],
+            context: 'season-info'
+        ));
     }
 
     // -----------------------------------------------------------------
@@ -199,87 +130,74 @@ class MovieBoxClient
     // -----------------------------------------------------------------
 
     /**
-     * Playable stream sources for a movie (se=0, ep=0) or a series episode.
-     *
-     * @return array{streams?:array,hls?:array,dash?:array,hasResource?:bool}
+     * Downloadable / streamable video files (direct MP4 URLs, all resolutions,
+     * paginated across episodes for series).
      */
-    public function play(string $subjectId, int $season = 0, int $episode = 0, ?string $detailPath = null): array
+    public function resource(string $subjectId, int $resolution = 1080, int $page = 1, int $perPage = 20): array
     {
-        return $this->mediaEndpoint('/wefeed-h5-bff/web/subject/play', $subjectId, $season, $episode, $detailPath, 'play');
+        return $this->getData(
+            self::RESOURCE,
+            ['subjectId' => $subjectId, 'resolution' => $resolution, 'page' => $page, 'perPage' => $perPage],
+            context: 'resource'
+        );
     }
 
-    /**
-     * Downloadable media files + subtitle (caption) files.
-     *
-     * @return array{downloads?:array,captions?:array,hasResource?:bool}
-     */
-    public function download(string $subjectId, int $season = 0, int $episode = 0, ?string $detailPath = null): array
+    /** External subtitle files for a specific resource (video file). */
+    public function extCaptions(string $subjectId, string $resourceId): array
     {
-        return $this->mediaEndpoint('/wefeed-h5-bff/web/subject/download', $subjectId, $season, $episode, $detailPath, 'download');
+        return $this->getData(
+            self::EXT_CAPTIONS,
+            ['subjectId' => $subjectId, 'resourceId' => $resourceId],
+            context: 'ext-captions'
+        );
     }
 
-    protected function mediaEndpoint(string $path, string $subjectId, int $season, int $episode, ?string $detailPath, string $context): array
+    /** Adaptive (DASH/MPD) play info for a movie/episode. */
+    public function playInfo(string $subjectId, int $season = 0, int $episode = 0): array
     {
-        $this->ensureBootstrapped();
-
-        $headers = [];
-        if ($detailPath) {
-            // Without a matching Referer the backend serves an empty body.
-            $headers['Referer'] = $this->baseUrl().'/movies/'.ltrim($detailPath, '/');
-        }
-
-        return $this->unwrap(
-            $this->client($headers)->get($this->baseUrl().$path, [
-                'subjectId' => $subjectId,
-                'se' => $season,
-                'ep' => $episode,
-            ]),
-            $context
+        return $this->getData(
+            self::PLAY_INFO,
+            ['subjectId' => $subjectId, 'se' => $season, 'ep' => $episode],
+            context: 'play-info',
+            playMode: true
         );
     }
 
     // -----------------------------------------------------------------
-    // Bootstrap (token + cookies)
+    // Diagnostics
     // -----------------------------------------------------------------
 
     /**
-     * Diagnostic probe: tests a fresh token bootstrap (bypassing cache) and
-     * reports the resolved hosts. Never throws — returns a report array.
-     *
      * @return array<string,mixed>
      */
     public function probe(): array
     {
-        $report = [
-            'host' => $this->baseUrl(),
-            'apiHost' => $this->apiBaseUrl(),
-            'proxy' => $this->proxy ? 'configured' : 'none',
-        ];
+        $report = ['hostPool' => $this->hostPool, 'proxy' => $this->proxy ? 'configured' : 'none'];
 
         try {
-            $token = $this->fetchToken();
-            $this->token = $token;
-            $report['tokenBootstrap'] = $token !== '' ? 'ok ('.strlen($token).' chars)' : 'empty token';
-        } catch (\Throwable $e) {
+            $this->bootstrapped = false;
+            $this->token = null;
+            $data = $this->getData(self::MAIN_PAGE, ['page' => 1, 'tabId' => 0, 'version' => ''], context: 'probe');
+            $report['activeHost'] = $this->activeBase;
+            $report['tokenBootstrap'] = $this->token ? 'ok ('.strlen($this->token).' chars)' : 'no token in x-user';
+            $report['home'] = ['ok' => true, 'sections' => is_array($data['items'] ?? null) ? count($data['items']) : 0];
+        } catch (Throwable $e) {
             $report['tokenBootstrap'] = 'FAILED';
-            $report['tokenError'] = class_basename($e).': '.$e->getMessage();
-        }
-
-        // The /download and /play endpoints need the account + token cookies
-        // set by the app-info request. Report which cookies we actually got.
-        try {
-            $this->fetchAppCookies();
-            $names = array_values(array_filter(array_map(
-                fn ($c) => $c['Name'] ?? null,
-                $this->cookieJar->toArray()
-            )));
-            $report['cookies'] = $names !== [] ? $names : 'NONE (app-info set no cookies)';
-        } catch (\Throwable $e) {
-            $report['cookies'] = 'error: '.$e->getMessage();
+            $report['error'] = class_basename($e).': '.$e->getMessage();
+            $report['activeHost'] = $this->activeBase;
         }
 
         return $report;
     }
+
+    public function activeHost(): string
+    {
+        return $this->activeBase;
+    }
+
+    // -----------------------------------------------------------------
+    // Transport
+    // -----------------------------------------------------------------
 
     public function ensureBootstrapped(): void
     {
@@ -287,105 +205,136 @@ class MovieBoxClient
             return;
         }
 
-        $this->token = $this->resolveToken();
-        $this->fetchAppCookies();
+        $cached = Cache::get(self::TOKEN_CACHE_KEY);
+        if (is_string($cached) && $cached !== '') {
+            $this->token = $cached;
+            $this->bootstrapped = true;
+
+            return;
+        }
+
+        // First call has no auth token; the server issues one via x-user.
+        $this->request('GET', self::MAIN_PAGE, ['page' => 1, 'tabId' => 0, 'version' => '']);
+
+        if (! $this->token) {
+            throw MovieBoxException::upstream('Token bootstrap failed: no token in x-user header.');
+        }
+
         $this->bootstrapped = true;
     }
 
-    protected function resolveToken(): string
+    protected function getData(string $path, array $params = [], string $context = 'request', bool $playMode = false): mixed
     {
-        return Cache::remember($this->tokenCacheKey(), $this->tokenTtl, fn () => $this->fetchToken());
+        if ($context !== 'probe') {
+            $this->ensureBootstrapped();
+        }
+
+        [, $response] = $this->request('GET', $path, $params, playMode: $playMode);
+
+        return $this->unwrap($response, $context);
+    }
+
+    protected function postData(string $path, array $payload, string $context = 'request'): mixed
+    {
+        $this->ensureBootstrapped();
+
+        $body = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        [, $response] = $this->request('POST', $path, [], $body);
+
+        return $this->unwrap($response, $context);
     }
 
     /**
-     * The search-suggest endpoint attaches an auth bearer token to the
-     * response via the `x-user` header. We reuse it for later requests.
+     * Perform a signed request, iterating the host pool until a non-retryable
+     * response is received.
+     *
+     * @return array{0:string,1:Response}
      */
-    protected function fetchToken(): string
+    protected function request(string $method, string $path, array $params = [], ?string $body = null, bool $playMode = false): array
     {
-        try {
-            $response = $this->client(withAuth: false)->post(
-                $this->apiBaseUrl().'/wefeed-h5api-bff/subject/search-suggest',
-                ['keyword' => 'avatar', 'perPage' => 0]
-            );
-        } catch (ConnectionException $e) {
-            throw MovieBoxException::upstream('Could not reach MovieBox to bootstrap a token: '.$e->getMessage());
+        $query = $params === [] ? '' : http_build_query($params, '', '&', PHP_QUERY_RFC3986);
+        $pathWithQuery = $query === '' ? $path : $path.'?'.$query;
+
+        $lastResponse = null;
+
+        foreach ($this->hostPool as $base) {
+            try {
+                $client = $this->buildClient($method, $path, $params, $body, $playMode);
+                $response = $method === 'GET'
+                    ? $client->get($base.$pathWithQuery)
+                    : $client->withBody($body ?? '', 'application/json; charset=utf-8')->post($base.$pathWithQuery);
+            } catch (Throwable $e) {
+                report($e);
+
+                continue;
+            }
+
+            $this->absorbToken($response);
+            $lastResponse = $response;
+
+            if (! in_array($response->status(), self::RETRY_STATUS, true)) {
+                $this->activeBase = $base;
+
+                return [$base, $response];
+            }
         }
 
-        $xUser = $response->header('x-user');
+        if ($lastResponse === null) {
+            throw MovieBoxException::upstream("All MovieBox hosts were unreachable for '$path'.");
+        }
 
+        return [$this->activeBase, $lastResponse];
+    }
+
+    protected function buildClient(string $method, string $path, array $params, ?string $body, bool $playMode): PendingRequest
+    {
+        $ts = (int) round(microtime(true) * 1000);
+        $accept = 'application/json';
+        $contentType = $method === 'GET' ? 'application/json' : 'application/json; charset=utf-8';
+
+        $headers = [
+            'User-Agent' => $this->userAgent,
+            'Accept' => $accept,
+            'Content-Type' => $contentType,
+            'Connection' => 'keep-alive',
+            'X-Client-Token' => Signer::clientToken($ts),
+            'x-tr-signature' => Signer::signature($method, $accept, $contentType, $path, $params, $body, $this->secretKey, $ts),
+            'X-Client-Info' => $this->clientInfo,
+            'X-Client-Status' => '0',
+        ];
+
+        if ($this->token) {
+            $headers['Authorization'] = 'Bearer '.$this->token;
+        }
+
+        if ($playMode) {
+            $headers['X-Play-Mode'] = '2';
+        }
+
+        $request = Http::withHeaders($headers)
+            ->connectTimeout(min(10, $this->timeout))
+            ->timeout($this->timeout);
+
+        if ($this->proxy) {
+            $request->withOptions(['proxy' => $this->proxy]);
+        }
+
+        return $request;
+    }
+
+    /** Absorb a fresh bearer token from the x-user response header. */
+    protected function absorbToken(Response $response): void
+    {
+        $xUser = $response->header('x-user');
         if (! $xUser) {
-            throw MovieBoxException::upstream('Token bootstrap failed: response is missing the x-user header.');
+            return;
         }
 
         $decoded = json_decode($xUser, true);
-
-        if (! is_array($decoded) || empty($decoded['token'])) {
-            throw MovieBoxException::upstream('Token bootstrap failed: no token present in x-user header.');
+        if (is_array($decoded) && ! empty($decoded['token'])) {
+            $this->token = $decoded['token'];
+            Cache::put(self::TOKEN_CACHE_KEY, $this->token, $this->tokenTtl);
         }
-
-        return $decoded['token'];
-    }
-
-    /**
-     * Fetch the latest app package info purely to obtain the `account`/`token`
-     * cookies the backend expects on subsequent requests. Best-effort.
-     */
-    protected function fetchAppCookies(): void
-    {
-        try {
-            $this->client()->get(
-                $this->baseUrl().'/wefeed-h5-bff/app/get-latest-app-pkgs',
-                ['app_name' => 'moviebox']
-            );
-        } catch (Throwable $e) {
-            report($e);
-        }
-    }
-
-    // -----------------------------------------------------------------
-    // Low-level helpers
-    // -----------------------------------------------------------------
-
-    protected function client(array $headers = [], bool $withAuth = true): PendingRequest
-    {
-        $defaults = [
-            'Accept' => 'application/json',
-            'Accept-Language' => 'en-US,en;q=0.9',
-            'User-Agent' => $this->userAgent,
-            'X-Client-Info' => json_encode(['timezone' => config('app.timezone', 'UTC')]),
-            'Referer' => $this->baseUrl().'/',
-            'Origin' => $this->baseUrl(),
-        ];
-
-        if ($withAuth && $this->token) {
-            $defaults['Authorization'] = 'Bearer '.$this->token;
-        }
-
-        $options = ['cookies' => $this->cookieJar];
-        if ($this->proxy) {
-            $options['proxy'] = $this->proxy;
-        }
-
-        return Http::withHeaders(array_merge($defaults, $headers))
-            ->withOptions($options)
-            ->connectTimeout(min(10, $this->timeout)) // fail fast on dead mirrors
-            ->timeout($this->timeout)
-            ->acceptJson();
-    }
-
-    protected function getData(string $path, array $query = [], string $context = 'request'): mixed
-    {
-        $this->ensureBootstrapped();
-
-        return $this->unwrap($this->client()->get($this->baseUrl().$path, $query), $context);
-    }
-
-    protected function postData(string $url, array $payload, string $context = 'request'): mixed
-    {
-        $this->ensureBootstrapped();
-
-        return $this->unwrap($this->client()->post($url, $payload), $context);
     }
 
     protected function unwrap(Response $response, string $context): mixed
@@ -400,13 +349,13 @@ class MovieBoxClient
             throw MovieBoxException::upstream("MovieBox '$context' returned a non-JSON body.");
         }
 
-        if (($json['code'] ?? 1) === 0 && ($json['message'] ?? null) === 'ok') {
-            return $json['data'] ?? [];
+        $code = $json['code'] ?? 0;
+        if ($code !== 0 && $code !== '0') {
+            $message = $json['message'] ?? 'unknown error';
+            throw MovieBoxException::upstream("MovieBox '$context' error (code $code): $message");
         }
 
-        $message = $json['message'] ?? 'unknown error';
-
-        throw MovieBoxException::upstream("MovieBox '$context' error: $message");
+        return $json['data'] ?? $json;
     }
 
     protected function cached(string $key, callable $callback): mixed
@@ -415,6 +364,6 @@ class MovieBoxClient
             return $callback();
         }
 
-        return Cache::remember("moviebox:$key", $this->cacheTtl, $callback);
+        return Cache::remember("moviebox:v3:$key", $this->cacheTtl, $callback);
     }
 }

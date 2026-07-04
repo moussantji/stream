@@ -7,7 +7,6 @@ use App\Services\MovieBox\MovieBoxClient;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
-use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 
 class StreamController extends Controller
@@ -15,201 +14,199 @@ class StreamController extends Controller
     public function __construct(protected MovieBoxClient $client) {}
 
     /**
-     * Resolve playable sources for a title. For movies pass se=0 & ep=0; for a
-     * series episode pass the season & episode numbers. Subtitles are merged
-     * from the download endpoint's caption list (best-effort).
+     * Resolve playable sources for a title. For movies pass season=0 & episode=0;
+     * for a series episode pass the season & episode numbers.
      */
     public function play(Request $request): JsonResponse
     {
-        $validated = $this->validatePayload($request);
+        $v = $this->validatePayload($request);
         $debug = $request->boolean('debug') || config('app.debug');
-        $attempts = [];
+        $diag = [];
 
-        foreach ($this->mirrorClients() as $name => $client) {
-            $result = $this->collectFromClient($client, $validated);
-            $attempts[$name] = $result['diag'];
+        $files = $this->resolveVideoFiles($v['subjectId'], $v['season'], $v['episode'], $diag);
+        $sources = $this->normalizeSources($files);
+        $subtitles = $this->resolveSubtitles($v['subjectId'], $files, $diag);
 
-            if ($result['sources'] !== [] || $result['hls'] !== []) {
-                $this->rememberWorkingMirror($name);
+        $payload = [
+            'sources' => $sources,
+            'hls' => [],
+            'subtitles' => $subtitles,
+            'hasResource' => $sources !== [],
+        ];
 
-                $payload = [
-                    'sources' => $result['sources'],
-                    'hls' => $result['hls'],
-                    'subtitles' => $result['subtitles'],
-                    'hasResource' => true,
-                    'mirror' => $name,
-                ];
-                if ($debug) {
-                    $payload['debug'] = ['params' => $validated, 'attempts' => $attempts];
-                }
-
-                return response()->json(['data' => $payload]);
-            }
-        }
-
-        $payload = ['sources' => [], 'hls' => [], 'subtitles' => [], 'hasResource' => false];
         if ($debug) {
-            $payload['debug'] = ['params' => $validated, 'attempts' => $attempts];
+            $payload['debug'] = [
+                'params' => $v,
+                'host' => $this->client->activeHost(),
+                'fileCount' => count($files),
+                'calls' => $diag,
+            ];
         }
 
         return response()->json(['data' => $payload]);
     }
 
-    /**
-     * Build the ordered list of clients to try: the last-known working mirror
-     * first (if any), then the primary host, then configured fallback mirrors.
-     *
-     * @return array<string,MovieBoxClient>
-     */
-    protected function mirrorClients(): array
-    {
-        $clients = ['primary' => $this->client];
-
-        foreach ((array) config('moviebox.mirrors', []) as $mirror) {
-            if (! is_array($mirror) || empty($mirror['host'])) {
-                continue;
-            }
-            $clients[$mirror['host']] ??= new MovieBoxClient($mirror);
-        }
-
-        $working = Cache::get('moviebox:working_mirror');
-        if ($working && isset($clients[$working])) {
-            $clients = [$working => $clients[$working]] + $clients;
-        }
-
-        return $clients;
-    }
-
-    protected function rememberWorkingMirror(string $name): void
-    {
-        Cache::put('moviebox:working_mirror', $name, now()->addHours(6));
-    }
-
-    /**
-     * Gather playable sources + subtitles from a single mirror (resilient).
-     *
-     * @param  array{subjectId:string,season:int,episode:int,detailPath:?string}  $v
-     * @return array{sources:array,hls:array,subtitles:array,diag:array}
-     */
-    protected function collectFromClient(MovieBoxClient $client, array $v): array
-    {
-        $downloads = $streams = $hls = $subtitles = [];
-        $diag = [];
-
-        // Direct MP4 files (most reliable, browser-playable).
-        try {
-            $d = $client->download($v['subjectId'], $v['season'], $v['episode'], $v['detailPath'] ?? null);
-            $downloads = $this->normalizeSources($d['downloads'] ?? [], resolutionKey: 'resolution');
-            $subtitles = $this->normalizeCaptions($d['captions'] ?? []);
-            $diag['download'] = [
-                'ok' => true,
-                'hasResource' => $d['hasResource'] ?? null,
-                'downloadCount' => is_array($d['downloads'] ?? null) ? count($d['downloads']) : 0,
-                'captionCount' => is_array($d['captions'] ?? null) ? count($d['captions']) : 0,
-            ];
-        } catch (\Throwable $e) {
-            report($e);
-            $diag['download'] = ['ok' => false, 'type' => class_basename($e), 'error' => $e->getMessage()];
-        }
-
-        // Adaptive streams / HLS on top.
-        try {
-            $p = $client->play($v['subjectId'], $v['season'], $v['episode'], $v['detailPath'] ?? null);
-            $streams = $this->normalizeSources($p['streams'] ?? []);
-            $hls = array_values(array_filter(array_map(
-                fn ($h) => is_array($h) ? ($h['url'] ?? null) : (is_string($h) ? $h : null),
-                $p['hls'] ?? []
-            )));
-            $diag['play'] = [
-                'ok' => true,
-                'hasResource' => $p['hasResource'] ?? null,
-                'streamCount' => is_array($p['streams'] ?? null) ? count($p['streams']) : 0,
-                'hlsCount' => is_array($p['hls'] ?? null) ? count($p['hls']) : 0,
-            ];
-        } catch (\Throwable $e) {
-            report($e);
-            $diag['play'] = ['ok' => false, 'type' => class_basename($e), 'error' => $e->getMessage()];
-        }
-
-        return [
-            'sources' => $this->mergeSources($downloads, $streams),
-            'hls' => $hls,
-            'subtitles' => $subtitles,
-            'diag' => $diag,
-        ];
-    }
-
-    /**
-     * Merge two source lists, de-duplicating by resolution (primary wins) and
-     * ordering highest quality first.
-     *
-     * @param  array<int,array<string,mixed>>  $primary
-     * @param  array<int,array<string,mixed>>  $secondary
-     * @return array<int,array<string,mixed>>
-     */
-    protected function mergeSources(array $primary, array $secondary): array
-    {
-        $byKey = [];
-        foreach ([...$primary, ...$secondary] as $source) {
-            if (empty($source['url'])) {
-                continue;
-            }
-            $key = ($source['resolution'] ?? 0) ?: $source['url'];
-            $byKey[$key] ??= $source;
-        }
-
-        $merged = array_values($byKey);
-        usort($merged, fn ($a, $b) => ($b['resolution'] ?? 0) <=> ($a['resolution'] ?? 0));
-
-        return $merged;
-    }
-
-    /** Downloadable media files + subtitle files (with mirror fallback). */
+    /** Downloadable media files + subtitle files. */
     public function download(Request $request): JsonResponse
     {
-        $validated = $this->validatePayload($request);
+        $v = $this->validatePayload($request);
+        $diag = [];
 
-        foreach ($this->mirrorClients() as $name => $client) {
-            try {
-                $data = $client->download(
-                    $validated['subjectId'],
-                    $validated['season'],
-                    $validated['episode'],
-                    $validated['detailPath'] ?? null
-                );
-            } catch (\Throwable $e) {
-                report($e);
-
-                continue;
-            }
-
-            $downloads = $this->normalizeSources($data['downloads'] ?? [], resolutionKey: 'resolution');
-            $subtitles = $this->normalizeCaptions($data['captions'] ?? []);
-
-            if ($downloads !== [] || $subtitles !== []) {
-                $this->rememberWorkingMirror($name);
-
-                return response()->json([
-                    'data' => [
-                        'downloads' => $downloads,
-                        'subtitles' => $subtitles,
-                        'limited' => (bool) ($data['limited'] ?? false),
-                        'hasResource' => true,
-                        'mirror' => $name,
-                    ],
-                ]);
-            }
-        }
+        $files = $this->resolveVideoFiles($v['subjectId'], $v['season'], $v['episode'], $diag);
 
         return response()->json([
-            'data' => ['downloads' => [], 'subtitles' => [], 'limited' => false, 'hasResource' => false],
+            'data' => [
+                'downloads' => $this->normalizeSources($files),
+                'subtitles' => $this->resolveSubtitles($v['subjectId'], $files, $diag),
+                'hasResource' => $files !== [],
+            ],
         ]);
     }
 
     /**
+     * Fetch the resource list and return the video files matching the requested
+     * season/episode (all resolution variants for a movie).
+     *
+     * @param  array<string,mixed>  $diag
+     * @return array<int,array<string,mixed>>
+     */
+    protected function resolveVideoFiles(string $subjectId, int $season, int $episode, array &$diag): array
+    {
+        $isMovie = $season === 0 && $episode === 0;
+        $maxPages = $isMovie ? 1 : 6;
+        $matched = [];
+        $page = 1;
+
+        do {
+            try {
+                $res = $this->client->resource($subjectId, 1080, $page, 20);
+            } catch (\Throwable $e) {
+                report($e);
+                $diag["resource_page_$page"] = ['ok' => false, 'error' => class_basename($e).': '.$e->getMessage()];
+                break;
+            }
+
+            $list = is_array($res['list'] ?? null) ? $res['list'] : [];
+            $diag["resource_page_$page"] = [
+                'ok' => true,
+                'listCount' => count($list),
+                'hasMore' => $res['pager']['hasMore'] ?? false,
+            ];
+
+            if ($isMovie) {
+                $matched = array_values(array_filter(
+                    $list,
+                    fn ($it) => is_array($it) && ! empty($it['resourceLink'])
+                ));
+                break;
+            }
+
+            foreach ($list as $it) {
+                if (is_array($it)
+                    && (int) ($it['se'] ?? -1) === $season
+                    && (int) ($it['ep'] ?? -1) === $episode
+                    && ! empty($it['resourceLink'])) {
+                    $matched[] = $it;
+                }
+            }
+
+            $hasMore = (bool) ($res['pager']['hasMore'] ?? false);
+            $page++;
+        } while ($matched === [] && $hasMore && $page <= $maxPages);
+
+        return $matched;
+    }
+
+    /**
+     * Collect subtitles: embedded on the file, otherwise via the ext-captions
+     * endpoint for the first resource.
+     *
+     * @param  array<int,array<string,mixed>>  $files
+     * @param  array<string,mixed>  $diag
+     * @return array<int,array<string,mixed>>
+     */
+    protected function resolveSubtitles(string $subjectId, array $files, array &$diag): array
+    {
+        foreach ($files as $file) {
+            if (! empty($file['extCaptions']) && is_array($file['extCaptions'])) {
+                return $this->normalizeCaptions($file['extCaptions']);
+            }
+        }
+
+        $resourceId = $files[0]['resourceId'] ?? null;
+        if (! $resourceId) {
+            return [];
+        }
+
+        try {
+            $cap = $this->client->extCaptions($subjectId, (string) $resourceId);
+
+            return $this->normalizeCaptions($cap['extCaptions'] ?? $cap['captions'] ?? []);
+        } catch (\Throwable $e) {
+            report($e);
+            $diag['captions'] = ['ok' => false, 'error' => $e->getMessage()];
+
+            return [];
+        }
+    }
+
+    /**
+     * @param  array<int,mixed>  $files
+     * @return array<int,array<string,mixed>>
+     */
+    protected function normalizeSources(array $files): array
+    {
+        $sources = [];
+        foreach ($files as $file) {
+            if (! is_array($file)) {
+                continue;
+            }
+            $url = $file['resourceLink'] ?? $file['url'] ?? null;
+            if (! $url) {
+                continue;
+            }
+
+            $resolution = (int) ($file['resolution'] ?? 0);
+            $sources[] = [
+                'url' => $url,
+                'resolution' => $resolution,
+                'quality' => $resolution > 0 ? $resolution.'p' : 'auto',
+                'size' => isset($file['size']) ? (int) $file['size'] : null,
+                'format' => $this->extFromUrl($url),
+                'codec' => $file['codecName'] ?? null,
+                'durationSeconds' => isset($file['duration']) ? (int) $file['duration'] : null,
+            ];
+        }
+
+        // Deduplicate by resolution (keep first) and order highest quality first.
+        $byKey = [];
+        foreach ($sources as $source) {
+            $key = $source['resolution'] ?: $source['url'];
+            $byKey[$key] ??= $source;
+        }
+        $out = array_values($byKey);
+        usort($out, fn ($a, $b) => $b['resolution'] <=> $a['resolution']);
+
+        return $out;
+    }
+
+    /**
+     * @param  array<int,mixed>  $captions
+     * @return array<int,array<string,mixed>>
+     */
+    protected function normalizeCaptions(array $captions): array
+    {
+        return array_values(array_map(fn ($caption) => [
+            'lang' => $caption['lan'] ?? null,
+            'label' => $caption['lanName'] ?? ($caption['lan'] ?? 'Subtitle'),
+            'url' => $caption['url'] ?? null,
+            'format' => $this->extFromUrl($caption['url'] ?? ''),
+        ], array_filter($captions, fn ($c) => is_array($c) && ! empty($c['url']))));
+    }
+
+    /**
      * Proxy + normalise a subtitle file to WebVTT so it can be attached to the
-     * HTML5 player without cross-origin issues (browsers require CORS + VTT for
-     * <track>; many upstream captions are SRT served without CORS headers).
+     * HTML5 player without cross-origin issues.
      */
     public function subtitle(Request $request): Response
     {
@@ -218,8 +215,6 @@ class StreamController extends Controller
         ]);
 
         $url = $validated['url'];
-
-        // Only allow subtitle-ish files to be proxied.
         $ext = $this->extFromUrl($url);
         abort_unless(in_array($ext, ['srt', 'vtt', null], true), 415, 'Unsupported subtitle format.');
 
@@ -240,75 +235,32 @@ class StreamController extends Controller
         ]);
     }
 
-    /** Convert SubRip (SRT) content to WebVTT. */
     protected function srtToVtt(string $srt): string
     {
-        $srt = preg_replace('/^\xEF\xBB\xBF/', '', $srt); // strip BOM
+        $srt = preg_replace('/^\xEF\xBB\xBF/', '', $srt);
         $srt = str_replace(["\r\n", "\r"], "\n", $srt);
-
-        // SRT uses comma millisecond separators; VTT uses dots.
         $srt = preg_replace('/(\d{2}:\d{2}:\d{2}),(\d{3})/', '$1.$2', $srt);
 
         return "WEBVTT\n\n".trim($srt)."\n";
     }
 
     /**
-     * @return array{subjectId:string,season:int,episode:int,detailPath:?string}
+     * @return array{subjectId:string,season:int,episode:int}
      */
     protected function validatePayload(Request $request): array
     {
         $validated = $request->validate([
             'subjectId' => ['required', 'string'],
-            'detailPath' => ['sometimes', 'nullable', 'string'],
+            'detailPath' => ['sometimes', 'nullable', 'string'], // ignored (v3 uses subjectId)
             'season' => ['sometimes', 'integer', 'min:0'],
             'episode' => ['sometimes', 'integer', 'min:0'],
         ]);
 
         return [
             'subjectId' => $validated['subjectId'],
-            'detailPath' => $validated['detailPath'] ?? null,
             'season' => (int) ($validated['season'] ?? 0),
             'episode' => (int) ($validated['episode'] ?? 0),
         ];
-    }
-
-    /**
-     * @param  array<int,mixed>  $streams
-     * @return array<int,array<string,mixed>>
-     */
-    protected function normalizeSources(array $streams, string $resolutionKey = 'resolutions'): array
-    {
-        $sources = array_values(array_map(function ($stream) use ($resolutionKey) {
-            $resolution = (int) ($stream[$resolutionKey] ?? $stream['resolution'] ?? $stream['resolutions'] ?? 0);
-
-            return [
-                'url' => $stream['url'] ?? null,
-                'resolution' => $resolution,
-                'quality' => $resolution > 0 ? $resolution.'p' : 'auto',
-                'size' => isset($stream['size']) ? (int) $stream['size'] : null,
-                'format' => $stream['format'] ?? $this->extFromUrl($stream['url'] ?? ''),
-                'codec' => $stream['codecName'] ?? null,
-                'durationSeconds' => isset($stream['duration']) ? (int) $stream['duration'] : null,
-            ];
-        }, array_filter($streams, fn ($s) => is_array($s) && ! empty($s['url']))));
-
-        usort($sources, fn ($a, $b) => $b['resolution'] <=> $a['resolution']);
-
-        return $sources;
-    }
-
-    /**
-     * @param  array<int,mixed>  $captions
-     * @return array<int,array<string,mixed>>
-     */
-    protected function normalizeCaptions(array $captions): array
-    {
-        return array_values(array_map(fn ($caption) => [
-            'lang' => $caption['lan'] ?? null,
-            'label' => $caption['lanName'] ?? ($caption['lan'] ?? 'Subtitle'),
-            'url' => $caption['url'] ?? null,
-            'format' => $this->extFromUrl($caption['url'] ?? ''),
-        ], array_filter($captions, fn ($c) => is_array($c) && ! empty($c['url']))));
     }
 
     protected function extFromUrl(string $url): ?string

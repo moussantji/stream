@@ -2,61 +2,28 @@
 
 /*
 |--------------------------------------------------------------------------
-| MovieBox (aoneroom) backend configuration
+| MovieBox (aoneroom) mobile API configuration
 |--------------------------------------------------------------------------
 |
-| This app talks directly to the same public "h5 BFF" endpoints that the
-| upstream Python project `Simatwa/moviebox-api` uses. The values below
-| control which mirror host is used, request behaviour and caching.
+| This app talks to the signed "wefeed-mobile-bff" API used by the MovieBox
+| Android app (the same one the upstream `Simatwa/moviebox-api` v3 client
+| targets). Requests are HMAC-signed and load-balanced across a pool of API
+| hosts with automatic failover.
 |
 */
 
 return [
 
-    // The h5 web BFF host (home / trending / detail / play / download).
-    'host' => env('MOVIEBOX_HOST', 'h5.aoneroom.com'),
-
-    // The API host used for search + search-suggest. This endpoint returns
-    // the bearer token (in the `x-user` response header) used to authorise
-    // subsequent requests.
-    'api_host' => env('MOVIEBOX_API_HOST', 'h5-api.aoneroom.com'),
-
-    'scheme' => env('MOVIEBOX_SCHEME', 'https'),
-
-    /*
-    | Fallback mirrors for the /play and /download endpoints. When the primary
-    | host returns no playable resource (hasResource=false), the app tries these
-    | in order and caches whichever works. aoneroom is great for browsing but
-    | often serves no media in some regions, while other mirrors do.
-    |
-    | Format (comma separated): "host" or "host|apiHost".
-    | e.g. MOVIEBOX_MIRRORS="lok-lok.cc, moviebox.ph|h5-api.aoneroom.com"
-    */
-    'mirrors' => (function () {
-        $raw = env('MOVIEBOX_MIRRORS');
-        $entries = ($raw !== null && $raw !== '')
-            ? explode(',', $raw)
-            : ['lok-lok.cc']; // sensible default: a commonly-working mirror
-
-        return array_values(array_filter(array_map(function ($entry) {
-            $entry = trim((string) $entry);
-            if ($entry === '') {
-                return null;
-            }
-            [$host, $apiHost] = array_pad(explode('|', $entry), 2, null);
-            $host = trim((string) $host);
-
-            return $host === '' ? null : [
-                'host' => $host,
-                'api_host' => trim((string) ($apiHost ?: $host)),
-            ];
-        }, $entries)));
-    })(),
+    // API host pool (tried in order, with failover on 4xx/5xx retry codes).
+    'host_pool' => array_values(array_filter(array_map('trim', explode(',', (string) env(
+        'MOVIEBOX_HOST_POOL',
+        'https://api6.aoneroom.com,https://api5.aoneroom.com,https://api4.aoneroom.com,https://api4sg.aoneroom.com,https://api3.aoneroom.com,https://api6sg.aoneroom.com,https://api.inmoviebox.com'
+    ))))),
 
     // Seconds to cache the bootstrapped bearer token.
     'token_ttl' => (int) env('MOVIEBOX_TOKEN_TTL', 1800),
 
-    // Seconds to cache catalog responses (home/trending/search/detail).
+    // Seconds to cache catalog responses (home/search/detail).
     'cache_ttl' => (int) env('MOVIEBOX_CACHE_TTL', 300),
 
     // Outbound request timeout, seconds.
@@ -65,11 +32,32 @@ return [
     // Optional outbound proxy.
     'proxy' => env('MOVIEBOX_PROXY') ?: null,
 
-    // Referer used specifically for media / subtitle download requests.
-    'download_referer' => env('MOVIEBOX_DOWNLOAD_REFERER', 'https://fmoviesunblocked.net/'),
+    // HMAC signing secret (base64). Override only if the upstream rotates it.
+    'secret_key' => env('MOVIEBOX_SECRET_KEY', '76iRl07s0xSN9jqmEWAt79EBJZulIQIsV64FZr2O'),
 
+    // Android app identity used in request headers.
     'user_agent' => env(
         'MOVIEBOX_USER_AGENT',
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36'
+        'com.community.oneroom/50020045 (Linux; U; Android 13; en_US; 23078RKD5C; Build/TQ2A.230405.003; Cronet/135.0.7012.3)'
     ),
+
+    'client_info' => env('MOVIEBOX_CLIENT_INFO', json_encode([
+        'package_name' => 'com.community.oneroom',
+        'version_name' => '3.0.03.0529.03',
+        'version_code' => 50020045,
+        'os' => 'android',
+        'os_version' => '13',
+        'install_ch' => 'ps',
+        'device_id' => 'a1b2c3d4e5f60718293a4b5c6d7e8f90',
+        'install_store' => 'ps',
+        'gaid' => 'b6f3a2c1-4d5e-6f70-8192-a3b4c5d6e7f8',
+        'brand' => 'Redmi',
+        'model' => '23078RKD5C',
+        'system_language' => 'en',
+        'net' => 'NETWORK_WIFI',
+        'region' => 'US',
+        'timezone' => 'America/New_York',
+        'sp_code' => '40401',
+        'X-Play-Mode' => '2',
+    ])),
 ];

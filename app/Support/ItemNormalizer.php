@@ -52,6 +52,8 @@ class ItemNormalizer
             $year = (int) substr($releaseDate, 0, 4);
         }
 
+        $rating = self::floatOrNull($get('imdbRatingValue') ?? $get('imdbRate'));
+
         return [
             'subjectId' => (string) $subjectId,
             'subjectType' => $type,
@@ -62,9 +64,11 @@ class ItemNormalizer
             'genres' => self::genres($get('genre')),
             'releaseDate' => $releaseDate ?: null,
             'year' => $year,
-            'durationSeconds' => self::intOrNull($get('durationSeconds') ?? $get('duration')),
-            'imdbRating' => self::floatOrNull($get('imdbRatingValue') ?? $get('imdbRate')),
+            'durationSeconds' => self::intOrNull($get('durationSeconds') ?? $get('seconds') ?? $get('duration')),
+            'imdbRating' => $rating > 0 ? $rating : null,
             'country' => $get('countryName'),
+            'seasonCount' => self::intOrNull($get('seNum')),
+            // v3 uses subjectId everywhere; detailPath kept only for back-compat.
             'detailPath' => $get('detailPath'),
             'hasResource' => (bool) ($get('hasResource') ?? true),
         ];

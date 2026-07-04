@@ -13,26 +13,29 @@ class CatalogController extends Controller
 {
     public function __construct(protected MovieBoxClient $client) {}
 
-    /** Curated landing-page rows built from the backend "operatingList". */
+    /** Curated landing-page rows built from the tab-operating response. */
     public function home(): JsonResponse
     {
-        $data = $this->client->home();
+        $data = $this->client->home(0);
 
         $sections = [];
-        foreach (($data['operatingList'] ?? []) as $entry) {
-            if (! is_array($entry)) {
+        foreach (($data['items'] ?? []) as $block) {
+            if (! is_array($block)) {
                 continue;
             }
 
-            $rawItems = $entry['banner']['items'] ?? $entry['subjects'] ?? [];
-            $items = ItemNormalizer::many(is_array($rawItems) ? $rawItems : []);
+            $rawItems = $block['subjects'] ?? [];
+            if (! $rawItems && isset($block['banner']['banners'])) {
+                $rawItems = $block['banner']['banners'];
+            }
 
+            $items = ItemNormalizer::many(is_array($rawItems) ? $rawItems : []);
             if ($items === []) {
                 continue;
             }
 
             $sections[] = [
-                'title' => $entry['title'] ?? 'Featured',
+                'title' => $block['title'] ?? 'Featured',
                 'items' => $items,
             ];
         }
@@ -40,20 +43,30 @@ class CatalogController extends Controller
         return response()->json(['data' => ['sections' => $sections]]);
     }
 
-    /** Trending titles (page is zero-indexed upstream). */
+    /** Trending: a flat, de-duplicated list drawn from the landing page. */
     public function trending(Request $request): JsonResponse
     {
-        $page = max(0, (int) $request->integer('page', 0));
-        $perPage = min(48, max(1, (int) $request->integer('perPage', 18)));
+        $tab = SubjectType::resolve($request->input('type', 'all'));
+        $tabId = match ($tab) {
+            SubjectType::MOVIES => 2,
+            SubjectType::TV_SERIES => 5,
+            default => 0,
+        };
 
-        $data = $this->client->trending($page, $perPage);
+        $data = $this->client->home($tabId);
 
-        return response()->json([
-            'data' => [
-                'items' => ItemNormalizer::many($data['subjectList'] ?? $data['items'] ?? []),
-                'pager' => $data['pager'] ?? null,
-            ],
-        ]);
+        $seen = [];
+        $items = [];
+        foreach (($data['items'] ?? []) as $block) {
+            foreach (ItemNormalizer::many($block['subjects'] ?? []) as $item) {
+                if (! isset($seen[$item['subjectId']])) {
+                    $seen[$item['subjectId']] = true;
+                    $items[] = $item;
+                }
+            }
+        }
+
+        return response()->json(['data' => ['items' => $items, 'pager' => null]]);
     }
 
     /** Full search with optional type filter (all|movies|tv-series). */
@@ -63,12 +76,12 @@ class CatalogController extends Controller
             'q' => ['required', 'string', 'min:1', 'max:120'],
             'type' => ['sometimes', 'string'],
             'page' => ['sometimes', 'integer', 'min:1'],
-            'perPage' => ['sometimes', 'integer', 'min:1', 'max:48'],
+            'perPage' => ['sometimes', 'integer', 'min:1', 'max:20'],
         ]);
 
         $type = SubjectType::resolve($validated['type'] ?? 'all');
         $page = (int) ($validated['page'] ?? 1);
-        $perPage = (int) ($validated['perPage'] ?? 24);
+        $perPage = (int) ($validated['perPage'] ?? 20);
 
         $data = $this->client->search($validated['q'], $type->value, $page, $perPage);
 
@@ -82,95 +95,66 @@ class CatalogController extends Controller
         ]);
     }
 
-    /** Health probe for the MovieBox backend connection. */
-    public function diagnostics(): JsonResponse
-    {
-        $report = $this->client->probe();
-
-        try {
-            $home = $this->client->home();
-            $report['home'] = [
-                'ok' => true,
-                'sections' => is_array($home['operatingList'] ?? null) ? count($home['operatingList']) : 0,
-            ];
-        } catch (\Throwable $e) {
-            $report['home'] = ['ok' => false, 'error' => class_basename($e).': '.$e->getMessage()];
-        }
-
-        return response()->json(['data' => $report]);
-    }
-
-    /** Autocomplete suggestions. */
+    /** Autocomplete suggestions (backed by a small search). */
     public function suggest(Request $request): JsonResponse
     {
         $validated = $request->validate([
             'q' => ['required', 'string', 'min:1', 'max:120'],
         ]);
 
-        $data = $this->client->suggest($validated['q']);
-
-        $suggestions = array_values(array_map(
-            fn ($item) => [
-                'word' => $item['word'] ?? null,
-                'type' => (int) ($item['type'] ?? 0),
-            ],
-            array_filter($data['items'] ?? [], 'is_array')
-        ));
+        $suggestions = [];
+        try {
+            $data = $this->client->search($validated['q'], 0, 1, 8);
+            foreach ($data['items'] ?? [] as $item) {
+                if (! empty($item['title'])) {
+                    $suggestions[] = ['word' => $item['title'], 'type' => (int) ($item['subjectType'] ?? 0)];
+                }
+            }
+        } catch (\Throwable $e) {
+            report($e);
+        }
 
         return response()->json(['data' => ['suggestions' => $suggestions]]);
     }
 
-    /** Popular searches + editorial "hot" lists for discovery widgets. */
+    /** Popular / hot lists for discovery widgets. */
     public function discover(): JsonResponse
     {
-        $hot = $this->client->hot();
+        $movies = $this->trendingItems(2);
+        $series = $this->trendingItems(5);
 
         return response()->json([
             'data' => [
-                'popular' => array_values(array_map(
-                    fn ($item) => is_array($item) ? ($item['title'] ?? null) : $item,
-                    $this->client->popularSearch()
-                )),
-                'hotMovies' => ItemNormalizer::many($hot['movie'] ?? []),
-                'hotSeries' => ItemNormalizer::many($hot['tv'] ?? []),
+                'popular' => array_map(fn ($i) => $i['title'], array_slice($movies, 0, 10)),
+                'hotMovies' => $movies,
+                'hotSeries' => $series,
             ],
         ]);
     }
 
     /**
-     * Rich detail page data: best-available metadata, seasons/episodes for
-     * series, cast, and recommendations. Degrades gracefully when the detail
-     * HTML can't be parsed.
+     * Rich detail-page data: metadata, seasons/episodes for series, cast, and
+     * a few recommendations.
      */
     public function detail(Request $request): JsonResponse
     {
         $validated = $request->validate([
             'subjectId' => ['required', 'string'],
-            'detailPath' => ['required', 'string'],
             'subjectType' => ['sometimes', 'integer'],
             'title' => ['sometimes', 'string'],
             'cover' => ['sometimes', 'string'],
         ]);
 
         $subjectId = $validated['subjectId'];
-        $detailPath = $validated['detailPath'];
 
-        $detail = $this->client->detail($detailPath, $subjectId);
-
-        $item = null;
-        $seasons = [];
-        $cast = [];
-
-        if (is_array($detail)) {
-            if (isset($detail['subject']) && is_array($detail['subject'])) {
-                $item = ItemNormalizer::one($detail['subject']);
-            }
-
-            $seasons = $this->normalizeSeasons($detail['resource']['seasons'] ?? []);
-            $cast = $this->normalizeCast($detail['stars'] ?? []);
+        $detail = null;
+        try {
+            $detail = $this->client->itemDetails($subjectId);
+        } catch (\Throwable $e) {
+            report($e);
         }
 
-        // Fallback metadata supplied by the caller (from the listing it came from).
+        $item = is_array($detail) ? ItemNormalizer::one($detail) : null;
         $item ??= [
             'subjectId' => $subjectId,
             'subjectType' => (int) ($validated['subjectType'] ?? 0),
@@ -184,30 +168,84 @@ class CatalogController extends Controller
             'durationSeconds' => null,
             'imdbRating' => null,
             'country' => null,
-            'detailPath' => $detailPath,
+            'seasonCount' => null,
+            'detailPath' => null,
             'hasResource' => true,
         ];
 
-        $item['detailPath'] ??= $detailPath;
+        $isSeries = $item['subjectType'] === SubjectType::TV_SERIES->value
+            || (int) ($item['seasonCount'] ?? 0) > 0;
 
+        $seasons = [];
+        if ($isSeries) {
+            try {
+                $seasonData = $this->client->seasonInfo($subjectId);
+                $seasons = $this->normalizeSeasons($seasonData['seasons'] ?? []);
+            } catch (\Throwable $e) {
+                report($e);
+            }
+        }
+
+        $cast = is_array($detail) ? $this->normalizeCast($detail['staffList'] ?? []) : [];
+
+        // No dedicated recommendation endpoint in the mobile API; surface a few
+        // titles that share the primary genre instead.
         $recommendations = [];
-        try {
-            $rec = $this->client->recommend($subjectId);
-            $recommendations = ItemNormalizer::many($rec['items'] ?? []);
-        } catch (\Throwable $e) {
-            report($e);
+        if (! empty($item['genres'][0])) {
+            try {
+                $rec = $this->client->search($item['genres'][0], $item['subjectType'], 1, 12);
+                $recommendations = array_values(array_filter(
+                    ItemNormalizer::many($rec['items'] ?? []),
+                    fn ($r) => $r['subjectId'] !== $item['subjectId']
+                ));
+            } catch (\Throwable $e) {
+                report($e);
+            }
         }
 
         return response()->json([
             'data' => [
                 'item' => $item,
-                'isSeries' => $item['subjectType'] === SubjectType::TV_SERIES->value || $seasons !== [],
+                'isSeries' => $isSeries || $seasons !== [],
                 'seasons' => $seasons,
                 'cast' => $cast,
                 'recommendations' => $recommendations,
                 'detailAvailable' => is_array($detail),
             ],
         ]);
+    }
+
+    /** Health probe for the MovieBox backend connection. */
+    public function diagnostics(): JsonResponse
+    {
+        return response()->json(['data' => $this->client->probe()]);
+    }
+
+    /**
+     * @return array<int,array<string,mixed>>
+     */
+    protected function trendingItems(int $tabId): array
+    {
+        try {
+            $data = $this->client->home($tabId);
+        } catch (\Throwable $e) {
+            report($e);
+
+            return [];
+        }
+
+        $seen = [];
+        $items = [];
+        foreach (($data['items'] ?? []) as $block) {
+            foreach (ItemNormalizer::many($block['subjects'] ?? []) as $item) {
+                if (! isset($seen[$item['subjectId']])) {
+                    $seen[$item['subjectId']] = true;
+                    $items[] = $item;
+                }
+            }
+        }
+
+        return $items;
     }
 
     /**

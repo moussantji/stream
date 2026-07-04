@@ -1,10 +1,12 @@
 # MovieBox Stream
 
 A movie & TV streaming website built with **Laravel 12 + Sanctum**. It searches,
-browses and streams content by talking directly to the public MovieBox
-(*aoneroom*) backend — the same endpoints used by the Python project
-[`Simatwa/moviebox-api`](https://github.com/Simatwa/moviebox-api), re-implemented
-natively in PHP so there is no Python runtime dependency.
+browses and streams content by talking directly to the MovieBox (*aoneroom*)
+**signed mobile API** (`wefeed-mobile-bff` on the `api*.aoneroom.com` host pool) —
+the same API used by the Python project
+[`Simatwa/moviebox-api`](https://github.com/Simatwa/moviebox-api) v3, re-implemented
+natively in PHP (including the HMAC request signing) so there is no Python
+runtime dependency.
 
 > [!IMPORTANT]
 > **Why a PHP re-implementation?** `moviebox-api` is a Python **library/CLI**, not
@@ -59,12 +61,12 @@ Laravel API  (routes/api.php)
 
 ### The MovieBox client (`app/Services/MovieBox`)
 
-- `MovieBoxClient` — bootstraps a bearer token (cached) + cookies, then calls the
-  backend for search, discovery, streaming and downloads. Backend responses are
-  wrapped as `{code, message, data}` and unwrapped automatically.
-- `DetailExtractor` — parses the Nuxt-style index-referenced JSON embedded in a
-  title's detail page to recover seasons/episodes, cast and reviews (best-effort;
-  degrades gracefully).
+- `MovieBoxClient` — bootstraps a bearer token (cached) from the tab-operating
+  endpoint, then calls the mobile API for search, discovery, details, streaming
+  and downloads. Requests are load-balanced across the host pool with automatic
+  failover; responses (`{code, message, data}`) are unwrapped automatically.
+- `Signer` — builds the `X-Client-Token` and HMAC-MD5 `x-tr-signature` headers
+  required by every request (verified byte-for-byte against the reference impl).
 - `SubjectType` — content-type enum (movies / tv-series / …).
 - `MovieBoxException` — upstream errors are surfaced as HTTP `502`.
 
