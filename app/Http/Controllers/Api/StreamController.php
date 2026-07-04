@@ -23,9 +23,33 @@ class StreamController extends Controller
         $debug = $request->boolean('debug') || config('app.debug');
         $diag = [];
 
-        $files = $this->resolveVideoFiles($v['subjectId'], $v['season'], $v['episode'], $diag);
+        $meta = null;
+        $files = $this->resolveVideoFiles($v['subjectId'], $v['season'], $v['episode'], $diag, $meta);
+        $sourceSubjectId = $v['subjectId'];
+
+        // The requested episode isn't in this subject. Many French-dubbed titles
+        // split each season/episode into a SEPARATE catalog entry with the
+        // season/episode in the title, so search for that sibling and play it.
+        if ($files === [] && $v['season'] > 0 && ($v['title'] ?? '') !== '') {
+            $sibling = $this->resolveSiblingEpisode($v['title'], $v['season'], $v['episode'], $diag);
+            if ($sibling !== null) {
+                $files = $sibling['files'];
+                $sourceSubjectId = $sibling['subjectId'];
+            }
+        }
+
+        // Last resort: the subject is genuinely a single video mislabeled with a
+        // season. Only serve it for the first episode, never for later seasons
+        // (whose videos live under the sibling entries handled above).
+        if ($files === [] && $v['season'] > 0
+            && $meta && ! $meta['hasEpisodeStructure'] && $meta['firstPageFiles'] !== []
+            && $v['season'] <= 1 && $v['episode'] <= 1) {
+            $files = $meta['firstPageFiles'];
+            $diag['fallback'] = 'movie-single-file';
+        }
+
         $sources = $this->normalizeSources($files);
-        $subtitles = $this->resolveSubtitles($v['subjectId'], $files, $diag);
+        $subtitles = $this->resolveSubtitles($sourceSubjectId, $files, $diag);
 
         $payload = [
             'sources' => $sources,
@@ -38,6 +62,7 @@ class StreamController extends Controller
             $payload['debug'] = [
                 'params' => $v,
                 'host' => $this->client->activeHost(),
+                'sourceSubjectId' => $sourceSubjectId,
                 'fileCount' => count($files),
                 'calls' => $diag,
             ];
@@ -70,7 +95,7 @@ class StreamController extends Controller
      * @param  array<string,mixed>  $diag
      * @return array<int,array<string,mixed>>
      */
-    protected function resolveVideoFiles(string $subjectId, int $season, int $episode, array &$diag): array
+    protected function resolveVideoFiles(string $subjectId, int $season, int $episode, array &$diag, ?array &$meta = null): array
     {
         $isMovie = $season === 0 && $episode === 0;
         // `resource` returns a flat list of every episode across all seasons,
@@ -79,7 +104,7 @@ class StreamController extends Controller
         // fall past the pagination window and surface as "no stream available".
         $maxPages = $isMovie ? 1 : 40;
         $matched = [];
-        $firstPageFiles = [];      // fallback pool if the subject is really a movie
+        $firstPageFiles = [];      // used to detect / play a single-video subject
         $hasEpisodeStructure = false;
         $page = 1;
 
@@ -130,19 +155,141 @@ class StreamController extends Controller
             $page++;
         } while ($matched === [] && $hasMore && $page <= $maxPages);
 
-        // Some titles (e.g. an auto-discovered "version française") are actually
-        // a single movie in the catalog with no per-episode files. When an
-        // episode was requested but the subject exposes no episode structure at
-        // all, fall back to its single video instead of "no stream available".
-        // A real series with a genuinely missing episode keeps returning [] so
-        // we never play the wrong episode.
-        if (! $isMovie && $matched === [] && ! $hasEpisodeStructure && $firstPageFiles !== []) {
-            $diag['fallback'] = 'movie-single-file (no episode structure)';
-
-            return $firstPageFiles;
-        }
+        $meta = ['hasEpisodeStructure' => $hasEpisodeStructure, 'firstPageFiles' => $firstPageFiles];
 
         return $matched;
+    }
+
+    /**
+     * Find the video for a season/episode that lives under a SEPARATE catalog
+     * entry (common for French-dubbed titles where each season/episode is
+     * uploaded as its own subject, e.g. "From Saison 4 [Version française]").
+     *
+     * @param  array<string,mixed>  $diag
+     * @return array{subjectId:string,files:array<int,array<string,mixed>>}|null
+     */
+    protected function resolveSiblingEpisode(string $title, int $season, int $episode, array &$diag): ?array
+    {
+        $base = $this->baseTitle($title);
+        if ($base === '') {
+            return null;
+        }
+
+        $queries = array_values(array_unique(array_filter([
+            "{$base} saison {$season} episode {$episode}",
+            "{$base} saison {$season}",
+            "{$base} season {$season}",
+            sprintf('%s s%02de%02d', $base, $season, $episode),
+            "{$base} {$season}",
+        ])));
+
+        $tried = [];
+        foreach ($queries as $query) {
+            try {
+                $res = $this->client->search($query, 0, 1, 20);
+            } catch (\Throwable $e) {
+                report($e);
+
+                continue;
+            }
+
+            $items = is_array($res['items'] ?? null) ? $res['items'] : [];
+            $match = $this->pickSiblingMatch($items, $base, $season, $episode);
+            $tried[] = ['q' => $query, 'results' => count($items), 'matched' => $match['subjectId'] ?? null];
+
+            if ($match === null) {
+                continue;
+            }
+
+            $sid = (string) $match['subjectId'];
+            $sibDiag = [];
+            // The sibling might itself be episode-structured or a single video.
+            $files = $this->resolveVideoFiles($sid, $season, $episode, $sibDiag);
+            if ($files === []) {
+                $files = $this->resolveVideoFiles($sid, 0, 0, $sibDiag);
+            }
+
+            if ($files !== []) {
+                $diag['sibling'] = ['queries' => $tried, 'used' => $sid, 'title' => $match['title'] ?? null];
+
+                return ['subjectId' => $sid, 'files' => $files];
+            }
+        }
+
+        $diag['sibling'] = ['queries' => $tried, 'used' => null];
+
+        return null;
+    }
+
+    /** Strip version / season / episode qualifiers to get the core show title. */
+    protected function baseTitle(string $title): string
+    {
+        $t = mb_strtolower($title);
+        $t = preg_replace('/[\[\(].*?[\]\)]/u', ' ', $t);                              // [..] (..)
+        $t = preg_replace('/\b(version\s+fran[cç]aise|vf|vostfr|vost|vo|multi|truefrench|french)\b/u', ' ', $t);
+        $t = preg_replace('/\bsaisons?\s*\d+\b/u', ' ', $t);
+        $t = preg_replace('/\b(episode|épisode|ep)\s*\d+\b/u', ' ', $t);
+        $t = preg_replace('/\bs\d{1,2}\s*e\d{1,3}\b/u', ' ', $t);
+        $t = preg_replace('/\bs\d{1,2}\b/u', ' ', $t);
+        $t = preg_replace('/\s+/u', ' ', (string) $t);
+
+        return trim((string) $t);
+    }
+
+    /**
+     * Pick the best sibling result: the base title must be present and the
+     * requested season must be referenced; a matching episode boosts the score,
+     * a different season penalises it.
+     *
+     * @param  array<int,mixed>  $items
+     * @return array<string,mixed>|null
+     */
+    protected function pickSiblingMatch(array $items, string $base, int $season, int $episode): ?array
+    {
+        $baseWords = array_values(array_filter(explode(' ', $base), fn ($w) => mb_strlen($w) >= 2));
+        $best = null;
+        $bestScore = 0;
+
+        foreach ($items as $it) {
+            if (! is_array($it) || empty($it['subjectId'])) {
+                continue;
+            }
+            $t = mb_strtolower((string) ($it['title'] ?? ''));
+            if ($t === '') {
+                continue;
+            }
+
+            foreach ($baseWords as $w) {
+                if (mb_strpos($t, $w) === false) {
+                    continue 2; // base title not present -> skip
+                }
+            }
+
+            $score = 1;
+            $seasonHit = preg_match('/\b(saison|season|s)\s*0*'.$season.'\b/u', $t)
+                || preg_match('/\bs0*'.$season.'e\d/u', $t);
+            if ($seasonHit) {
+                $score += 3;
+            }
+            if (preg_match('/\b(episode|épisode|ep|e)\s*0*'.$episode.'\b/u', $t)) {
+                $score += 2;
+            }
+            if (preg_match_all('/\bsaisons?\s*(\d+)\b/u', $t, $m)) {
+                foreach ($m[1] as $s) {
+                    if ((int) $s !== $season) {
+                        $score -= 2;
+                    }
+                }
+            }
+
+            if ($score > $bestScore) {
+                $bestScore = $score;
+                $best = $it;
+            }
+        }
+
+        // Require at least the base title + a season reference to be confident.
+        return ($best !== null && $bestScore >= 4) ? $best : null;
     }
 
     /**
@@ -273,7 +420,7 @@ class StreamController extends Controller
     }
 
     /**
-     * @return array{subjectId:string,season:int,episode:int}
+     * @return array{subjectId:string,season:int,episode:int,title:string}
      */
     protected function validatePayload(Request $request): array
     {
@@ -282,12 +429,14 @@ class StreamController extends Controller
             'detailPath' => ['sometimes', 'nullable', 'string'], // ignored (v3 uses subjectId)
             'season' => ['sometimes', 'integer', 'min:0'],
             'episode' => ['sometimes', 'integer', 'min:0'],
+            'title' => ['sometimes', 'nullable', 'string', 'max:300'],
         ]);
 
         return [
             'subjectId' => $validated['subjectId'],
             'season' => (int) ($validated['season'] ?? 0),
             'episode' => (int) ($validated['episode'] ?? 0),
+            'title' => trim((string) ($validated['title'] ?? '')),
         ];
     }
 

@@ -528,7 +528,7 @@ export async function watchPage(app, params) {
 
     let data;
     try {
-        data = await api.play({ subjectId: item.subjectId, detailPath: item.detailPath, season, episode });
+        data = await api.play({ subjectId: item.subjectId, detailPath: item.detailPath, season, episode, title: item.title });
     } catch (e) {
         clear(shell);
         shell.appendChild(el('div', { class: 'player-message' }, [errorState(e.message, () => watchPage(app, params))]));
