@@ -13,10 +13,68 @@ class CatalogController extends Controller
 {
     public function __construct(protected MovieBoxClient $client) {}
 
-    /** Curated landing-page rows built from the tab-operating response. */
+    /**
+     * Home rows. The mobile API has no language filter, so we build a French
+     * browsing experience from configurable search queries. If none are
+     * configured (or all fail), we fall back to the provider's landing page.
+     */
     public function home(): JsonResponse
     {
-        $data = $this->client->home(0);
+        $queries = (array) config('moviebox.home_queries', []);
+        $sections = [];
+
+        foreach ($queries as $q) {
+            try {
+                $data = $this->client->search($q['query'], 0, 1, 20);
+                $items = ItemNormalizer::many($data['items'] ?? []);
+            } catch (\Throwable $e) {
+                report($e);
+                $items = [];
+            }
+
+            if ($items !== []) {
+                $sections[] = ['title' => $q['label'], 'items' => $items];
+            }
+        }
+
+        if ($sections === []) {
+            $sections = $this->landingPageSections();
+        }
+
+        return response()->json(['data' => ['sections' => $sections]]);
+    }
+
+    /** Trending row/page (backed by a configurable French search query). */
+    public function trending(Request $request): JsonResponse
+    {
+        $type = SubjectType::resolve($request->input('type', 'all'));
+        $query = (string) config('moviebox.trending_query', 'français');
+
+        $items = [];
+        try {
+            $data = $this->client->search($query, $type->value, 1, 20);
+            $items = ItemNormalizer::many($data['items'] ?? []);
+        } catch (\Throwable $e) {
+            report($e);
+        }
+
+        return response()->json(['data' => ['items' => $items, 'pager' => null]]);
+    }
+
+    /**
+     * Parse the provider's tab-operating landing page into sections (fallback).
+     *
+     * @return array<int,array<string,mixed>>
+     */
+    protected function landingPageSections(): array
+    {
+        try {
+            $data = $this->client->home(0);
+        } catch (\Throwable $e) {
+            report($e);
+
+            return [];
+        }
 
         $sections = [];
         foreach (($data['items'] ?? []) as $block) {
@@ -34,39 +92,10 @@ class CatalogController extends Controller
                 continue;
             }
 
-            $sections[] = [
-                'title' => $block['title'] ?? 'Featured',
-                'items' => $items,
-            ];
+            $sections[] = ['title' => $block['title'] ?? 'Featured', 'items' => $items];
         }
 
-        return response()->json(['data' => ['sections' => $sections]]);
-    }
-
-    /** Trending: a flat, de-duplicated list drawn from the landing page. */
-    public function trending(Request $request): JsonResponse
-    {
-        $tab = SubjectType::resolve($request->input('type', 'all'));
-        $tabId = match ($tab) {
-            SubjectType::MOVIES => 2,
-            SubjectType::TV_SERIES => 5,
-            default => 0,
-        };
-
-        $data = $this->client->home($tabId);
-
-        $seen = [];
-        $items = [];
-        foreach (($data['items'] ?? []) as $block) {
-            foreach (ItemNormalizer::many($block['subjects'] ?? []) as $item) {
-                if (! isset($seen[$item['subjectId']])) {
-                    $seen[$item['subjectId']] = true;
-                    $items[] = $item;
-                }
-            }
-        }
-
-        return response()->json(['data' => ['items' => $items, 'pager' => null]]);
+        return $sections;
     }
 
     /** Full search with optional type filter (all|movies|tv-series). */

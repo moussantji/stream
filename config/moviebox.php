@@ -36,10 +36,43 @@ return [
     'secret_key' => env('MOVIEBOX_SECRET_KEY', '76iRl07s0xSN9jqmEWAt79EBJZulIQIsV64FZr2O'),
 
     /*
-    | Locale that drives which catalog you get. MovieBox is region-based, so
-    | this is what switches the home/discovery content between markets
-    | (e.g. FR/fr surfaces French & French-dubbed titles instead of Bollywood).
+    | The MovieBox mobile API has NO language/region parameter — its default
+    | landing page is Bollywood-heavy regardless of settings. To get a French
+    | browsing experience we instead build the home page from a set of search
+    | queries (the one lever that reliably surfaces French / French-dubbed
+    | titles). Each entry is "Row label|search query" (or just "query").
+    | Set MOVIEBOX_HOME_QUERIES="" to fall back to the provider's landing page.
     */
+    'home_queries' => (function () {
+        $raw = env('MOVIEBOX_HOME_QUERIES');
+        $entries = $raw !== null
+            ? ($raw === '' ? [] : explode(',', $raw))
+            : [
+                'Films en français|film français',
+                'Version française|version française',
+                'Comédie|comédie française',
+                'Action|action française',
+                'Séries en français|série française',
+                'Animation|animation française',
+            ];
+
+        return array_values(array_filter(array_map(function ($entry) {
+            $entry = trim((string) $entry);
+            if ($entry === '') {
+                return null;
+            }
+            [$label, $query] = array_pad(explode('|', $entry, 2), 2, null);
+            $label = trim((string) $label);
+            $query = trim((string) ($query ?? $label));
+
+            return $query === '' ? null : ['label' => $label ?: $query, 'query' => $query];
+        }, $entries)));
+    })(),
+
+    // Query used for the "Trending" row / page (no real trending-by-language exists).
+    'trending_query' => env('MOVIEBOX_TRENDING_QUERY', 'français'),
+
+    // Region/language identity (informational only; the API ignores it for content).
     'region' => strtoupper((string) env('MOVIEBOX_REGION', 'FR')),
     'language' => strtolower((string) env('MOVIEBOX_LANGUAGE', 'fr')),
     'timezone' => env('MOVIEBOX_TIMEZONE', 'Europe/Paris'),
