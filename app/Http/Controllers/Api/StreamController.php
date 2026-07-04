@@ -49,13 +49,27 @@ class StreamController extends Controller
         }
 
         $sources = $this->normalizeSources($files);
+        $hls = [];
         $subtitles = $this->resolveSubtitles($sourceSubjectId, $files, $diag);
+
+        // No downloadable MP4 for this episode? Fall back to the adaptive
+        // streaming endpoint (play-info). The provider's own web player streams
+        // from here, and it often carries episodes that were never published as
+        // downloadable files (e.g. S4 E1/E2 when only E3 is downloadable).
+        if ($sources === []) {
+            $stream = $this->resolvePlayInfo($sourceSubjectId, $v['season'], $v['episode'], $diag, $debug);
+            $sources = $stream['sources'];
+            $hls = $stream['hls'];
+            if ($subtitles === [] && $stream['subtitles'] !== []) {
+                $subtitles = $stream['subtitles'];
+            }
+        }
 
         $payload = [
             'sources' => $sources,
-            'hls' => [],
+            'hls' => $hls,
             'subtitles' => $subtitles,
-            'hasResource' => $sources !== [],
+            'hasResource' => $sources !== [] || $hls !== [],
         ];
 
         if ($debug) {
@@ -301,6 +315,86 @@ class StreamController extends Controller
 
         // Require at least the base title + a season reference to be confident.
         return ($best !== null && $bestScore >= 4) ? $best : null;
+    }
+
+    /**
+     * Adaptive streaming fallback via the play-info endpoint. Extracts HLS
+     * (m3u8) and/or MP4 URLs generically since the response shape varies.
+     *
+     * @param  array<string,mixed>  $diag
+     * @return array{sources:array<int,array<string,mixed>>,hls:array<int,string>,subtitles:array<int,array<string,mixed>>}
+     */
+    protected function resolvePlayInfo(string $subjectId, int $season, int $episode, array &$diag, bool $debug = false): array
+    {
+        $out = ['sources' => [], 'hls' => [], 'subtitles' => []];
+
+        try {
+            $data = $this->client->playInfo($subjectId, $season, $episode);
+        } catch (\Throwable $e) {
+            report($e);
+            $diag['playInfo'] = ['ok' => false, 'error' => class_basename($e).': '.$e->getMessage()];
+
+            return $out;
+        }
+
+        if (! is_array($data)) {
+            return $out;
+        }
+
+        if ($debug) {
+            $diag['playInfoRaw'] = $data;
+        }
+
+        // Gather stream entries from whichever container key is present.
+        $streams = [];
+        foreach (['streams', 'list', 'resources', 'playInfos', 'medias', 'urls', 'playInfo'] as $key) {
+            if (isset($data[$key]) && is_array($data[$key])) {
+                $streams = array_merge($streams, array_is_list($data[$key]) ? $data[$key] : [$data[$key]]);
+            }
+        }
+        if ($streams === []) {
+            $streams[] = $data; // maybe a single top-level url
+        }
+
+        $hls = [];
+        $mp4 = [];
+        foreach ($streams as $s) {
+            if (! is_array($s)) {
+                continue;
+            }
+            $url = null;
+            foreach (['url', 'playUrl', 'streamUrl', 'm3u8', 'hlsUrl', 'link', 'videoUrl', 'mpd'] as $f) {
+                if (! empty($s[$f]) && is_string($s[$f])) {
+                    $url = $s[$f];
+                    break;
+                }
+            }
+            if (! $url) {
+                continue;
+            }
+
+            $resolution = (int) ($s['resolution'] ?? $s['quality'] ?? 0);
+            $format = strtoupper((string) ($s['format'] ?? $s['streamType'] ?? ''));
+
+            if (stripos($url, '.m3u8') !== false || $format === 'HLS') {
+                $hls[] = $url;
+            } elseif (stripos($url, '.mp4') !== false || $format === 'MP4') {
+                $mp4[] = ['resourceLink' => $url, 'resolution' => $resolution];
+            } elseif (stripos($url, '.mpd') !== false || $format === 'DASH') {
+                // DASH/MPD is not playable by the current hls.js-based player.
+                $diag['playInfoDash'] = true;
+            }
+        }
+
+        $out['hls'] = array_values(array_unique($hls));
+        $out['sources'] = $this->normalizeSources($mp4);
+
+        $subs = $data['subtitles'] ?? $data['captions'] ?? $data['extCaptions'] ?? [];
+        if (is_array($subs)) {
+            $out['subtitles'] = $this->normalizeCaptions($subs);
+        }
+
+        return $out;
     }
 
     /**
