@@ -218,6 +218,11 @@ video.hero-bg { pointer-events: none; }
 }
 .detail-actions { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
 
+/* ---------------- Infinite scroll ---------------- */
+.infinite-sentinel { min-height: 8px; }
+.infinite-loader { display: flex; justify-content: center; padding: 24px 0 32px; }
+.infinite-loader .spinner { width: 32px; height: 32px; margin: 0; }
+
 /* ---------------- Search filters ---------------- */
 .filter-bar { display: flex; flex-wrap: wrap; gap: 14px; margin: 4px 0 18px; align-items: flex-end; }
 .filter { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--text-dim); }

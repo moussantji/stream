@@ -144,53 +144,65 @@ function continueRow(history) {
     ]);
 }
 
-// Generic paginated grid with a "Charger plus" button.
-// fetchPage(page) must resolve to { items: [...], pager: { hasMore } }.
+// Observe a sentinel element and invoke cb() when it nears the viewport.
+// Returns the observer so callers can disconnect it.
+function onReachBottom(sentinel, cb) {
+    const observer = new IntersectionObserver((entries) => {
+        if (entries.some((e) => e.isIntersecting)) cb();
+    }, { rootMargin: '600px 0px' });
+    observer.observe(sentinel);
+    return observer;
+}
+
+// Generic paginated grid with INFINITE SCROLL (auto-loads the next page when
+// the user nears the bottom). fetchPage(page) -> { items, pager: { hasMore } }.
 function paginatedGrid(container, fetchPage, { emptyMsg = 'Rien à afficher.' } = {}) {
     const gridWrap = el('div', {}, [loadingState()]);
-    const moreWrap = el('div', { style: 'text-align:center;padding:8px 0 24px' });
+    const sentinel = el('div', { class: 'infinite-sentinel' });
     container.appendChild(gridWrap);
-    container.appendChild(moreWrap);
+    container.appendChild(sentinel);
 
     let page = 1;
     let gridEl = null;
     let loading = false;
+    let done = false;
+    let observer = null;
 
-    const load = async (append) => {
-        if (loading) return;
+    const stop = () => { done = true; if (observer) { observer.disconnect(); observer = null; } clear(sentinel); };
+
+    const load = async () => {
+        if (loading || done) return;
         loading = true;
+        clear(sentinel);
+        sentinel.appendChild(el('div', { class: 'infinite-loader' }, [el('div', { class: 'spinner' })]));
+
         try {
             const data = await fetchPage(page);
             const items = data.items || [];
-            if (!append) { clear(gridWrap); gridEl = null; }
 
             if (!items.length && page === 1) {
                 clear(gridWrap);
                 gridWrap.appendChild(emptyState(emptyMsg));
-                clear(moreWrap);
+                stop();
                 return;
             }
 
             if (!gridEl) { gridEl = grid(items); clear(gridWrap); gridWrap.appendChild(gridEl); }
             else items.forEach((it) => gridEl.appendChild(card(it)));
 
-            clear(moreWrap);
-            if (data.pager && data.pager.hasMore) {
-                const btn = el('button', {
-                    class: 'btn btn-ghost', text: 'Charger plus',
-                    onclick: () => { page += 1; load(true); },
-                });
-                moreWrap.appendChild(btn);
-            }
+            page += 1;
+            clear(sentinel);
+            if (!data.pager || !data.pager.hasMore) stop();
         } catch (e) {
-            clear(gridWrap);
-            gridWrap.appendChild(errorState(e.message, () => load(false)));
+            clear(sentinel);
+            sentinel.appendChild(errorState(e.message, () => { loading = false; load(); }));
         } finally {
             loading = false;
         }
     };
 
-    load(false);
+    observer = onReachBottom(sentinel, load);
+    load();
 }
 
 // ---------- TRENDING / POPULAIRES ----------
@@ -228,43 +240,51 @@ export async function localPage(app, params) {
 
     const info = el('p', { style: 'color:var(--text-dim);margin:0 0 12px' });
     const gridWrap = el('div', {}, [loadingState('Chargement de la base locale…')]);
-    const moreWrap = el('div', { style: 'text-align:center;padding:8px 0 24px' });
+    const sentinel = el('div', { class: 'infinite-sentinel' });
     container.appendChild(info);
     container.appendChild(gridWrap);
-    container.appendChild(moreWrap);
+    container.appendChild(sentinel);
 
     let page = 1;
     let gridEl = null;
+    let loading = false;
+    let done = false;
+    let observer = null;
 
-    const load = async (append) => {
+    const stop = () => { done = true; if (observer) { observer.disconnect(); observer = null; } clear(sentinel); };
+
+    const load = async () => {
+        if (loading || done) return;
+        loading = true;
+        clear(sentinel);
+        sentinel.appendChild(el('div', { class: 'infinite-loader' }, [el('div', { class: 'spinner' })]));
         try {
             const data = await api.local({ type, page });
             info.textContent = `${data.total} titre(s) enregistré(s) dans ta base`;
 
-            if (!append) { clear(gridWrap); clear(moreWrap); gridEl = null; }
-
             if (!data.items.length && page === 1) {
+                clear(gridWrap);
                 gridWrap.appendChild(emptyState('Base locale vide', 'Navigue sur le site : chaque titre affiché est enregistré ici automatiquement.'));
+                stop();
                 return;
             }
 
-            if (!gridEl) { gridEl = grid(data.items); gridWrap.appendChild(gridEl); }
+            if (!gridEl) { gridEl = grid(data.items); clear(gridWrap); gridWrap.appendChild(gridEl); }
             else { data.items.forEach((it) => gridEl.appendChild(card(it))); }
 
-            clear(moreWrap);
-            if (data.pager && data.pager.hasMore) {
-                moreWrap.appendChild(el('button', {
-                    class: 'btn btn-ghost', text: 'Charger plus',
-                    onclick: () => { page += 1; load(true); },
-                }));
-            }
+            page += 1;
+            clear(sentinel);
+            if (!data.pager || !data.pager.hasMore) stop();
         } catch (e) {
-            clear(gridWrap);
-            gridWrap.appendChild(errorState(e.message, () => load(false)));
+            clear(sentinel);
+            sentinel.appendChild(errorState(e.message, () => { loading = false; load(); }));
+        } finally {
+            loading = false;
         }
     };
 
-    await load(false);
+    observer = onReachBottom(sentinel, load);
+    await load();
 }
 
 // ---------- LIVE TV CHANNELS ----------
@@ -379,9 +399,9 @@ export async function searchPage(app, params) {
     container.appendChild(filterBar);
 
     const gridWrap = el('div', {}, [loadingState('Recherche…')]);
-    const moreWrap = el('div', { style: 'text-align:center;padding:8px 0 24px' });
+    const sentinel = el('div', { class: 'infinite-sentinel' });
     container.appendChild(gridWrap);
-    container.appendChild(moreWrap);
+    container.appendChild(sentinel);
 
     if (!q) {
         clear(gridWrap);
@@ -391,7 +411,11 @@ export async function searchPage(app, params) {
 
     let page = 1;
     let loading = false;
+    let done = false;
+    let observer = null;
     let all = [];
+
+    const stop = () => { done = true; if (observer) { observer.disconnect(); observer = null; } clear(sentinel); };
 
     const populateFilters = () => {
         const genres = new Set();
@@ -434,30 +458,29 @@ export async function searchPage(app, params) {
 
     [genreSel, yearSel, sortSel].forEach((sel) => { sel.onchange = render; });
 
-    const load = async (append) => {
-        if (loading) return;
+    const load = async () => {
+        if (loading || done) return;
         loading = true;
+        clear(sentinel);
+        sentinel.appendChild(el('div', { class: 'infinite-loader' }, [el('div', { class: 'spinner' })]));
         try {
             const data = await api.search(q, type, page);
-            all = append ? all.concat(data.items || []) : (data.items || []);
+            all = all.concat(data.items || []);
             populateFilters();
             render();
-            clear(moreWrap);
-            if (data.pager && data.pager.hasMore) {
-                moreWrap.appendChild(el('button', {
-                    class: 'btn btn-ghost', text: 'Charger plus',
-                    onclick: () => { page += 1; load(true); },
-                }));
-            }
+            page += 1;
+            clear(sentinel);
+            if (!data.pager || !data.pager.hasMore) stop();
         } catch (e) {
-            clear(gridWrap);
-            gridWrap.appendChild(errorState(e.message, () => load(false)));
+            clear(sentinel);
+            sentinel.appendChild(errorState(e.message, () => { loading = false; load(); }));
         } finally {
             loading = false;
         }
     };
 
-    await load(false);
+    observer = onReachBottom(sentinel, load);
+    await load();
 }
 
 // ---------- DETAIL ----------
