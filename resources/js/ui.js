@@ -91,11 +91,37 @@ export function card(item, opts = {}) {
     ]);
 }
 
+const CHEVRON_L = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>';
+const CHEVRON_R = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>';
+
+// Horizontal carousel with prev/next scroll arrows.
+export function carousel(cardNodes) {
+    const scroller = el('div', { class: 'row-scroller' }, cardNodes);
+    const scrollByPage = (dir) => scroller.scrollBy({ left: dir * scroller.clientWidth * 0.9, behavior: 'smooth' });
+
+    const prev = el('button', { class: 'row-nav prev', 'aria-label': 'Précédent', html: CHEVRON_L, onclick: () => scrollByPage(-1) });
+    const next = el('button', { class: 'row-nav next', 'aria-label': 'Suivant', html: CHEVRON_R, onclick: () => scrollByPage(1) });
+
+    const viewport = el('div', { class: 'row-viewport' }, [prev, scroller, next]);
+
+    // Hide arrows when there's nothing more to scroll in that direction.
+    const sync = () => {
+        const max = scroller.scrollWidth - scroller.clientWidth - 2;
+        prev.classList.toggle('hidden-nav', scroller.scrollLeft <= 2);
+        next.classList.toggle('hidden-nav', scroller.scrollLeft >= max);
+    };
+    scroller.addEventListener('scroll', sync, { passive: true });
+    // Defer initial sync until laid out.
+    requestAnimationFrame(sync);
+
+    return viewport;
+}
+
 export function row(title, items) {
     if (!items || !items.length) return document.createComment('empty row');
     return el('section', { class: 'row container' }, [
         el('h2', { class: 'section-title', text: title }),
-        el('div', { class: 'row-scroller' }, items.map((i) => card(i))),
+        carousel(items.map((i) => card(i))),
     ]);
 }
 

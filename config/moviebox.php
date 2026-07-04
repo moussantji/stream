@@ -52,6 +52,20 @@ return [
         'hakunaymatata.com'
     ))))),
 
+    // Content filtering: titles whose genre/title/description match any of these
+    // keywords are hidden from DISCOVERY surfaces (home, trending, categories,
+    // recommendations, local library). They remain reachable via SEARCH so the
+    // filter is a browsing preference, not a hard block. Comma-separated,
+    // configurable via env; set MOVIEBOX_BLOCKED_KEYWORDS="" to disable.
+    'content_filter_enabled' => filter_var(env('MOVIEBOX_CONTENT_FILTER', true), FILTER_VALIDATE_BOOL),
+    'blocked_keywords' => array_values(array_filter(array_map(
+        fn ($w) => mb_strtolower(trim($w)),
+        explode(',', (string) env(
+            'MOVIEBOX_BLOCKED_KEYWORDS',
+            'hentai,ecchi,yaoi,yuri,hardcore,porn,porno,pornographic,xxx,x-rated,erotic,erotique,erotica,nsfw,adult,18+,gay,lgbt,lgbtq,lesbian,lesbienne,homosexual,homosexuel,homosexuelle,queer,bara'
+        ))
+    ))),
+
     // Optional outbound proxy.
     'proxy' => env('MOVIEBOX_PROXY') ?: null,
 

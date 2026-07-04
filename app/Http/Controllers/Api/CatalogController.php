@@ -8,6 +8,7 @@ use App\Models\CatalogSnapshot;
 use App\Services\Catalog\CatalogRepository;
 use App\Services\MovieBox\MovieBoxClient;
 use App\Services\MovieBox\SubjectType;
+use App\Support\ContentFilter;
 use App\Support\ItemNormalizer;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -132,7 +133,7 @@ class CatalogController extends Controller
         })->values()->all();
 
         return response()->json(['data' => [
-            'items' => $items,
+            'items' => ContentFilter::apply($items),
             'total' => $total,
             'pager' => ['page' => $page, 'perPage' => $perPage, 'hasMore' => $page * $perPage < $total],
         ]]);
@@ -283,7 +284,7 @@ class CatalogController extends Controller
         try {
             $data = $this->client->search($query, $subjectType, 1, $perPage);
 
-            return ItemNormalizer::many($data['items'] ?? []);
+            return ContentFilter::apply(ItemNormalizer::many($data['items'] ?? []));
         } catch (\Throwable $e) {
             report($e);
 
@@ -320,7 +321,7 @@ class CatalogController extends Controller
             }
         }
 
-        return $items;
+        return ContentFilter::apply($items);
     }
 
     /**
@@ -347,7 +348,7 @@ class CatalogController extends Controller
                 $rawItems = $block['banner']['banners'];
             }
 
-            $items = ItemNormalizer::many(is_array($rawItems) ? $rawItems : []);
+            $items = ContentFilter::apply(ItemNormalizer::many(is_array($rawItems) ? $rawItems : []));
             if ($items !== []) {
                 $sections[] = ['title' => $block['title'] ?? 'Featured', 'items' => $items];
             }

@@ -1,7 +1,7 @@
 // Page renderers for the SPA.
 import { api, isAuthed } from './api.js';
 import {
-    el, clear, row, grid, card, skeletonRow, loadingState, errorState, emptyState,
+    el, clear, row, grid, card, carousel, skeletonRow, loadingState, errorState, emptyState,
     navigate, watchHref, detailHref, toast, openAuthModal,
 } from './ui.js';
 import { Player } from './player.js';
@@ -96,7 +96,7 @@ function continueRow(history) {
     });
     return el('section', { class: 'row container' }, [
         el('h2', { class: 'section-title', text: 'Reprendre la lecture' }),
-        el('div', { class: 'row-scroller' }, cards),
+        carousel(cards),
     ]);
 }
 

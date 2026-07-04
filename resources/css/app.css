@@ -139,11 +139,26 @@ img { display: block; }
 
 /* ---------------- Rows / cards ---------------- */
 .row { margin-bottom: 8px; }
+.row-viewport { position: relative; }
 .row-scroller {
     display: grid; grid-auto-flow: column; grid-auto-columns: clamp(140px, 20vw, 200px);
     gap: 14px; overflow-x: auto; padding: 6px 2px 18px; scroll-behavior: smooth;
     scrollbar-width: thin;
 }
+.row-nav {
+    position: absolute; top: 0; bottom: 18px; width: 48px; z-index: 6;
+    display: flex; align-items: center; justify-content: center;
+    background: linear-gradient(90deg, rgba(11,11,15,.85), rgba(11,11,15,.15));
+    border: none; color: #fff; opacity: 0; transition: opacity .15s;
+}
+.row-nav.next { background: linear-gradient(270deg, rgba(11,11,15,.85), rgba(11,11,15,.15)); }
+.row-viewport:hover .row-nav { opacity: 1; }
+.row-nav.hidden-nav { opacity: 0 !important; pointer-events: none; }
+.row-nav.prev { left: 0; }
+.row-nav.next { right: 0; }
+.row-nav svg { width: 30px; height: 30px; filter: drop-shadow(0 2px 4px rgba(0,0,0,.6)); }
+.row-nav:hover svg { transform: scale(1.15); transition: transform .12s; }
+@media (max-width: 720px) { .row-nav { display: none; } }
 .grid {
     display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
     gap: 16px; padding: 6px 0 24px;
