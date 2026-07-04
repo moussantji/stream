@@ -739,18 +739,8 @@ export async function watchPage(app, params) {
         return;
     }
 
-    // Quality selector for MP4 sources
-    if (data.sources.length > 1) {
-        const select = el('select', { class: 'select' }, data.sources.map((s) =>
-            el('option', { value: s.url, text: s.quality })));
-        select.onchange = () => player.setMp4(select.value);
-        toolbar.appendChild(el('span', { text: 'Quality:', style: 'color:var(--text-dim)' }));
-        toolbar.appendChild(select);
-    }
-
-    if (data.subtitles.length) {
-        toolbar.appendChild(el('span', { text: `${data.subtitles.length} subtitle track(s) — use the player’s CC menu.`, style: 'color:var(--text-dim);font-size:13px' }));
-    }
+    // Quality, subtitles, speed and fullscreen are handled inside the player's
+    // own control bar now.
 
     // Clean up when navigating away
     const cleanup = () => { player.destroy(); window.removeEventListener('popstate', cleanup); };
@@ -869,9 +859,36 @@ export async function adminPage(app) {
         statCard('Autres', stats.other),
     ]));
 
+    // --- Catalogue / deep import ---
+    const importStatus = el('p', { class: 'admin-status' });
+    const importBtn = el('button', { class: 'btn btn-primary', text: 'Approfondir l’import' });
+    importBtn.onclick = async () => {
+        importBtn.disabled = true;
+        const label = importBtn.textContent;
+        importBtn.textContent = 'Lancement…';
+        importStatus.textContent = '';
+        try {
+            const r = await api.adminImport(20);
+            importStatus.textContent = r.message || 'Import lancé en arrière-plan.';
+        } catch (e) {
+            importStatus.textContent = 'Échec : ' + e.message;
+        } finally {
+            importBtn.disabled = false;
+            importBtn.textContent = label;
+        }
+    };
+
+    body.appendChild(el('div', { class: 'admin-panel' }, [
+        el('h3', { text: 'Catalogue' }),
+        el('p', { class: 'admin-hint', text: `${stats.total} titre(s) actuellement en base. L’API MovieBox n’expose pas de liste complète du catalogue : celui-ci est découvert page par page. Lance une exploration plus profonde pour enregistrer davantage de titres (l’opération tourne en arrière-plan, recharge la page ensuite).` }),
+        el('div', { class: 'admin-controls' }, [importBtn]),
+        importStatus,
+    ]));
+
+    // --- Export des liens ---
     const typeSel = el('select', { class: 'select' }, [['all', 'Tous'], ['movies', 'Films'], ['tv-series', 'Séries']].map(([v, l]) =>
         el('option', { value: v, text: l })));
-    const limitInput = el('input', { class: 'select', type: 'number', min: '1', max: '1000', value: '100', style: 'width:110px' });
+    const limitInput = el('input', { class: 'select', type: 'number', min: '0', max: '100000', value: '0', style: 'width:120px' });
     const status = el('p', { class: 'admin-status' });
 
     const btn = el('button', { class: 'btn btn-primary', text: 'Exporter les liens (.txt)' });
@@ -893,10 +910,10 @@ export async function adminPage(app) {
 
     body.appendChild(el('div', { class: 'admin-panel' }, [
         el('h3', { text: 'Exporter les liens de téléchargement' }),
-        el('p', { class: 'admin-hint', text: "Génère un fichier .txt listant chaque titre et ses liens (par épisode pour les séries). L'export web est limité par « Nombre max ». Pour tout exporter sans limite, lance : php artisan catalog:export-links" }),
+        el('p', { class: 'admin-hint', text: 'Génère un .txt (un bloc par titre, une ligne par épisode pour les séries). Mets « Nombre max » à 0 pour tout exporter. L’export web interroge l’API pour chaque titre : pour un très gros catalogue, préfère la commande CLI « php artisan catalog:export-links ».' }),
         el('div', { class: 'admin-controls' }, [
             el('label', { class: 'filter' }, [el('span', { text: 'Type' }), typeSel]),
-            el('label', { class: 'filter' }, [el('span', { text: 'Nombre max' }), limitInput]),
+            el('label', { class: 'filter' }, [el('span', { text: 'Nombre max (0 = tout)' }), limitInput]),
             btn,
         ]),
         status,

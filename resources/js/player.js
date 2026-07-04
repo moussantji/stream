@@ -1,5 +1,6 @@
-// Video player: native MP4 with quality switching, HLS via hls.js fallback,
-// and WebVTT subtitle tracks proxied through the backend.
+// Custom video player: MP4 (with quality switching), HLS via hls.js, DASH via
+// dash.js, WebVTT subtitles proxied same-origin, and a full custom control bar
+// (seek + buffer, volume, quality, speed, subtitles, fullscreen, shortcuts).
 import { api } from './api.js';
 import { el } from './ui.js';
 
@@ -36,33 +37,233 @@ async function loadDash() {
     return dashModule;
 }
 
+const I = {
+    play: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>',
+    pause: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>',
+    volume: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 10v4h4l5 5V5L7 10H3zm13.5 2a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4zM14 3.2v2.06a7 7 0 0 1 0 13.48v2.06a9 9 0 0 0 0-17.6z"/></svg>',
+    muted: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 10v4h4l5 5V5L7 10H3zm18.3-1.3-1.4-1.4L17 10.2 14.1 7.3l-1.4 1.4L15.6 11.6l-2.9 2.9 1.4 1.4L17 13l2.9 2.9 1.4-1.4L18.4 11.6z"/></svg>',
+    cc: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M5 4h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zm2.5 6.8c.28 0 .53.12.7.32l1.03-.72A2.4 2.4 0 0 0 7.5 9.2 2.55 2.55 0 0 0 5 11.8v.4a2.55 2.55 0 0 0 2.5 2.6c.78 0 1.47-.36 1.93-.9l-1.03-.72a.9.9 0 0 1-.9.42.95.95 0 0 1-.9-1v-.4a.95.95 0 0 1 .9-1zm7 0c.28 0 .53.12.7.32l1.03-.72a2.4 2.4 0 0 0-1.73-.9 2.55 2.55 0 0 0-2.5 2.6v.4a2.55 2.55 0 0 0 2.5 2.6c.78 0 1.47-.36 1.93-.9l-1.03-.72a.9.9 0 0 1-.9.42.95.95 0 0 1-.9-1v-.4a.95.95 0 0 1 .9-1z"/></svg>',
+    gear: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M19.4 13a7.8 7.8 0 0 0 0-2l2-1.6-2-3.4-2.4 1a7.6 7.6 0 0 0-1.7-1l-.4-2.5H10.9l-.4 2.5a7.6 7.6 0 0 0-1.7 1l-2.4-1-2 3.4L4.6 11a7.8 7.8 0 0 0 0 2l-2 1.6 2 3.4 2.4-1c.5.4 1.1.7 1.7 1l.4 2.5h4.1l.4-2.5c.6-.3 1.2-.6 1.7-1l2.4 1 2-3.4-2-1.6zM12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7z"/></svg>',
+    enterFs: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M4 9V4h5v2H6v3H4zm11-5h5v5h-2V6h-3V4zM6 15v3h3v2H4v-5h2zm12 0h2v5h-5v-2h3v-3z"/></svg>',
+    exitFs: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 7V4H5v5h5V7H7zm10 0h-3v2h5V4h-2v3zM7 17h3v-2H5v5h2v-3zm10 0v3h2v-5h-5v2h3z"/></svg>',
+    bigPlay: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>',
+};
+
+const fmt = (s) => {
+    if (!isFinite(s) || s < 0) s = 0;
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = Math.floor(s % 60).toString().padStart(2, '0');
+    return h ? `${h}:${m.toString().padStart(2, '0')}:${sec}` : `${m}:${sec}`;
+};
+
 export class Player {
     constructor(container) {
         this.container = container;
         this.hls = null;
-        // NOTE: no `crossorigin` attribute — the media CDN doesn't send CORS
-        // headers, and setting it would block cross-origin MP4 playback.
-        // Subtitle tracks are proxied same-origin via /api/subtitle, so they
-        // work without it.
-        this.video = el('video', {
-            controls: 'controls',
-            playsinline: 'playsinline',
-            preload: 'metadata',
-        });
-        this.container.appendChild(this.video);
+        this.dash = null;
+        this.currentSources = [];
+        this.subtitles = [];
+        this.activeTrack = -1; // -1 = off
         this._progressTimer = null;
+        this._hideTimer = null;
+        this._seeking = false;
+        this.build();
     }
 
-    /**
-     * @param {{sources:Array, hls:Array, subtitles:Array, startTime?:number, onProgress?:Function}} data
-     */
+    build() {
+        // No `crossorigin`: the media CDN doesn't send CORS headers; subtitles
+        // are proxied same-origin so they work regardless.
+        this.video = el('video', { playsinline: 'playsinline', preload: 'metadata' });
+
+        this.spinner = el('div', { class: 'vp-spinner', hidden: 'hidden' });
+        this.bigBtn = el('button', { class: 'vp-big', 'aria-label': 'Lecture', html: I.bigPlay });
+
+        // Progress / seek bar
+        this.buffered = el('div', { class: 'vp-buffered' });
+        this.played = el('div', { class: 'vp-played' });
+        this.handle = el('div', { class: 'vp-handle' });
+        this.progress = el('div', { class: 'vp-progress', role: 'slider', tabindex: '0' }, [
+            el('div', { class: 'vp-track' }, [this.buffered, this.played, this.handle]),
+        ]);
+
+        this.playBtn = el('button', { class: 'vp-btn', 'aria-label': 'Lecture/Pause', html: I.play });
+        this.muteBtn = el('button', { class: 'vp-btn', 'aria-label': 'Muet', html: I.volume });
+        this.volume = el('input', { class: 'vp-volume', type: 'range', min: '0', max: '1', step: '0.05', value: '1' });
+        this.time = el('span', { class: 'vp-time', text: '0:00 / 0:00' });
+
+        this.ccBtn = el('button', { class: 'vp-btn', 'aria-label': 'Sous-titres', html: I.cc, hidden: 'hidden' });
+        this.gearBtn = el('button', { class: 'vp-btn', 'aria-label': 'Réglages', html: I.gear });
+        this.fsBtn = el('button', { class: 'vp-btn', 'aria-label': 'Plein écran', html: I.enterFs });
+
+        this.menu = el('div', { class: 'vp-menu', hidden: 'hidden' });
+
+        this.controls = el('div', { class: 'vp-controls' }, [
+            this.progress,
+            el('div', { class: 'vp-row' }, [
+                this.playBtn,
+                el('div', { class: 'vp-vol' }, [this.muteBtn, this.volume]),
+                this.time,
+                el('div', { class: 'vp-spacer' }),
+                this.ccBtn,
+                el('div', { class: 'vp-settings' }, [this.gearBtn, this.menu]),
+                this.fsBtn,
+            ]),
+        ]);
+
+        this.wrap = el('div', { class: 'vp', tabindex: '0' }, [
+            this.video, this.spinner, this.bigBtn, this.controls,
+        ]);
+        this.container.appendChild(this.wrap);
+
+        this.bind();
+    }
+
+    bind() {
+        const v = this.video;
+
+        const toggle = () => (v.paused ? this.play() : v.pause());
+        this.playBtn.onclick = toggle;
+        this.bigBtn.onclick = toggle;
+        v.addEventListener('click', toggle);
+        v.addEventListener('dblclick', () => this.toggleFullscreen());
+
+        v.addEventListener('play', () => { this.playBtn.innerHTML = I.pause; this.wrap.classList.add('vp-playing'); this.scheduleHide(); });
+        v.addEventListener('pause', () => { this.playBtn.innerHTML = I.play; this.wrap.classList.remove('vp-playing'); this.showControls(); });
+        v.addEventListener('waiting', () => { this.spinner.hidden = false; });
+        v.addEventListener('playing', () => { this.spinner.hidden = true; });
+        v.addEventListener('canplay', () => { this.spinner.hidden = true; });
+        v.addEventListener('timeupdate', () => this.updateProgress());
+        v.addEventListener('progress', () => this.updateProgress());
+        v.addEventListener('loadedmetadata', () => this.updateProgress());
+        v.addEventListener('ended', () => { this.playBtn.innerHTML = I.play; this.showControls(); });
+
+        // Seeking
+        const seekTo = (clientX) => {
+            const r = this.progress.getBoundingClientRect();
+            const ratio = Math.min(1, Math.max(0, (clientX - r.left) / r.width));
+            if (isFinite(v.duration)) v.currentTime = ratio * v.duration;
+        };
+        this.progress.addEventListener('pointerdown', (e) => {
+            this._seeking = true;
+            this.progress.setPointerCapture(e.pointerId);
+            seekTo(e.clientX);
+        });
+        this.progress.addEventListener('pointermove', (e) => { if (this._seeking) seekTo(e.clientX); });
+        this.progress.addEventListener('pointerup', (e) => { this._seeking = false; try { this.progress.releasePointerCapture(e.pointerId); } catch { /* */ } });
+
+        // Volume
+        this.muteBtn.onclick = () => { v.muted = !v.muted; this.updateVolumeUi(); };
+        this.volume.oninput = () => { v.volume = parseFloat(this.volume.value); v.muted = v.volume === 0; this.updateVolumeUi(); };
+        v.addEventListener('volumechange', () => this.updateVolumeUi());
+
+        // Subtitles
+        this.ccBtn.onclick = () => this.cycleSubtitle();
+
+        // Settings menu
+        this.gearBtn.onclick = (e) => { e.stopPropagation(); this.menu.hidden ? this.openMenu() : (this.menu.hidden = true); };
+        document.addEventListener('click', this._docClick = (e) => { if (!this.wrap.contains(e.target)) this.menu.hidden = true; });
+
+        // Fullscreen
+        this.fsBtn.onclick = () => this.toggleFullscreen();
+        document.addEventListener('fullscreenchange', this._fsChange = () => {
+            const fs = document.fullscreenElement === this.wrap;
+            this.wrap.classList.toggle('vp-fs', fs);
+            this.fsBtn.innerHTML = fs ? I.exitFs : I.enterFs;
+        });
+
+        // Auto-hide controls
+        this.wrap.addEventListener('pointermove', () => { this.showControls(); this.scheduleHide(); });
+        this.wrap.addEventListener('pointerleave', () => { if (!v.paused) this.hideControls(); });
+
+        // Keyboard shortcuts
+        this.wrap.addEventListener('keydown', (e) => {
+            switch (e.key) {
+                case ' ': case 'k': e.preventDefault(); toggle(); break;
+                case 'ArrowRight': v.currentTime = Math.min((v.duration || 0), v.currentTime + 10); break;
+                case 'ArrowLeft': v.currentTime = Math.max(0, v.currentTime - 10); break;
+                case 'ArrowUp': e.preventDefault(); v.volume = Math.min(1, v.volume + 0.1); break;
+                case 'ArrowDown': e.preventDefault(); v.volume = Math.max(0, v.volume - 0.1); break;
+                case 'f': this.toggleFullscreen(); break;
+                case 'm': v.muted = !v.muted; this.updateVolumeUi(); break;
+                default: return;
+            }
+            this.showControls();
+            this.scheduleHide();
+        });
+
+        this.updateVolumeUi();
+    }
+
+    updateProgress() {
+        const v = this.video;
+        const d = v.duration || 0;
+        this.played.style.width = d ? `${(v.currentTime / d) * 100}%` : '0%';
+        this.handle.style.left = d ? `${(v.currentTime / d) * 100}%` : '0%';
+        try {
+            if (v.buffered.length) {
+                this.buffered.style.width = d ? `${(v.buffered.end(v.buffered.length - 1) / d) * 100}%` : '0%';
+            }
+        } catch { /* */ }
+        this.time.textContent = `${fmt(v.currentTime)} / ${fmt(d)}`;
+    }
+
+    updateVolumeUi() {
+        const v = this.video;
+        this.muteBtn.innerHTML = (v.muted || v.volume === 0) ? I.muted : I.volume;
+        this.volume.value = v.muted ? 0 : v.volume;
+    }
+
+    showControls() { this.wrap.classList.add('vp-active'); }
+    hideControls() { if (!this.menu.hidden) return; this.wrap.classList.remove('vp-active'); }
+    scheduleHide() {
+        clearTimeout(this._hideTimer);
+        this._hideTimer = setTimeout(() => { if (!this.video.paused) this.hideControls(); }, 3000);
+    }
+
+    toggleFullscreen() {
+        if (document.fullscreenElement === this.wrap) document.exitFullscreen?.();
+        else this.wrap.requestFullscreen?.();
+    }
+
+    openMenu() {
+        const v = this.video;
+        const menu = this.menu;
+        menu.innerHTML = '';
+
+        // Quality (MP4 sources only; HLS/DASH are adaptive)
+        if (this.currentSources.length > 1) {
+            menu.appendChild(el('div', { class: 'vp-menu-title', text: 'Qualité' }));
+            this.currentSources.forEach((s) => {
+                const active = v.currentSrc === s.url;
+                menu.appendChild(el('button', {
+                    class: `vp-menu-item ${active ? 'active' : ''}`,
+                    text: s.quality || (s.resolution ? s.resolution + 'p' : 'auto'),
+                    onclick: () => { this.setMp4(s.url); this.menu.hidden = true; },
+                }));
+            });
+        }
+
+        // Playback speed
+        menu.appendChild(el('div', { class: 'vp-menu-title', text: 'Vitesse' }));
+        [0.5, 0.75, 1, 1.25, 1.5, 2].forEach((rate) => {
+            menu.appendChild(el('button', {
+                class: `vp-menu-item ${v.playbackRate === rate ? 'active' : ''}`,
+                text: rate === 1 ? 'Normale' : rate + '×',
+                onclick: () => { v.playbackRate = rate; this.menu.hidden = true; },
+            }));
+        });
+
+        menu.hidden = false;
+    }
+
     async load(data) {
         this.destroyHls();
         this.destroyDash();
         const { sources = [], hls = [], dash = [], subtitles = [], startTime = 0, onProgress } = data;
+        this.currentSources = sources;
 
         if (sources.length) {
-            this.currentSources = sources;
             this.setMp4(sources[0].url);
         } else if (hls.length) {
             await this.setHls(hls[0]);
@@ -93,8 +294,12 @@ export class Player {
     setMp4(url) {
         this.destroyHls();
         const t = this.video.currentTime;
+        const wasPlaying = !this.video.paused;
         this.video.src = url;
-        this.video.currentTime = t || 0;
+        this.video.addEventListener('loadedmetadata', () => {
+            if (t) this.video.currentTime = t;
+            if (wasPlaying) this.play();
+        }, { once: true });
     }
 
     async setHls(url) {
@@ -104,7 +309,6 @@ export class Player {
             this.hls.loadSource(url);
             this.hls.attachMedia(this.video);
         } else {
-            // Safari / native HLS
             this.video.src = url;
         }
     }
@@ -116,39 +320,54 @@ export class Player {
             this.dash.updateSettings({ streaming: { buffer: { bufferTimeAtTopQuality: 30 } } });
             this.dash.initialize(this.video, url, false);
         } else {
-            // Native MPD support is rare, but try as a last resort.
             this.video.src = url;
         }
     }
 
     setSubtitles(subtitles) {
-        // Remove existing tracks
         this.video.querySelectorAll('track').forEach((t) => t.remove());
-        subtitles.forEach((sub, i) => {
+        this.subtitles = subtitles || [];
+        this.activeTrack = -1;
+        this.subtitles.forEach((sub, i) => {
             if (!sub.url) return;
             const track = el('track', {
                 kind: 'subtitles',
-                label: sub.label || sub.lang || `Track ${i + 1}`,
+                label: sub.label || sub.lang || `Piste ${i + 1}`,
                 srclang: (sub.lang || 'en').slice(0, 2),
                 src: api.subtitleUrl(sub.url),
             });
-            if (i === 0) track.default = true;
             this.video.appendChild(track);
         });
+        // Hide all tracks initially (custom CC control drives visibility).
+        Array.from(this.video.textTracks).forEach((t) => { t.mode = 'hidden'; });
+        this.ccBtn.hidden = this.subtitles.length === 0;
+        this.ccBtn.classList.remove('active');
+    }
+
+    cycleSubtitle() {
+        const tracks = this.video.textTracks;
+        if (!tracks.length) return;
+        Array.from(tracks).forEach((t) => { t.mode = 'hidden'; });
+        this.activeTrack += 1;
+        if (this.activeTrack >= tracks.length) this.activeTrack = -1;
+        if (this.activeTrack >= 0) {
+            tracks[this.activeTrack].mode = 'showing';
+            this.ccBtn.classList.add('active');
+        } else {
+            this.ccBtn.classList.remove('active');
+        }
     }
 
     play() { this.video.play().catch(() => {}); }
 
-    destroyHls() {
-        if (this.hls) { this.hls.destroy(); this.hls = null; }
-    }
-
-    destroyDash() {
-        if (this.dash) { try { this.dash.reset(); } catch { /* ignore */ } this.dash = null; }
-    }
+    destroyHls() { if (this.hls) { this.hls.destroy(); this.hls = null; } }
+    destroyDash() { if (this.dash) { try { this.dash.reset(); } catch { /* */ } this.dash = null; } }
 
     destroy() {
         clearInterval(this._progressTimer);
+        clearTimeout(this._hideTimer);
+        document.removeEventListener('click', this._docClick);
+        document.removeEventListener('fullscreenchange', this._fsChange);
         this.destroyHls();
         this.destroyDash();
         this.video.pause();

@@ -66,4 +66,5 @@ Route::middleware('auth:sanctum')->group(function () {
 Route::middleware('auth:sanctum')->prefix('admin')->group(function () {
     Route::get('stats', [AdminController::class, 'stats']);
     Route::get('export-links', [AdminController::class, 'exportLinks']);
+    Route::post('import', [AdminController::class, 'import']);
 });

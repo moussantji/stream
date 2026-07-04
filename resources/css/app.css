@@ -186,26 +186,22 @@ video.hero-bg { pointer-events: none; }
 
 /* ---------------- Detail ---------------- */
 .detail-hero { position: relative; padding: 32px 0 24px; overflow: hidden; isolation: isolate; }
-/* Trailer/poster as a backdrop behind the description — kept clear (only a
-   slight dim for text legibility), no heavy blur. */
+/* Trailer/poster as a clean backdrop behind the description — no blur, no
+   colour tint, just enough darkening so the text stays readable. */
 .detail-hero-bg {
     position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover;
     z-index: -2;
-    filter: brightness(.78);
+    filter: brightness(.6);
     pointer-events: none;
 }
-/* Centre stays clear so the trailer is visible; only the EDGES get a red glow
-   (brand colour) plus a soft darkening vignette. */
 .detail-hero-overlay {
     position: absolute; inset: 0; z-index: -1;
-    background: radial-gradient(ellipse at center, transparent 45%, rgba(11, 11, 15, .55) 100%);
-    box-shadow:
-        inset 0 0 130px 26px rgba(229, 9, 20, .55),
-        inset 0 0 55px rgba(229, 9, 20, .6);
+    background:
+        linear-gradient(to right, rgba(11, 11, 15, .9), rgba(11, 11, 15, .45) 60%, rgba(11, 11, 15, .7)),
+        linear-gradient(to top, var(--bg) 2%, transparent 45%);
     pointer-events: none;
 }
 .detail-hero .container { position: relative; z-index: 1; display: grid; grid-template-columns: 260px 1fr; gap: 32px; }
-/* Keep text readable over the now-clearer backdrop. */
 .detail-hero .detail-title,
 .detail-hero .detail-desc,
 .detail-hero .detail-meta { text-shadow: 0 1px 12px rgba(0, 0, 0, .85); }
@@ -277,6 +273,80 @@ video.hero-bg { pointer-events: none; }
 
 .player-shell { position: relative; background: #000; border-radius: var(--radius); overflow: hidden; box-shadow: var(--shadow); aspect-ratio: 16/9; }
 .player-shell video { width: 100%; height: 100%; background: #000; }
+
+/* ---------------- Custom video player (.vp) ---------------- */
+.vp { position: relative; width: 100%; height: 100%; background: #000; outline: none; overflow: hidden; }
+.vp video { width: 100%; height: 100%; display: block; background: #000; }
+.vp.vp-fs { border-radius: 0; }
+
+.vp-spinner {
+    position: absolute; top: 50%; left: 50%; width: 54px; height: 54px; margin: -27px 0 0 -27px;
+    border: 4px solid rgba(255, 255, 255, .25); border-top-color: #fff; border-radius: 50%;
+    animation: spin .8s linear infinite; z-index: 4; pointer-events: none;
+}
+
+.vp-big {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    width: 84px; height: 84px; border-radius: 50%; border: none;
+    background: rgba(229, 9, 20, .92); color: #fff; display: grid; place-items: center;
+    z-index: 3; transition: opacity .2s, transform .15s; box-shadow: 0 8px 30px rgba(0, 0, 0, .5);
+}
+.vp-big svg { width: 40px; height: 40px; margin-left: 4px; }
+.vp-big:hover { transform: translate(-50%, -50%) scale(1.06); }
+.vp.vp-playing .vp-big { opacity: 0; pointer-events: none; }
+
+.vp-controls {
+    position: absolute; left: 0; right: 0; bottom: 0; z-index: 5;
+    padding: 8px 14px 10px;
+    background: linear-gradient(to top, rgba(0, 0, 0, .85), rgba(0, 0, 0, .35) 60%, transparent);
+    opacity: 0; transform: translateY(8px); transition: opacity .2s, transform .2s;
+}
+.vp.vp-active .vp-controls, .vp:not(.vp-playing) .vp-controls { opacity: 1; transform: none; }
+.vp.vp-active { cursor: default; }
+.vp.vp-playing:not(.vp-active) { cursor: none; }
+
+.vp-progress { padding: 8px 0; cursor: pointer; touch-action: none; }
+.vp-track { position: relative; height: 5px; background: rgba(255, 255, 255, .25); border-radius: 3px; }
+.vp-buffered { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: rgba(255, 255, 255, .35); border-radius: 3px; }
+.vp-played { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: var(--accent); border-radius: 3px; }
+.vp-handle {
+    position: absolute; top: 50%; width: 13px; height: 13px; margin-left: -6px; border-radius: 50%;
+    background: var(--accent); transform: translateY(-50%) scale(0); transition: transform .12s;
+}
+.vp-progress:hover .vp-track { height: 7px; }
+.vp-progress:hover .vp-handle { transform: translateY(-50%) scale(1); }
+
+.vp-row { display: flex; align-items: center; gap: 6px; }
+.vp-spacer { flex: 1; }
+.vp-btn {
+    background: transparent; border: none; color: #fff; width: 40px; height: 40px;
+    display: grid; place-items: center; border-radius: 8px; opacity: .92;
+}
+.vp-btn svg { width: 24px; height: 24px; }
+.vp-btn:hover { background: rgba(255, 255, 255, .15); opacity: 1; }
+.vp-btn.active { color: var(--accent-2); }
+.vp-time { color: #fff; font-size: 13px; font-variant-numeric: tabular-nums; margin-left: 4px; white-space: nowrap; }
+
+.vp-vol { display: flex; align-items: center; }
+.vp-volume { width: 0; opacity: 0; transition: width .2s, opacity .2s; accent-color: var(--accent); cursor: pointer; }
+.vp-vol:hover .vp-volume, .vp-volume:focus { width: 80px; opacity: 1; margin: 0 6px; }
+
+.vp-settings { position: relative; }
+.vp-menu {
+    position: absolute; right: 0; bottom: 48px; min-width: 170px; max-height: 260px; overflow: auto;
+    background: rgba(20, 20, 28, .97); border: 1px solid var(--border); border-radius: 10px;
+    padding: 6px; box-shadow: var(--shadow);
+}
+.vp-menu-title { font-size: 12px; color: var(--text-dim); padding: 8px 10px 4px; text-transform: uppercase; letter-spacing: .04em; }
+.vp-menu-item {
+    display: block; width: 100%; text-align: left; background: transparent; border: none; color: #fff;
+    padding: 9px 10px; border-radius: 7px; font-size: 14px;
+}
+.vp-menu-item:hover { background: rgba(255, 255, 255, .1); }
+.vp-menu-item.active { color: var(--accent-2); font-weight: 700; }
+
+.vp video::cue { background: rgba(0, 0, 0, .6); color: #fff; font-size: .9em; }
+@media (max-width: 720px) { .vp-volume { display: none; } .vp-time { font-size: 12px; } }
 .player-toolbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-top: 16px; }
 .player-toolbar .spacer { flex: 1; }
 .select {

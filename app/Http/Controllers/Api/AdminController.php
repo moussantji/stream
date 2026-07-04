@@ -8,6 +8,7 @@ use App\Services\Catalog\CatalogExporter;
 use App\Services\MovieBox\SubjectType;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Artisan;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 
 class AdminController extends Controller
@@ -45,7 +46,9 @@ class AdminController extends Controller
     {
         $this->authorizeAdmin($request);
 
-        $limit = min(1000, max(1, (int) $request->input('limit', 100)));
+        // limit=0 (or blank) means "everything persisted" (bounded by a hard cap).
+        $raw = (int) $request->input('limit', 100);
+        $limit = $raw <= 0 ? 100000 : min(100000, $raw);
         $type = SubjectType::resolve($request->input('type', 'all'));
 
         $query = CatalogItem::query()->orderBy('id');
@@ -82,6 +85,28 @@ class AdminController extends Controller
             'Cache-Control' => 'no-store',
             'X-Accel-Buffering' => 'no',
         ]);
+    }
+
+    /**
+     * Trigger a deeper catalog import (more titles) in the background. The API
+     * has no "list everything" endpoint, so the catalog is discovered by paging
+     * through each category — this fetches more pages than the light boot import.
+     */
+    public function import(Request $request): JsonResponse
+    {
+        $this->authorizeAdmin($request);
+
+        $pages = min(40, max(1, (int) $request->input('pages', 15)));
+
+        // Runs after the HTTP response is flushed — no queue worker required.
+        dispatch(function () use ($pages) {
+            Artisan::call('catalog:import', ['--pages' => $pages]);
+        })->afterResponse();
+
+        return response()->json(['data' => [
+            'message' => "Import lancé en arrière-plan ({$pages} pages par catégorie). Recharge la page dans quelques minutes pour voir le total augmenter.",
+            'pages' => $pages,
+        ]]);
     }
 
     protected function authorizeAdmin(Request $request): void

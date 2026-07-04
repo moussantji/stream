@@ -52,7 +52,8 @@ class AppServiceProvider extends ServiceProvider
 
         $this->app->terminating(function () {
             try {
-                Artisan::call('catalog:import');
+                // Keep startup light; the admin "deep import" fetches more pages.
+                Artisan::call('catalog:import', ['--pages' => 3]);
             } catch (Throwable $e) {
                 report($e);
             }

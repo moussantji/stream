@@ -20,7 +20,8 @@ use Throwable;
 class ImportCatalog extends Command
 {
     protected $signature = 'catalog:import
-        {--no-persist : Skip writing to the catalog_items table (JSON only)}';
+        {--no-persist : Skip writing to the catalog_items table (JSON only)}
+        {--pages=12 : How many pages to fetch per category (deeper = more titles)}';
 
     protected $description = 'Import all films, séries and animation from the MovieBox API and save them as JSON.';
 
@@ -44,9 +45,10 @@ class ImportCatalog extends Command
         File::ensureDirectoryExists($dir);
 
         $everything = [];
+        $pages = max(1, (int) $this->option('pages'));
 
         foreach (self::CATEGORIES as $slug => $tabId) {
-            $items = $this->fetchTab($tabId);
+            $items = $this->fetchTab($tabId, $pages);
 
             $this->writeJson($dir, $slug, [
                 'type' => $slug,
@@ -80,33 +82,41 @@ class ImportCatalog extends Command
     }
 
     /**
-     * Flatten every subject of a tab-operating tab into a de-duplicated,
-     * normalized list.
+     * Flatten subjects of a tab-operating tab across several pages into a
+     * de-duplicated, normalized list. Stops early when a page adds nothing new.
      *
      * @return array<int,array<string,mixed>>
      */
-    protected function fetchTab(int $tabId): array
+    protected function fetchTab(int $tabId, int $pages = 1): array
     {
-        try {
-            $data = $this->client->home($tabId);
-        } catch (Throwable $e) {
-            report($e);
-            $this->warn("  API indisponible pour l'onglet {$tabId} — ignoré.");
-
-            return [];
-        }
-
         $seen = [];
         $items = [];
-        foreach (($data['items'] ?? []) as $block) {
-            if (! is_array($block)) {
-                continue;
+
+        for ($page = 1; $page <= $pages; $page++) {
+            try {
+                $data = $this->client->home($tabId, $page);
+            } catch (Throwable $e) {
+                report($e);
+                $this->warn("  API indisponible pour l'onglet {$tabId} (page {$page}) — arrêt.");
+                break;
             }
-            foreach (ItemNormalizer::many($block['subjects'] ?? []) as $item) {
-                if (! isset($seen[$item['subjectId']])) {
-                    $seen[$item['subjectId']] = true;
-                    $items[] = $item;
+
+            $added = 0;
+            foreach (($data['items'] ?? []) as $block) {
+                if (! is_array($block)) {
+                    continue;
                 }
+                foreach (ItemNormalizer::many($block['subjects'] ?? []) as $item) {
+                    if (! isset($seen[$item['subjectId']])) {
+                        $seen[$item['subjectId']] = true;
+                        $items[] = $item;
+                        $added++;
+                    }
+                }
+            }
+
+            if ($added === 0) {
+                break; // no more new titles on this tab
             }
         }
 

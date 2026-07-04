@@ -138,6 +138,7 @@ export const api = {
 
     // ---- Admin ----
     adminStats: () => unwrap(request('admin/stats')),
+    adminImport: (pages = 15) => unwrap(request('admin/import', { method: 'POST', body: { pages } })),
     exportLinks: (params) => downloadFile('admin/export-links', params, 'moviebox-links.txt'),
 
     // ---- Library ----
