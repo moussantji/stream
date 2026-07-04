@@ -97,6 +97,8 @@ export const api = {
     search: (q, type = 'all', page = 1) => unwrap(request('search', { params: { q, type, page } })),
     suggest: (q) => unwrap(request('suggest', { params: { q } })),
     discover: () => unwrap(request('discover')),
+    category: (tab) => unwrap(request('category', { params: { tab } })),
+    channels: () => unwrap(request('channels')),
     detail: (params) => unwrap(request('detail', { params })),
 
     // ---- Streaming ----

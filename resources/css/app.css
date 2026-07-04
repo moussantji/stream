@@ -239,11 +239,81 @@ img { display: block; }
 
 .fav-btn.active { background: var(--accent); color: #fff; border-color: transparent; }
 
+/* ---------------- Live TV channels ---------------- */
+.channel-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: 16px;
+    padding: 6px 0 24px;
+}
+.channel-card {
+    position: relative;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    cursor: pointer;
+    transition: transform .15s, border-color .15s;
+}
+.channel-card:hover { transform: translateY(-3px); border-color: var(--accent); }
+.channel-card.disabled { opacity: .55; cursor: not-allowed; }
+.channel-card img, .channel-card .ph {
+    width: 100%; aspect-ratio: 16/10; object-fit: cover; background: #10101a;
+    display: grid; place-items: center; color: var(--text-dim); font-size: 13px; text-align: center; padding: 8px;
+}
+.channel-name { padding: 10px 12px; font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.channel-badge { position: absolute; top: 8px; right: 8px; background: rgba(0,0,0,.7); border-radius: 6px; padding: 2px 8px; font-size: 11px; }
+
+/* ---------------- Mobile menu toggle ---------------- */
+.nav-toggle {
+    display: none;
+    background: transparent;
+    border: none;
+    color: var(--text);
+    padding: 6px;
+    margin-right: 4px;
+    border-radius: 8px;
+}
+.nav-toggle:hover { background: var(--bg-elevated); }
+
 /* ---------------- Responsive ---------------- */
-@media (max-width: 860px) {
-    .main-nav { display: none; }
+@media (max-width: 980px) {
+    .nav-toggle { display: inline-flex; }
+
+    .main-nav {
+        position: fixed;
+        top: var(--header-h);
+        left: 0;
+        right: 0;
+        flex-direction: column;
+        gap: 4px;
+        margin: 0;
+        padding: 12px clamp(16px, 4vw, 48px) 18px;
+        background: var(--bg-elevated);
+        border-bottom: 1px solid var(--border);
+        box-shadow: var(--shadow);
+        transform: translateY(-130%);
+        transition: transform .22s ease;
+        z-index: 45;
+    }
+    .main-nav.open { transform: translateY(0); }
+    .main-nav a { padding: 12px 10px; border-radius: 8px; font-size: 16px; }
+    .main-nav a:hover, .main-nav a.active { background: var(--bg-card); }
+
+    .brand { margin-right: auto; }
+}
+
+@media (max-width: 720px) {
     .detail-hero .container { grid-template-columns: 1fr; }
-    .detail-poster { max-width: 200px; }
+    .detail-poster { max-width: 180px; margin: 0 auto; }
+    .search-box { width: 100%; margin-left: 0; }
+    .header-inner { flex-wrap: wrap; height: auto; padding-top: 10px; padding-bottom: 10px; gap: 10px; }
     .brand-text { display: none; }
-    .search-box { width: min(220px, 50vw); }
+    .search-box { order: 3; width: 100%; }
+    .auth-area .avatar-chip span { display: none; }
+    .hero { height: min(70vh, 460px); }
+    .row-scroller { grid-auto-columns: clamp(120px, 38vw, 160px); }
+    .grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 12px; }
+    .channel-grid { grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 12px; }
+    .section-title { font-size: 18px; }
 }

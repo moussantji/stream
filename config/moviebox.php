@@ -26,6 +26,10 @@ return [
     // Seconds to cache catalog responses (home/search/detail).
     'cache_ttl' => (int) env('MOVIEBOX_CACHE_TTL', 300),
 
+    // Seconds a persisted MySQL snapshot is served as fresh before re-fetching
+    // (it is still used as a fallback beyond this when the API fails).
+    'snapshot_ttl' => (int) env('MOVIEBOX_SNAPSHOT_TTL', 900),
+
     // Outbound request timeout, seconds.
     'timeout' => (int) env('MOVIEBOX_TIMEOUT', 30),
 

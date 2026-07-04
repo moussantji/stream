@@ -18,6 +18,9 @@ runtime dependency.
 
 ## Features
 
+- **Categories** — Films, Séries & Émissions, Animation, Populaires (most-watched), and a Live TV page, with a mobile-responsive nav (hamburger menu)
+- **MySQL persistence** — every catalog response is snapshotted to MySQL and served stale-if-error, so the site keeps working when the upstream API hiccups
+- **French versions (VF)** — a Version/Langue selector plays French dubs, and separate "[Version française]" entries are auto-discovered
 - **Browse & discover** — curated home rows, trending, "hot" and popular searches
 - **Search** with live autocomplete suggestions and type filters (movies / series)
 - **Detail pages** with metadata, cast, seasons & episodes, and recommendations
@@ -128,7 +131,9 @@ library endpoints require a Sanctum bearer token
 | GET    | `/search`    | `q, type=(all\|movies\|tv-series), page` |
 | GET    | `/suggest`   | `q` |
 | GET    | `/discover`  | — |
-| GET    | `/detail`    | `subjectId, detailPath, subjectType[, title, cover]` |
+| GET    | `/category`  | `tab=(films\|series\|animation)` |
+| GET    | `/channels`  | — (live TV, best-effort) |
+| GET    | `/detail`    | `subjectId, subjectType[, title, cover]` |
 
 ### Streaming
 | Method | Endpoint      | Query |

@@ -1,7 +1,7 @@
 import '../css/app.css';
 import { api } from './api.js';
 import { navigate, renderAuthArea, el, clear } from './ui.js';
-import { homePage, trendingPage, searchPage, detailPage, watchPage, libraryPage } from './pages.js';
+import { homePage, trendingPage, searchPage, detailPage, watchPage, libraryPage, categoryPage, channelsPage } from './pages.js';
 
 const appRoot = document.getElementById('app');
 
@@ -12,12 +12,22 @@ function route() {
 
     window.scrollTo(0, 0);
     highlightNav(path);
+    closeMobileNav();
 
     switch (true) {
         case path === '/' :
             return homePage(appRoot);
+        case path === '/films':
+            return categoryPage(appRoot, 'films', 'Films');
+        case path === '/series':
+            return categoryPage(appRoot, 'series', 'Séries & Émissions');
+        case path === '/animation':
+            return categoryPage(appRoot, 'animation', 'Animation');
+        case path === '/tv':
+            return channelsPage(appRoot);
+        case path === '/populaires':
         case path === '/trending':
-            return trendingPage(appRoot);
+            return trendingPage(appRoot, 'Les plus regardés');
         case path === '/search':
             return searchPage(appRoot, params);
         case path === '/title':
@@ -38,6 +48,23 @@ function route() {
 function highlightNav(path) {
     document.querySelectorAll('[data-nav]').forEach((a) => {
         a.classList.toggle('active', a.getAttribute('data-nav') === path);
+    });
+}
+
+function closeMobileNav() {
+    const nav = document.getElementById('main-nav');
+    const toggle = document.getElementById('nav-toggle');
+    if (nav) nav.classList.remove('open');
+    if (toggle) toggle.setAttribute('aria-expanded', 'false');
+}
+
+function initNavToggle() {
+    const nav = document.getElementById('main-nav');
+    const toggle = document.getElementById('nav-toggle');
+    if (!nav || !toggle) return;
+    toggle.addEventListener('click', () => {
+        const open = nav.classList.toggle('open');
+        toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
     });
 }
 
@@ -96,4 +123,5 @@ function initSearch() {
 // ---------------- Init ----------------
 renderAuthArea();
 initSearch();
+initNavToggle();
 route();

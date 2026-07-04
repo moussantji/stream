@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Services\Catalog\CatalogRepository;
 use App\Services\MovieBox\MovieBoxClient;
 use App\Services\MovieBox\SubjectType;
 use App\Support\ItemNormalizer;
@@ -11,94 +12,82 @@ use Illuminate\Http\Request;
 
 class CatalogController extends Controller
 {
-    public function __construct(protected MovieBoxClient $client) {}
+    /** Category slug -> tab-operating tab id + display title. */
+    protected const CATEGORIES = [
+        'films' => ['tab' => 2, 'title' => 'Films'],
+        'series' => ['tab' => 5, 'title' => 'Séries & Émissions'],
+        'emissions' => ['tab' => 5, 'title' => 'Séries & Émissions'],
+        'animation' => ['tab' => 8, 'title' => 'Animation'],
+        'anime' => ['tab' => 8, 'title' => 'Animation'],
+    ];
 
-    /**
-     * Home rows. The mobile API has no language filter, so we build a French
-     * browsing experience from configurable search queries. If none are
-     * configured (or all fail), we fall back to the provider's landing page.
-     */
+    public function __construct(
+        protected MovieBoxClient $client,
+        protected CatalogRepository $repo,
+    ) {}
+
+    // -----------------------------------------------------------------
+    // Discovery
+    // -----------------------------------------------------------------
+
+    /** French-oriented home rows (persisted to MySQL, stale-if-error). */
     public function home(): JsonResponse
     {
-        $queries = (array) config('moviebox.home_queries', []);
-        $sections = [];
+        $data = $this->repo->remember(
+            'catalog:home',
+            $this->ttl(),
+            fn () => ['sections' => $this->buildHomeSections()],
+        );
 
-        foreach ($queries as $q) {
-            try {
-                $data = $this->client->search($q['query'], 0, 1, 20);
-                $items = ItemNormalizer::many($data['items'] ?? []);
-            } catch (\Throwable $e) {
-                report($e);
-                $items = [];
-            }
-
-            if ($items !== []) {
-                $sections[] = ['title' => $q['label'], 'items' => $items];
-            }
-        }
-
-        if ($sections === []) {
-            $sections = $this->landingPageSections();
-        }
-
-        return response()->json(['data' => ['sections' => $sections]]);
+        return response()->json(['data' => $data]);
     }
 
-    /** Trending row/page (backed by a configurable French search query). */
+    /** Trending / "les plus regardés" row + page. */
     public function trending(Request $request): JsonResponse
     {
         $type = SubjectType::resolve($request->input('type', 'all'));
         $query = (string) config('moviebox.trending_query', 'français');
 
-        $items = [];
-        try {
-            $data = $this->client->search($query, $type->value, 1, 20);
-            $items = ItemNormalizer::many($data['items'] ?? []);
-        } catch (\Throwable $e) {
-            report($e);
-        }
+        $data = $this->repo->remember(
+            "catalog:trending:{$type->value}",
+            $this->ttl(),
+            fn () => ['items' => $this->searchItems($query, $type->value, 20), 'pager' => null],
+        );
 
-        return response()->json(['data' => ['items' => $items, 'pager' => null]]);
+        return response()->json(['data' => $data]);
     }
 
-    /**
-     * Parse the provider's tab-operating landing page into sections (fallback).
-     *
-     * @return array<int,array<string,mixed>>
-     */
-    protected function landingPageSections(): array
+    /** Category browse (films / séries / animation) from tab-operating. */
+    public function category(Request $request): JsonResponse
     {
-        try {
-            $data = $this->client->home(0);
-        } catch (\Throwable $e) {
-            report($e);
+        $slug = strtolower((string) $request->input('tab', 'films'));
+        $config = self::CATEGORIES[$slug] ?? self::CATEGORIES['films'];
 
-            return [];
-        }
+        $data = $this->repo->remember(
+            "catalog:category:{$config['tab']}",
+            $this->ttl(),
+            fn () => ['title' => $config['title'], 'items' => $this->flattenTab($config['tab'])],
+        );
 
-        $sections = [];
-        foreach (($data['items'] ?? []) as $block) {
-            if (! is_array($block)) {
-                continue;
-            }
+        // Title is static; ensure it is present even when served from an old snapshot.
+        $data['title'] = $config['title'];
 
-            $rawItems = $block['subjects'] ?? [];
-            if (! $rawItems && isset($block['banner']['banners'])) {
-                $rawItems = $block['banner']['banners'];
-            }
-
-            $items = ItemNormalizer::many(is_array($rawItems) ? $rawItems : []);
-            if ($items === []) {
-                continue;
-            }
-
-            $sections[] = ['title' => $block['title'] ?? 'Featured', 'items' => $items];
-        }
-
-        return $sections;
+        return response()->json(['data' => $data]);
     }
 
-    /** Full search with optional type filter (all|movies|tv-series). */
+    /** Live TV channels, extracted from the landing page's liveList (best-effort). */
+    public function channels(): JsonResponse
+    {
+        $data = $this->repo->remember(
+            'catalog:channels',
+            $this->ttl(),
+            fn () => ['channels' => $this->buildChannels()],
+        );
+
+        return response()->json(['data' => $data]);
+    }
+
+    /** Full search (also persisted for resilience). */
     public function search(Request $request): JsonResponse
     {
         $validated = $request->validate([
@@ -111,20 +100,27 @@ class CatalogController extends Controller
         $type = SubjectType::resolve($validated['type'] ?? 'all');
         $page = (int) ($validated['page'] ?? 1);
         $perPage = (int) ($validated['perPage'] ?? 20);
+        $q = $validated['q'];
 
-        $data = $this->client->search($validated['q'], $type->value, $page, $perPage);
+        $data = $this->repo->remember(
+            'catalog:search:'.md5("$q|{$type->value}|$page|$perPage"),
+            $this->ttl(),
+            function () use ($q, $type, $page, $perPage) {
+                $res = $this->client->search($q, $type->value, $page, $perPage);
 
-        return response()->json([
-            'data' => [
-                'query' => $validated['q'],
-                'type' => $type->name,
-                'items' => ItemNormalizer::many($data['items'] ?? []),
-                'pager' => $data['pager'] ?? null,
-            ],
-        ]);
+                return [
+                    'query' => $q,
+                    'type' => $type->name,
+                    'items' => ItemNormalizer::many($res['items'] ?? []),
+                    'pager' => $res['pager'] ?? null,
+                ];
+            },
+        );
+
+        return response()->json(['data' => $data]);
     }
 
-    /** Autocomplete suggestions (backed by a small search). */
+    /** Autocomplete suggestions (not persisted — cheap + volatile). */
     public function suggest(Request $request): JsonResponse
     {
         $validated = $request->validate([
@@ -149,22 +145,21 @@ class CatalogController extends Controller
     /** Popular / hot lists for discovery widgets. */
     public function discover(): JsonResponse
     {
-        $movies = $this->trendingItems(2);
-        $series = $this->trendingItems(5);
+        $data = $this->repo->remember('catalog:discover', $this->ttl(), function () {
+            $movies = $this->flattenTab(2);
+            $series = $this->flattenTab(5);
 
-        return response()->json([
-            'data' => [
+            return [
                 'popular' => array_map(fn ($i) => $i['title'], array_slice($movies, 0, 10)),
                 'hotMovies' => $movies,
                 'hotSeries' => $series,
-            ],
-        ]);
+            ];
+        });
+
+        return response()->json(['data' => $data]);
     }
 
-    /**
-     * Rich detail-page data: metadata, seasons/episodes for series, cast, and
-     * a few recommendations.
-     */
+    /** Rich detail-page data (persisted per subject for resilience). */
     public function detail(Request $request): JsonResponse
     {
         $validated = $request->validate([
@@ -174,6 +169,205 @@ class CatalogController extends Controller
             'cover' => ['sometimes', 'string'],
         ]);
 
+        $data = $this->repo->remember(
+            'catalog:detail:'.$validated['subjectId'],
+            $this->ttl(),
+            fn () => $this->buildDetail($validated),
+            isEmpty: fn ($d) => empty($d['item']),
+        );
+
+        return response()->json(['data' => $data]);
+    }
+
+    /** Health probe for the MovieBox backend connection. */
+    public function diagnostics(): JsonResponse
+    {
+        return response()->json(['data' => $this->client->probe()]);
+    }
+
+    // -----------------------------------------------------------------
+    // Builders
+    // -----------------------------------------------------------------
+
+    protected function ttl(): int
+    {
+        return (int) config('moviebox.snapshot_ttl', 900);
+    }
+
+    /**
+     * @return array<int,array<string,mixed>>
+     */
+    protected function buildHomeSections(): array
+    {
+        $queries = (array) config('moviebox.home_queries', []);
+        $sections = [];
+
+        foreach ($queries as $q) {
+            $items = $this->searchItems($q['query'], 0, 20);
+            if ($items !== []) {
+                $sections[] = ['title' => $q['label'], 'items' => $items];
+            }
+        }
+
+        return $sections !== [] ? $sections : $this->landingPageSections();
+    }
+
+    /**
+     * @return array<int,array<string,mixed>>
+     */
+    protected function searchItems(string $query, int $subjectType, int $perPage): array
+    {
+        try {
+            $data = $this->client->search($query, $subjectType, 1, $perPage);
+
+            return ItemNormalizer::many($data['items'] ?? []);
+        } catch (\Throwable $e) {
+            report($e);
+
+            return [];
+        }
+    }
+
+    /**
+     * Flatten all subjects of a tab-operating tab into a de-duplicated list.
+     *
+     * @return array<int,array<string,mixed>>
+     */
+    protected function flattenTab(int $tabId): array
+    {
+        try {
+            $data = $this->client->home($tabId);
+        } catch (\Throwable $e) {
+            report($e);
+
+            return [];
+        }
+
+        $seen = [];
+        $items = [];
+        foreach (($data['items'] ?? []) as $block) {
+            if (! is_array($block)) {
+                continue;
+            }
+            foreach (ItemNormalizer::many($block['subjects'] ?? []) as $item) {
+                if (! isset($seen[$item['subjectId']])) {
+                    $seen[$item['subjectId']] = true;
+                    $items[] = $item;
+                }
+            }
+        }
+
+        return $items;
+    }
+
+    /**
+     * @return array<int,array<string,mixed>>
+     */
+    protected function landingPageSections(): array
+    {
+        try {
+            $data = $this->client->home(0);
+        } catch (\Throwable $e) {
+            report($e);
+
+            return [];
+        }
+
+        $sections = [];
+        foreach (($data['items'] ?? []) as $block) {
+            if (! is_array($block)) {
+                continue;
+            }
+
+            $rawItems = $block['subjects'] ?? [];
+            if (! $rawItems && isset($block['banner']['banners'])) {
+                $rawItems = $block['banner']['banners'];
+            }
+
+            $items = ItemNormalizer::many(is_array($rawItems) ? $rawItems : []);
+            if ($items !== []) {
+                $sections[] = ['title' => $block['title'] ?? 'Featured', 'items' => $items];
+            }
+        }
+
+        return $sections;
+    }
+
+    /**
+     * Extract live-TV channels from the landing page's liveList entries.
+     *
+     * @return array<int,array<string,mixed>>
+     */
+    protected function buildChannels(): array
+    {
+        try {
+            $data = $this->client->home(0);
+        } catch (\Throwable $e) {
+            report($e);
+
+            return [];
+        }
+
+        $channels = [];
+        $seen = [];
+        foreach (($data['items'] ?? []) as $block) {
+            if (! is_array($block)) {
+                continue;
+            }
+            foreach ((array) ($block['liveList'] ?? []) as $entry) {
+                $channel = $this->normalizeChannel(is_array($entry) ? $entry : []);
+                if ($channel && ! isset($seen[$channel['id']])) {
+                    $seen[$channel['id']] = true;
+                    $channels[] = $channel;
+                }
+            }
+        }
+
+        return $channels;
+    }
+
+    /**
+     * @param  array<string,mixed>  $raw
+     * @return array<string,mixed>|null
+     */
+    protected function normalizeChannel(array $raw): ?array
+    {
+        $title = $raw['title'] ?? $raw['name'] ?? $raw['channelName'] ?? $raw['channelTitle'] ?? null;
+        if (! $title) {
+            return null;
+        }
+
+        $cover = null;
+        foreach ([$raw['cover'] ?? null, $raw['icon'] ?? null, $raw['image'] ?? null, $raw['logo'] ?? null, $raw['poster'] ?? null] as $c) {
+            if (is_array($c) && ! empty($c['url'])) {
+                $cover = $c['url'];
+                break;
+            }
+            if (is_string($c) && $c !== '') {
+                $cover = $c;
+                break;
+            }
+        }
+
+        $url = $raw['url'] ?? $raw['playUrl'] ?? $raw['streamUrl'] ?? $raw['m3u8'] ?? $raw['hls'] ?? null;
+        if (is_array($url)) {
+            $url = $url['url'] ?? $url['playUrl'] ?? null;
+        }
+
+        return [
+            'id' => (string) ($raw['id'] ?? $raw['channelId'] ?? $raw['subjectId'] ?? md5($title)),
+            'title' => $title,
+            'cover' => $cover,
+            'url' => is_string($url) ? $url : null,
+        ];
+    }
+
+    /**
+     * @param  array<string,mixed>  $validated
+     * @return array<string,mixed>
+     */
+    protected function buildDetail(array $validated): array
+    {
         $subjectId = $validated['subjectId'];
 
         $detail = null;
@@ -216,42 +410,35 @@ class CatalogController extends Controller
         }
 
         $cast = is_array($detail) ? $this->normalizeCast($detail['staffList'] ?? []) : [];
-        $dubs = is_array($detail) ? $this->normalizeDubs($detail['dubs'] ?? []) : [];
-        $dubs = $this->ensureFrenchVersion($dubs, $item);
+        $dubs = $this->ensureFrenchVersion(
+            is_array($detail) ? $this->normalizeDubs($detail['dubs'] ?? []) : [],
+            $item
+        );
 
-        // No dedicated recommendation endpoint in the mobile API; surface a few
-        // titles that share the primary genre instead.
         $recommendations = [];
         if (! empty($item['genres'][0])) {
-            try {
-                $rec = $this->client->search($item['genres'][0], $item['subjectType'], 1, 12);
-                $recommendations = array_values(array_filter(
-                    ItemNormalizer::many($rec['items'] ?? []),
-                    fn ($r) => $r['subjectId'] !== $item['subjectId']
-                ));
-            } catch (\Throwable $e) {
-                report($e);
-            }
+            $recommendations = array_values(array_filter(
+                $this->searchItems($item['genres'][0], $item['subjectType'], 12),
+                fn ($r) => $r['subjectId'] !== $item['subjectId']
+            ));
         }
 
-        return response()->json([
-            'data' => [
-                'item' => $item,
-                'isSeries' => $isSeries || $seasons !== [],
-                'seasons' => $seasons,
-                'cast' => $cast,
-                'dubs' => $dubs,
-                'recommendations' => $recommendations,
-                'detailAvailable' => is_array($detail),
-            ],
-        ]);
+        return [
+            'item' => $item,
+            'isSeries' => $isSeries || $seasons !== [],
+            'seasons' => $seasons,
+            'cast' => $cast,
+            'dubs' => $dubs,
+            'recommendations' => $recommendations,
+            'detailAvailable' => is_array($detail),
+        ];
     }
 
+    // -----------------------------------------------------------------
+    // Normalizers
+    // -----------------------------------------------------------------
+
     /**
-     * If a title has no French dub track, many French versions exist instead as
-     * a *separate* catalog entry (e.g. "From [Version française]"). Look one up
-     * by title and, if found, offer it as a selectable "Français (VF)" version.
-     *
      * @param  array<int,array<string,mixed>>  $dubs
      * @param  array<string,mixed>  $item
      * @return array<int,array<string,mixed>>
@@ -260,7 +447,7 @@ class CatalogController extends Controller
     {
         foreach ($dubs as $dub) {
             if (str_starts_with($dub['code'] ?? '', 'fr') || stripos($dub['label'] ?? '', 'fran') !== false) {
-                return $dubs; // already has a French option
+                return $dubs;
             }
         }
 
@@ -282,13 +469,10 @@ class CatalogController extends Controller
     }
 
     /**
-     * Search the catalog for a "<title> version française" counterpart.
-     *
      * @return array<string,mixed>|null
      */
     protected function findFrenchVersion(string $title, string $excludeSubjectId): ?array
     {
-        // Strip bracketed tags like "[Version française]" / "(2024)".
         $clean = trim(preg_replace('/[\[\(].*?[\]\)]/u', '', $title)) ?: $title;
 
         foreach ([$clean.' version française', $clean.' français'] as $query) {
@@ -315,9 +499,6 @@ class CatalogController extends Controller
     }
 
     /**
-     * Normalize the dub (audio-language) list. Each dub is a *separate*
-     * subjectId, so switching language means playing a different subject.
-     *
      * @param  array<int,mixed>  $dubs
      * @return array<int,array<string,mixed>>
      */
@@ -345,39 +526,6 @@ class CatalogController extends Controller
         }
 
         return $out;
-    }
-
-    /** Health probe for the MovieBox backend connection. */
-    public function diagnostics(): JsonResponse
-    {
-        return response()->json(['data' => $this->client->probe()]);
-    }
-
-    /**
-     * @return array<int,array<string,mixed>>
-     */
-    protected function trendingItems(int $tabId): array
-    {
-        try {
-            $data = $this->client->home($tabId);
-        } catch (\Throwable $e) {
-            report($e);
-
-            return [];
-        }
-
-        $seen = [];
-        $items = [];
-        foreach (($data['items'] ?? []) as $block) {
-            foreach (ItemNormalizer::many($block['subjects'] ?? []) as $item) {
-                if (! isset($seen[$item['subjectId']])) {
-                    $seen[$item['subjectId']] = true;
-                    $items[] = $item;
-                }
-            }
-        }
-
-        return $items;
     }
 
     /**

@@ -61,7 +61,7 @@ export async function homePage(app) {
         app.appendChild(continueRow(historyRes.value));
     }
 
-    if (trending.length) app.appendChild(row('Trending Now', trending));
+    if (trending.length) app.appendChild(row('Les plus regardés', trending));
     sections.forEach((s) => app.appendChild(row(s.title, s.items)));
 }
 
@@ -79,8 +79,8 @@ function hero(item) {
             el('div', { class: 'hero-meta' }, meta),
             item.description ? el('p', { class: 'hero-desc', text: item.description }) : null,
             el('div', { class: 'hero-actions' }, [
-                el('button', { class: 'btn btn-primary', html: `${PLAY_SVG} <span>Play</span>`, style: 'display:flex;gap:8px;align-items:center', onclick: () => navigate(watchHref(item)) }),
-                el('button', { class: 'btn btn-ghost', text: 'More info', onclick: () => navigate(detailHref(item)) }),
+                el('button', { class: 'btn btn-primary', html: `${PLAY_SVG} <span>Lecture</span>`, style: 'display:flex;gap:8px;align-items:center', onclick: () => navigate(watchHref(item)) }),
+                el('button', { class: 'btn btn-ghost', text: "Plus d'infos", onclick: () => navigate(detailHref(item)) }),
             ]),
         ]),
     ]);
@@ -95,26 +95,118 @@ function continueRow(history) {
         return node;
     });
     return el('section', { class: 'row container' }, [
-        el('h2', { class: 'section-title', text: 'Continue Watching' }),
+        el('h2', { class: 'section-title', text: 'Reprendre la lecture' }),
         el('div', { class: 'row-scroller' }, cards),
     ]);
 }
 
-// ---------- TRENDING ----------
-export async function trendingPage(app) {
+// ---------- TRENDING / POPULAIRES ----------
+export async function trendingPage(app, title = 'Les plus regardés') {
     clear(app);
-    app.appendChild(el('div', { class: 'container' }, [el('h2', { class: 'section-title', text: 'Trending' }), loadingState()]));
+    app.appendChild(el('div', { class: 'container' }, [el('h2', { class: 'section-title', text: title }), loadingState()]));
     try {
         const data = await api.trending(0, 48);
         clear(app);
         app.appendChild(el('div', { class: 'container' }, [
-            el('h2', { class: 'section-title', text: 'Trending Now' }),
-            data.items.length ? grid(data.items) : emptyState('Nothing trending right now.'),
+            el('h2', { class: 'section-title', text: title }),
+            data.items.length ? grid(data.items) : emptyState('Rien à afficher pour le moment.'),
         ]));
     } catch (e) {
         clear(app);
-        app.appendChild(errorState(e.message, () => trendingPage(app)));
+        app.appendChild(errorState(e.message, () => trendingPage(app, title)));
     }
+}
+
+// ---------- CATEGORY (Films / Séries / Animation) ----------
+export async function categoryPage(app, tab, title) {
+    clear(app);
+    app.appendChild(el('div', { class: 'container' }, [el('h2', { class: 'section-title', text: title }), loadingState()]));
+    try {
+        const data = await api.category(tab);
+        clear(app);
+        app.appendChild(el('div', { class: 'container' }, [
+            el('h2', { class: 'section-title', text: data.title || title }),
+            data.items.length ? grid(data.items) : emptyState('Aucun contenu pour le moment.'),
+        ]));
+    } catch (e) {
+        clear(app);
+        app.appendChild(errorState(e.message, () => categoryPage(app, tab, title)));
+    }
+}
+
+// ---------- LIVE TV CHANNELS ----------
+export async function channelsPage(app) {
+    clear(app);
+    app.appendChild(el('div', { class: 'container' }, [el('h2', { class: 'section-title', text: 'TV en direct' }), loadingState()]));
+
+    let data;
+    try {
+        data = await api.channels();
+    } catch (e) {
+        clear(app);
+        app.appendChild(errorState(e.message, () => channelsPage(app)));
+        return;
+    }
+
+    clear(app);
+    const container = el('div', { class: 'container' });
+    app.appendChild(container);
+    container.appendChild(el('h2', { class: 'section-title', text: 'TV en direct' }));
+
+    if (!data.channels || !data.channels.length) {
+        container.appendChild(emptyState(
+            'Aucune chaîne disponible',
+            "Le fournisseur n'expose pas de chaînes en direct pour cette région pour le moment.",
+        ));
+        return;
+    }
+
+    const nowPlaying = el('div', { class: 'watch-title', style: 'display:none' });
+    const shell = el('div', { class: 'player-shell', style: 'display:none;margin-bottom:20px' });
+    container.appendChild(nowPlaying);
+    container.appendChild(shell);
+
+    let player = null;
+    const gridEl = el('div', { class: 'channel-grid' });
+
+    data.channels.forEach((ch) => {
+        const node = el('div', {
+            class: `channel-card ${ch.url ? '' : 'disabled'}`,
+            role: 'button', tabindex: '0',
+        }, [
+            ch.cover
+                ? el('img', { src: ch.cover, alt: ch.title, loading: 'lazy' })
+                : el('div', { class: 'ph', text: ch.title }),
+            el('div', { class: 'channel-name', text: ch.title }),
+            ch.url ? null : el('div', { class: 'channel-badge', text: 'Indisponible' }),
+        ]);
+
+        if (ch.url) {
+            node.onclick = async () => {
+                nowPlaying.style.display = '';
+                nowPlaying.textContent = `En direct — ${ch.title}`;
+                shell.style.display = '';
+                clear(shell);
+                if (player) player.destroy();
+                player = new Player(shell);
+                const isHls = /\.m3u8(\?|$)/i.test(ch.url);
+                try {
+                    await player.load(isHls
+                        ? { hls: [ch.url] }
+                        : { sources: [{ url: ch.url, quality: 'auto', resolution: 0 }] });
+                    player.play();
+                    shell.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                } catch (err) {
+                    clear(shell);
+                    shell.appendChild(el('div', { class: 'player-message' }, [emptyState('Lecture impossible', err.message)]));
+                }
+            };
+        }
+
+        gridEl.appendChild(node);
+    });
+
+    container.appendChild(gridEl);
 }
 
 // ---------- SEARCH ----------
