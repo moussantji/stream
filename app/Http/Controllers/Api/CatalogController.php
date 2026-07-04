@@ -464,11 +464,19 @@ class CatalogController extends Controller
 
         $seasons = [];
         if ($isSeries) {
-            try {
-                $seasonData = $this->client->seasonInfo($subjectId);
-                $seasons = $this->normalizeSeasons($seasonData['seasons'] ?? []);
-            } catch (\Throwable $e) {
-                report($e);
+            // Build the season/episode list from the files that ACTUALLY exist
+            // in the resource endpoint. season-info advertises a theoretical
+            // range (e.g. S4 E1–E10) even when only some episodes were uploaded
+            // (e.g. only S4 E3), which would otherwise show unplayable episodes.
+            $seasons = $this->availableSeasons($subjectId);
+
+            if ($seasons === []) {
+                try {
+                    $seasonData = $this->client->seasonInfo($subjectId);
+                    $seasons = $this->normalizeSeasons($seasonData['seasons'] ?? []);
+                } catch (\Throwable $e) {
+                    report($e);
+                }
             }
         }
 
@@ -589,6 +597,58 @@ class CatalogController extends Controller
         }
 
         return $out;
+    }
+
+    /**
+     * Build the real season/episode map from the resource endpoint (only the
+     * episodes that actually have a playable file). Paginated: 20 files/page.
+     *
+     * @return array<int,array<string,mixed>>
+     */
+    protected function availableSeasons(string $subjectId): array
+    {
+        $map = [];       // se => [ep => true]
+        $page = 1;
+        $maxPages = 40;
+
+        do {
+            try {
+                $res = $this->client->resource($subjectId, 1080, $page, 20);
+            } catch (\Throwable $e) {
+                report($e);
+                break;
+            }
+
+            $list = is_array($res['list'] ?? null) ? $res['list'] : [];
+            foreach ($list as $it) {
+                if (! is_array($it) || empty($it['resourceLink'])) {
+                    continue;
+                }
+                $se = (int) ($it['se'] ?? 0);
+                $ep = (int) ($it['ep'] ?? 0);
+                if ($se > 0 && $ep > 0) {
+                    $map[$se][$ep] = true;
+                }
+            }
+
+            $hasMore = (bool) ($res['pager']['hasMore'] ?? false);
+            $page++;
+        } while ($hasMore && $page <= $maxPages);
+
+        ksort($map);
+        $seasons = [];
+        foreach ($map as $se => $eps) {
+            $episodes = array_keys($eps);
+            sort($episodes);
+            $seasons[] = [
+                'season' => $se,
+                'episodeCount' => count($episodes),
+                'episodes' => $episodes,
+                'resolutions' => [],
+            ];
+        }
+
+        return $seasons;
     }
 
     /**
