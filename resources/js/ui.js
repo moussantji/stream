@@ -287,4 +287,7 @@ export function renderAuthArea() {
     }
 
     document.querySelectorAll('[data-auth-only]').forEach((n) => { n.style.display = isAuthed() ? '' : 'none'; });
+
+    const isAdmin = isAuthed() && !!(currentUser()?.is_admin);
+    document.querySelectorAll('[data-admin-only]').forEach((n) => { n.style.display = isAdmin ? '' : 'none'; });
 }

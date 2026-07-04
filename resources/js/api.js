@@ -84,6 +84,35 @@ async function request(path, { method = 'GET', params, body } = {}) {
 
 const unwrap = (p) => p.then((r) => (r && 'data' in r ? r.data : r));
 
+// Authenticated file download (sends the bearer token, then triggers a
+// browser download of the returned blob).
+async function downloadFile(path, params, filename) {
+    const url = new URL(`/api/${path.replace(/^\//, '')}`, window.location.origin);
+    if (params) {
+        Object.entries(params).forEach(([k, v]) => {
+            if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, v);
+        });
+    }
+    const headers = {};
+    const token = getToken();
+    if (token) headers.Authorization = `Bearer ${token}`;
+
+    const res = await fetch(url, { headers });
+    if (!res.ok) {
+        if (res.status === 401) clearAuth();
+        throw new ApiError(`Export échoué (${res.status}).`, res.status);
+    }
+    const blob = await res.blob();
+    const objUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = objUrl;
+    a.download = filename || 'export.txt';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(objUrl), 2000);
+}
+
 export const api = {
     // ---- Auth ----
     register: (payload) => request('auth/register', { method: 'POST', body: payload }),
@@ -106,6 +135,10 @@ export const api = {
     play: (params) => unwrap(request('play', { params })),
     downloads: (params) => unwrap(request('downloads', { params })),
     subtitleUrl: (url) => `/api/subtitle?url=${encodeURIComponent(url)}`,
+
+    // ---- Admin ----
+    adminStats: () => unwrap(request('admin/stats')),
+    exportLinks: (params) => downloadFile('admin/export-links', params, 'moviebox-links.txt'),
 
     // ---- Library ----
     favorites: () => unwrap(request('favorites')),

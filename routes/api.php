@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\Api\AdminController;
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\CatalogController;
 use App\Http\Controllers\Api\LibraryController;
@@ -59,4 +60,10 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('history', [LibraryController::class, 'history']);
     Route::post('history', [LibraryController::class, 'storeHistory']);
     Route::delete('history/{subjectId}', [LibraryController::class, 'destroyHistory']);
+});
+
+// ---- Admin (Sanctum + is_admin, enforced in the controller) ---------------
+Route::middleware('auth:sanctum')->prefix('admin')->group(function () {
+    Route::get('stats', [AdminController::class, 'stats']);
+    Route::get('export-links', [AdminController::class, 'exportLinks']);
 });

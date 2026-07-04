@@ -1,7 +1,8 @@
 import '../css/app.css';
 import { api } from './api.js';
 import { navigate, renderAuthArea, el, clear } from './ui.js';
-import { homePage, trendingPage, searchPage, detailPage, watchPage, libraryPage, categoryPage, channelsPage, localPage } from './pages.js';
+import { homePage, trendingPage, searchPage, detailPage, watchPage, libraryPage, categoryPage, channelsPage, localPage, adminPage } from './pages.js';
+import { setAuth, getToken, isAuthed } from './api.js';
 
 const appRoot = document.getElementById('app');
 
@@ -38,6 +39,8 @@ function route() {
             return watchPage(appRoot, params);
         case path === '/library':
             return libraryPage(appRoot);
+        case path === '/admin':
+            return adminPage(appRoot);
         default:
             clear(appRoot);
             appRoot.appendChild(el('div', { class: 'state' }, [
@@ -127,3 +130,8 @@ renderAuthArea();
 initSearch();
 initNavToggle();
 route();
+
+// Refresh the stored user (e.g. to pick up is_admin) for existing sessions.
+if (isAuthed()) {
+    api.me().then((u) => { if (u) setAuth(getToken(), u); }).catch(() => {});
+}

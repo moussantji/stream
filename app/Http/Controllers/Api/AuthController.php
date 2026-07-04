@@ -71,7 +71,7 @@ class AuthController extends Controller
             'message' => $message,
             'token' => $token,
             'token_type' => 'Bearer',
-            'user' => $user->only(['id', 'name', 'email']),
+            'user' => $user->only(['id', 'name', 'email', 'is_admin']),
         ], $status);
     }
 }

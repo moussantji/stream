@@ -27,6 +27,7 @@
                 <a href="/series" data-link data-nav="/series">Séries &amp; Émissions</a>
                 <a href="/animation" data-link data-nav="/animation">Animation</a>
                 <a href="/library" data-link data-nav="/library" data-auth-only>Ma liste</a>
+                <a href="/admin" data-link data-nav="/admin" data-admin-only style="display:none">Admin</a>
             </nav>
 
             <form class="search-box" id="search-form" role="search" autocomplete="off">

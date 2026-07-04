@@ -817,6 +817,86 @@ async function buildEpisodeSidebar(side, item, activeSeason, activeEpisode) {
     renderSeason(current);
 }
 
+// ---------- ADMIN ----------
+function statCard(label, val) {
+    return el('div', { class: 'stat-card' }, [
+        el('div', { class: 'stat-val', text: String(val ?? 0) }),
+        el('div', { class: 'stat-label', text: label }),
+    ]);
+}
+
+export async function adminPage(app) {
+    clear(app);
+
+    if (!isAuthed()) {
+        app.appendChild(el('div', { class: 'container' }, [
+            emptyState('Connexion requise', 'Cet espace est réservé aux administrateurs.'),
+        ]));
+        return;
+    }
+
+    const container = el('div', { class: 'container' });
+    app.appendChild(container);
+    container.appendChild(el('h2', { class: 'section-title', text: 'Administration' }));
+
+    const body = el('div', {}, [loadingState('Vérification des droits…')]);
+    container.appendChild(body);
+
+    let stats;
+    try {
+        stats = await api.adminStats();
+    } catch (e) {
+        clear(body);
+        body.appendChild(emptyState(
+            e.status === 403 ? 'Accès refusé' : 'Erreur',
+            e.status === 403 ? "Ton compte n'a pas les droits administrateur." : e.message,
+        ));
+        return;
+    }
+
+    clear(body);
+
+    body.appendChild(el('div', { class: 'admin-stats' }, [
+        statCard('Titres', stats.total),
+        statCard('Films', stats.movies),
+        statCard('Séries', stats.series),
+        statCard('Autres', stats.other),
+    ]));
+
+    const typeSel = el('select', { class: 'select' }, [['all', 'Tous'], ['movies', 'Films'], ['tv-series', 'Séries']].map(([v, l]) =>
+        el('option', { value: v, text: l })));
+    const limitInput = el('input', { class: 'select', type: 'number', min: '1', max: '1000', value: '100', style: 'width:110px' });
+    const status = el('p', { class: 'admin-status' });
+
+    const btn = el('button', { class: 'btn btn-primary', text: 'Exporter les liens (.txt)' });
+    btn.onclick = async () => {
+        btn.disabled = true;
+        const label = btn.textContent;
+        btn.textContent = 'Export en cours…';
+        status.textContent = '';
+        try {
+            await api.exportLinks({ type: typeSel.value, limit: limitInput.value });
+            status.textContent = 'Téléchargement lancé ✓';
+        } catch (e) {
+            status.textContent = 'Échec : ' + e.message;
+        } finally {
+            btn.disabled = false;
+            btn.textContent = label;
+        }
+    };
+
+    body.appendChild(el('div', { class: 'admin-panel' }, [
+        el('h3', { text: 'Exporter les liens de téléchargement' }),
+        el('p', { class: 'admin-hint', text: "Génère un fichier .txt listant chaque titre et ses liens (par épisode pour les séries). L'export web est limité par « Nombre max ». Pour tout exporter sans limite, lance : php artisan catalog:export-links" }),
+        el('div', { class: 'admin-controls' }, [
+            el('label', { class: 'filter' }, [el('span', { text: 'Type' }), typeSel]),
+            el('label', { class: 'filter' }, [el('span', { text: 'Nombre max' }), limitInput]),
+            btn,
+        ]),
+        status,
+    ]));
+}
+
 // ---------- LIBRARY ----------
 export async function libraryPage(app) {
     clear(app);
