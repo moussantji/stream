@@ -118,10 +118,21 @@ class StreamController extends Controller
             }
 
             $list = is_array($res['list'] ?? null) ? $res['list'] : [];
+
+            // Debug sample: what se/ep does each file carry? ("*" = has a link)
+            $seEpSample = [];
+            foreach ($list as $it) {
+                if (is_array($it)) {
+                    $seEpSample[] = 's'.($it['se'] ?? '?').'e'.($it['ep'] ?? '?')
+                        .(empty($it['resourceLink']) ? '' : '*');
+                }
+            }
+
             $diag["resource_page_$page"] = [
                 'ok' => true,
                 'listCount' => count($list),
                 'hasMore' => $res['pager']['hasMore'] ?? false,
+                'seEp' => $seEpSample,
             ];
 
             if ($isMovie) {
