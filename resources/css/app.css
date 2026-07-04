@@ -199,6 +199,11 @@ img { display: block; }
 }
 .detail-actions { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
 
+/* ---------------- Search filters ---------------- */
+.filter-bar { display: flex; flex-wrap: wrap; gap: 14px; margin: 4px 0 18px; align-items: flex-end; }
+.filter { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--text-dim); }
+.filter select { min-width: 150px; }
+
 .episodes { margin-top: 12px; }
 .season-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
 .season-tab { background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 8px; padding: 8px 16px; color: var(--text-dim); font-weight: 600; }

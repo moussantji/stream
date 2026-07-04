@@ -37,7 +37,7 @@ export async function homePage(app) {
 
     const [homeRes, trendingRes, historyRes] = await Promise.allSettled([
         api.home(),
-        api.trending(0, 24),
+        api.trending(1),
         isAuthed() ? api.history() : Promise.resolve([]),
     ]);
 
@@ -100,38 +100,69 @@ function continueRow(history) {
     ]);
 }
 
+// Generic paginated grid with a "Charger plus" button.
+// fetchPage(page) must resolve to { items: [...], pager: { hasMore } }.
+function paginatedGrid(container, fetchPage, { emptyMsg = 'Rien à afficher.' } = {}) {
+    const gridWrap = el('div', {}, [loadingState()]);
+    const moreWrap = el('div', { style: 'text-align:center;padding:8px 0 24px' });
+    container.appendChild(gridWrap);
+    container.appendChild(moreWrap);
+
+    let page = 1;
+    let gridEl = null;
+    let loading = false;
+
+    const load = async (append) => {
+        if (loading) return;
+        loading = true;
+        try {
+            const data = await fetchPage(page);
+            const items = data.items || [];
+            if (!append) { clear(gridWrap); gridEl = null; }
+
+            if (!items.length && page === 1) {
+                clear(gridWrap);
+                gridWrap.appendChild(emptyState(emptyMsg));
+                clear(moreWrap);
+                return;
+            }
+
+            if (!gridEl) { gridEl = grid(items); clear(gridWrap); gridWrap.appendChild(gridEl); }
+            else items.forEach((it) => gridEl.appendChild(card(it)));
+
+            clear(moreWrap);
+            if (data.pager && data.pager.hasMore) {
+                const btn = el('button', {
+                    class: 'btn btn-ghost', text: 'Charger plus',
+                    onclick: () => { page += 1; load(true); },
+                });
+                moreWrap.appendChild(btn);
+            }
+        } catch (e) {
+            clear(gridWrap);
+            gridWrap.appendChild(errorState(e.message, () => load(false)));
+        } finally {
+            loading = false;
+        }
+    };
+
+    load(false);
+}
+
 // ---------- TRENDING / POPULAIRES ----------
 export async function trendingPage(app, title = 'Les plus regardés') {
     clear(app);
-    app.appendChild(el('div', { class: 'container' }, [el('h2', { class: 'section-title', text: title }), loadingState()]));
-    try {
-        const data = await api.trending(0, 48);
-        clear(app);
-        app.appendChild(el('div', { class: 'container' }, [
-            el('h2', { class: 'section-title', text: title }),
-            data.items.length ? grid(data.items) : emptyState('Rien à afficher pour le moment.'),
-        ]));
-    } catch (e) {
-        clear(app);
-        app.appendChild(errorState(e.message, () => trendingPage(app, title)));
-    }
+    const container = el('div', { class: 'container' }, [el('h2', { class: 'section-title', text: title })]);
+    app.appendChild(container);
+    paginatedGrid(container, (page) => api.trending(page), { emptyMsg: 'Rien à afficher pour le moment.' });
 }
 
 // ---------- CATEGORY (Films / Séries / Animation) ----------
 export async function categoryPage(app, tab, title) {
     clear(app);
-    app.appendChild(el('div', { class: 'container' }, [el('h2', { class: 'section-title', text: title }), loadingState()]));
-    try {
-        const data = await api.category(tab);
-        clear(app);
-        app.appendChild(el('div', { class: 'container' }, [
-            el('h2', { class: 'section-title', text: data.title || title }),
-            data.items.length ? grid(data.items) : emptyState('Aucun contenu pour le moment.'),
-        ]));
-    } catch (e) {
-        clear(app);
-        app.appendChild(errorState(e.message, () => categoryPage(app, tab, title)));
-    }
+    const container = el('div', { class: 'container' }, [el('h2', { class: 'section-title', text: title })]);
+    app.appendChild(container);
+    paginatedGrid(container, (page) => api.category(tab, page), { emptyMsg: 'Aucun contenu pour le moment.' });
 }
 
 // ---------- LOCAL CATALOG (MySQL) ----------
@@ -273,28 +304,116 @@ export async function searchPage(app, params) {
     const type = params.get('type') || 'all';
     clear(app);
 
-    const tabs = el('div', { class: 'season-tabs' }, ['all', 'movies', 'tv-series'].map((t) =>
+    const container = el('div', { class: 'container' });
+    app.appendChild(container);
+    container.appendChild(el('h2', { class: 'section-title', text: `Résultats pour « ${q} »` }));
+
+    // Type filter (server-side): switching reloads the query.
+    const typeTabs = el('div', { class: 'season-tabs' }, [['all', 'Tous'], ['movies', 'Films'], ['tv-series', 'Séries']].map(([t, label]) =>
         el('button', {
             class: `season-tab ${t === type ? 'active' : ''}`,
-            text: t === 'tv-series' ? 'Series' : t.charAt(0).toUpperCase() + t.slice(1),
+            text: label,
             onclick: () => navigate(`/search?q=${encodeURIComponent(q)}&type=${t}`),
         })));
+    container.appendChild(typeTabs);
 
-    const results = el('div', {}, [loadingState('Searching…')]);
-    app.appendChild(el('div', { class: 'container' }, [
-        el('h2', { class: 'section-title', text: `Results for “${q}”` }),
-        tabs,
-        results,
-    ]));
+    // Client-side refinement filters (genre / year / sort).
+    const genreSel = el('select', { class: 'select' }, [el('option', { value: '', text: 'Tous les genres' })]);
+    const yearSel = el('select', { class: 'select' }, [el('option', { value: '', text: 'Toutes les années' })]);
+    const sortSel = el('select', { class: 'select' }, [
+        el('option', { value: 'relevance', text: 'Pertinence' }),
+        el('option', { value: 'rating', text: 'Mieux notés' }),
+        el('option', { value: 'year_desc', text: 'Plus récents' }),
+        el('option', { value: 'year_asc', text: 'Plus anciens' }),
+        el('option', { value: 'title', text: 'Titre (A→Z)' }),
+    ]);
+    const filterBar = el('div', { class: 'filter-bar' }, [
+        el('label', { class: 'filter' }, [el('span', { text: 'Genre' }), genreSel]),
+        el('label', { class: 'filter' }, [el('span', { text: 'Année' }), yearSel]),
+        el('label', { class: 'filter' }, [el('span', { text: 'Trier' }), sortSel]),
+    ]);
+    container.appendChild(filterBar);
 
-    try {
-        const data = await api.search(q, type);
-        clear(results);
-        results.appendChild(data.items.length ? grid(data.items) : emptyState('No matches found.', 'Try a different keyword or filter.'));
-    } catch (e) {
-        clear(results);
-        results.appendChild(errorState(e.message, () => searchPage(app, params)));
+    const gridWrap = el('div', {}, [loadingState('Recherche…')]);
+    const moreWrap = el('div', { style: 'text-align:center;padding:8px 0 24px' });
+    container.appendChild(gridWrap);
+    container.appendChild(moreWrap);
+
+    if (!q) {
+        clear(gridWrap);
+        gridWrap.appendChild(emptyState('Saisis un mot-clé pour lancer une recherche.'));
+        return;
     }
+
+    let page = 1;
+    let loading = false;
+    let all = [];
+
+    const populateFilters = () => {
+        const genres = new Set();
+        const years = new Set();
+        all.forEach((it) => { (it.genres || []).forEach((g) => genres.add(g)); if (it.year) years.add(it.year); });
+
+        const keepG = genreSel.value;
+        clear(genreSel);
+        genreSel.appendChild(el('option', { value: '', text: 'Tous les genres' }));
+        [...genres].sort((a, b) => a.localeCompare(b)).forEach((g) => genreSel.appendChild(el('option', { value: g, text: g })));
+        genreSel.value = keepG;
+
+        const keepY = yearSel.value;
+        clear(yearSel);
+        yearSel.appendChild(el('option', { value: '', text: 'Toutes les années' }));
+        [...years].sort((a, b) => b - a).forEach((y) => yearSel.appendChild(el('option', { value: String(y), text: String(y) })));
+        yearSel.value = keepY;
+    };
+
+    const render = () => {
+        let items = all.slice();
+        if (genreSel.value) items = items.filter((it) => (it.genres || []).includes(genreSel.value));
+        if (yearSel.value) items = items.filter((it) => String(it.year) === yearSel.value);
+
+        switch (sortSel.value) {
+            case 'rating': items.sort((a, b) => (b.imdbRating || 0) - (a.imdbRating || 0)); break;
+            case 'year_desc': items.sort((a, b) => (b.year || 0) - (a.year || 0)); break;
+            case 'year_asc': items.sort((a, b) => (a.year || 0) - (b.year || 0)); break;
+            case 'title': items.sort((a, b) => (a.title || '').localeCompare(b.title || '')); break;
+            default: break;
+        }
+
+        clear(gridWrap);
+        if (!all.length) {
+            gridWrap.appendChild(emptyState('Aucun résultat pour cette recherche.', 'Essaie un autre mot-clé ou un autre type.'));
+        } else {
+            gridWrap.appendChild(items.length ? grid(items) : emptyState('Aucun résultat avec ces filtres.'));
+        }
+    };
+
+    [genreSel, yearSel, sortSel].forEach((sel) => { sel.onchange = render; });
+
+    const load = async (append) => {
+        if (loading) return;
+        loading = true;
+        try {
+            const data = await api.search(q, type, page);
+            all = append ? all.concat(data.items || []) : (data.items || []);
+            populateFilters();
+            render();
+            clear(moreWrap);
+            if (data.pager && data.pager.hasMore) {
+                moreWrap.appendChild(el('button', {
+                    class: 'btn btn-ghost', text: 'Charger plus',
+                    onclick: () => { page += 1; load(true); },
+                }));
+            }
+        } catch (e) {
+            clear(gridWrap);
+            gridWrap.appendChild(errorState(e.message, () => load(false)));
+        } finally {
+            loading = false;
+        }
+    };
+
+    await load(false);
 }
 
 // ---------- DETAIL ----------

@@ -45,31 +45,46 @@ class CatalogController extends Controller
         return response()->json(['data' => $data]);
     }
 
-    /** Trending / "les plus regardés" row + page. */
+    /** Trending / "les plus regardés" row + page (paginated). */
     public function trending(Request $request): JsonResponse
     {
         $type = SubjectType::resolve($request->input('type', 'all'));
+        $page = max(1, (int) $request->input('page', 1));
         $query = (string) config('moviebox.trending_query', 'français');
 
         $data = $this->repo->remember(
-            "catalog:trending:{$type->value}",
+            "catalog:trending:{$type->value}:$page",
             $this->ttl(),
-            fn () => ['items' => $this->searchItems($query, $type->value, 20), 'pager' => null],
+            function () use ($query, $type, $page) {
+                try {
+                    $res = $this->client->search($query, $type->value, $page, 20);
+
+                    return [
+                        'items' => ContentFilter::apply(ItemNormalizer::many($res['items'] ?? [])),
+                        'pager' => $this->pager($res, $page, 20),
+                    ];
+                } catch (\Throwable $e) {
+                    report($e);
+
+                    return ['items' => [], 'pager' => ['page' => $page, 'hasMore' => false]];
+                }
+            },
         );
 
         return response()->json(['data' => $data]);
     }
 
-    /** Category browse (films / séries / animation) from tab-operating. */
+    /** Category browse (films / séries / animation) from tab-operating (paginated). */
     public function category(Request $request): JsonResponse
     {
         $slug = strtolower((string) $request->input('tab', 'films'));
         $config = self::CATEGORIES[$slug] ?? self::CATEGORIES['films'];
+        $page = max(1, (int) $request->input('page', 1));
 
         $data = $this->repo->remember(
-            "catalog:category:{$config['tab']}",
+            "catalog:category:{$config['tab']}:$page",
             $this->ttl(),
-            fn () => ['title' => $config['title'], 'items' => $this->flattenTab($config['tab'])],
+            fn () => ['title' => $config['title']] + $this->tabPage($config['tab'], $page),
         );
 
         // Title is static; ensure it is present even when served from an old snapshot.
@@ -163,8 +178,9 @@ class CatalogController extends Controller
                 return [
                     'query' => $q,
                     'type' => $type->name,
+                    // NOTE: search is intentionally NOT content-filtered.
                     'items' => ItemNormalizer::many($res['items'] ?? []),
-                    'pager' => $res['pager'] ?? null,
+                    'pager' => $this->pager($res, $page, $perPage),
                 ];
             },
         );
@@ -293,27 +309,41 @@ class CatalogController extends Controller
     }
 
     /**
-     * Flatten all subjects of a tab-operating tab into a de-duplicated list.
+     * Flatten all subjects of a tab-operating tab (page 1) into a filtered,
+     * de-duplicated list.
      *
      * @return array<int,array<string,mixed>>
      */
     protected function flattenTab(int $tabId): array
     {
+        return $this->tabPage($tabId, 1)['items'];
+    }
+
+    /**
+     * One paginated page of a tab-operating tab.
+     *
+     * @return array{items:array<int,array<string,mixed>>,pager:array{page:int,hasMore:bool}}
+     */
+    protected function tabPage(int $tabId, int $page): array
+    {
         try {
-            $data = $this->client->home($tabId);
+            $data = $this->client->home($tabId, $page);
         } catch (\Throwable $e) {
             report($e);
 
-            return [];
+            return ['items' => [], 'pager' => ['page' => $page, 'hasMore' => false]];
         }
 
         $seen = [];
         $items = [];
+        $rawCount = 0;
         foreach (($data['items'] ?? []) as $block) {
             if (! is_array($block)) {
                 continue;
             }
-            foreach (ItemNormalizer::many($block['subjects'] ?? []) as $item) {
+            $subjects = is_array($block['subjects'] ?? null) ? $block['subjects'] : [];
+            $rawCount += count($subjects);
+            foreach (ItemNormalizer::many($subjects) as $item) {
                 if (! isset($seen[$item['subjectId']])) {
                     $seen[$item['subjectId']] = true;
                     $items[] = $item;
@@ -321,7 +351,32 @@ class CatalogController extends Controller
             }
         }
 
-        return ContentFilter::apply($items);
+        // hasMore heuristic: a non-trivial number of raw subjects on this page
+        // suggests the next page likely has more (the tab endpoint exposes no
+        // reliable total).
+        return [
+            'items' => ContentFilter::apply($items),
+            'pager' => ['page' => $page, 'hasMore' => $rawCount >= 10],
+        ];
+    }
+
+    /**
+     * Normalise a raw API response's pager into {page, hasMore}.
+     *
+     * @param  array<string,mixed>  $res
+     * @return array{page:int,hasMore:bool}
+     */
+    protected function pager(array $res, int $page, int $perPage): array
+    {
+        $raw = is_array($res['pager'] ?? null) ? $res['pager'] : [];
+        $count = is_array($res['items'] ?? null) ? count($res['items']) : 0;
+
+        $hasMore = $raw['hasMore']
+            ?? $raw['hasNext']
+            ?? (isset($raw['nextPage']) ? (bool) $raw['nextPage'] : null)
+            ?? ($count >= $perPage);
+
+        return ['page' => $page, 'hasMore' => (bool) $hasMore];
     }
 
     /**

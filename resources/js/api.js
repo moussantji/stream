@@ -93,11 +93,11 @@ export const api = {
 
     // ---- Catalog ----
     home: () => unwrap(request('home')),
-    trending: (page = 0, perPage = 24) => unwrap(request('trending', { params: { page, perPage } })),
+    trending: (page = 1, type = 'all') => unwrap(request('trending', { params: { page, type } })),
     search: (q, type = 'all', page = 1) => unwrap(request('search', { params: { q, type, page } })),
     suggest: (q) => unwrap(request('suggest', { params: { q } })),
     discover: () => unwrap(request('discover')),
-    category: (tab) => unwrap(request('category', { params: { tab } })),
+    category: (tab, page = 1) => unwrap(request('category', { params: { tab, page } })),
     channels: () => unwrap(request('channels')),
     local: (params) => unwrap(request('local', { params })),
     detail: (params) => unwrap(request('detail', { params })),
