@@ -22,22 +22,14 @@ class StreamController extends Controller
     {
         $validated = $this->validatePayload($request);
 
-        $data = $this->client->play(
-            $validated['subjectId'],
-            $validated['season'],
-            $validated['episode'],
-            $validated['detailPath'] ?? null
-        );
-
-        $sources = $this->normalizeSources($data['streams'] ?? []);
-
-        $hls = array_values(array_filter(array_map(
-            fn ($h) => is_array($h) ? ($h['url'] ?? null) : (is_string($h) ? $h : null),
-            $data['hls'] ?? []
-        )));
-
-        // Try to enrich with subtitles from the download endpoint.
+        $streams = [];
+        $hls = [];
+        $downloads = [];
         $subtitles = [];
+        $hasResource = false;
+
+        // The /download endpoint returns direct, browser-playable MP4 URLs and
+        // is the most reliable source (it's what the upstream library uses).
         try {
             $download = $this->client->download(
                 $validated['subjectId'],
@@ -45,19 +37,68 @@ class StreamController extends Controller
                 $validated['episode'],
                 $validated['detailPath'] ?? null
             );
+            $downloads = $this->normalizeSources($download['downloads'] ?? [], resolutionKey: 'resolution');
             $subtitles = $this->normalizeCaptions($download['captions'] ?? []);
+            $hasResource = $hasResource || (bool) ($download['hasResource'] ?? false);
         } catch (\Throwable $e) {
             report($e);
         }
+
+        // The /play endpoint may add adaptive streams / HLS on top.
+        try {
+            $data = $this->client->play(
+                $validated['subjectId'],
+                $validated['season'],
+                $validated['episode'],
+                $validated['detailPath'] ?? null
+            );
+            $streams = $this->normalizeSources($data['streams'] ?? []);
+            $hls = array_values(array_filter(array_map(
+                fn ($h) => is_array($h) ? ($h['url'] ?? null) : (is_string($h) ? $h : null),
+                $data['hls'] ?? []
+            )));
+            $hasResource = $hasResource || (bool) ($data['hasResource'] ?? false);
+        } catch (\Throwable $e) {
+            report($e);
+        }
+
+        // Prefer direct MP4 downloads, then merge in any extra resolutions the
+        // play endpoint offered (deduplicated by resolution).
+        $sources = $this->mergeSources($downloads, $streams);
 
         return response()->json([
             'data' => [
                 'sources' => $sources,
                 'hls' => $hls,
                 'subtitles' => $subtitles,
-                'hasResource' => (bool) ($data['hasResource'] ?? ($sources !== [] || $hls !== [])),
+                'hasResource' => $hasResource || $sources !== [] || $hls !== [],
             ],
         ]);
+    }
+
+    /**
+     * Merge two source lists, de-duplicating by resolution (primary wins) and
+     * ordering highest quality first.
+     *
+     * @param  array<int,array<string,mixed>>  $primary
+     * @param  array<int,array<string,mixed>>  $secondary
+     * @return array<int,array<string,mixed>>
+     */
+    protected function mergeSources(array $primary, array $secondary): array
+    {
+        $byKey = [];
+        foreach ([...$primary, ...$secondary] as $source) {
+            if (empty($source['url'])) {
+                continue;
+            }
+            $key = ($source['resolution'] ?? 0) ?: $source['url'];
+            $byKey[$key] ??= $source;
+        }
+
+        $merged = array_values($byKey);
+        usort($merged, fn ($a, $b) => ($b['resolution'] ?? 0) <=> ($a['resolution'] ?? 0));
+
+        return $merged;
     }
 
     /** Downloadable media files + subtitle files. */

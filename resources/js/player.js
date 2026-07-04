@@ -16,10 +16,13 @@ export class Player {
     constructor(container) {
         this.container = container;
         this.hls = null;
+        // NOTE: no `crossorigin` attribute — the media CDN doesn't send CORS
+        // headers, and setting it would block cross-origin MP4 playback.
+        // Subtitle tracks are proxied same-origin via /api/subtitle, so they
+        // work without it.
         this.video = el('video', {
             controls: 'controls',
             playsinline: 'playsinline',
-            crossorigin: 'anonymous',
             preload: 'metadata',
         });
         this.container.appendChild(this.video);
