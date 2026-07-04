@@ -7,6 +7,7 @@ use App\Services\MovieBox\MovieBoxClient;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 
 class StreamController extends Controller
@@ -22,87 +23,120 @@ class StreamController extends Controller
     {
         $validated = $this->validatePayload($request);
         $debug = $request->boolean('debug') || config('app.debug');
-        $diagnostics = [];
+        $attempts = [];
 
-        $streams = [];
-        $hls = [];
-        $downloads = [];
-        $subtitles = [];
-        $hasResource = false;
+        foreach ($this->mirrorClients() as $name => $client) {
+            $result = $this->collectFromClient($client, $validated);
+            $attempts[$name] = $result['diag'];
 
-        // The /download endpoint returns direct, browser-playable MP4 URLs and
-        // is the most reliable source (it's what the upstream library uses).
-        try {
-            $download = $this->client->download(
-                $validated['subjectId'],
-                $validated['season'],
-                $validated['episode'],
-                $validated['detailPath'] ?? null
-            );
-            $downloads = $this->normalizeSources($download['downloads'] ?? [], resolutionKey: 'resolution');
-            $subtitles = $this->normalizeCaptions($download['captions'] ?? []);
-            $hasResource = $hasResource || (bool) ($download['hasResource'] ?? false);
-            $diagnostics['download'] = [
-                'ok' => true,
-                'hasResource' => $download['hasResource'] ?? null,
-                'downloadCount' => is_array($download['downloads'] ?? null) ? count($download['downloads']) : 0,
-                'captionCount' => is_array($download['captions'] ?? null) ? count($download['captions']) : 0,
-                'limited' => $download['limited'] ?? null,
-                'limitedCode' => $download['limitedCode'] ?? null,
-            ];
-        } catch (\Throwable $e) {
-            report($e);
-            $diagnostics['download'] = ['ok' => false, 'type' => class_basename($e), 'error' => $e->getMessage()];
+            if ($result['sources'] !== [] || $result['hls'] !== []) {
+                $this->rememberWorkingMirror($name);
+
+                $payload = [
+                    'sources' => $result['sources'],
+                    'hls' => $result['hls'],
+                    'subtitles' => $result['subtitles'],
+                    'hasResource' => true,
+                    'mirror' => $name,
+                ];
+                if ($debug) {
+                    $payload['debug'] = ['params' => $validated, 'attempts' => $attempts];
+                }
+
+                return response()->json(['data' => $payload]);
+            }
         }
 
-        // The /play endpoint may add adaptive streams / HLS on top.
-        try {
-            $data = $this->client->play(
-                $validated['subjectId'],
-                $validated['season'],
-                $validated['episode'],
-                $validated['detailPath'] ?? null
-            );
-            $streams = $this->normalizeSources($data['streams'] ?? []);
-            $hls = array_values(array_filter(array_map(
-                fn ($h) => is_array($h) ? ($h['url'] ?? null) : (is_string($h) ? $h : null),
-                $data['hls'] ?? []
-            )));
-            $hasResource = $hasResource || (bool) ($data['hasResource'] ?? false);
-            $diagnostics['play'] = [
-                'ok' => true,
-                'hasResource' => $data['hasResource'] ?? null,
-                'streamCount' => is_array($data['streams'] ?? null) ? count($data['streams']) : 0,
-                'hlsCount' => is_array($data['hls'] ?? null) ? count($data['hls']) : 0,
-            ];
-        } catch (\Throwable $e) {
-            report($e);
-            $diagnostics['play'] = ['ok' => false, 'type' => class_basename($e), 'error' => $e->getMessage()];
-        }
-
-        // Prefer direct MP4 downloads, then merge in any extra resolutions the
-        // play endpoint offered (deduplicated by resolution).
-        $sources = $this->mergeSources($downloads, $streams);
-
-        $payload = [
-            'sources' => $sources,
-            'hls' => $hls,
-            'subtitles' => $subtitles,
-            'hasResource' => $hasResource || $sources !== [] || $hls !== [],
-        ];
-
+        $payload = ['sources' => [], 'hls' => [], 'subtitles' => [], 'hasResource' => false];
         if ($debug) {
-            $payload['debug'] = [
-                'params' => $validated,
-                'host' => $this->client->baseUrl(),
-                'referer' => $validated['detailPath']
-                    ? $this->client->baseUrl().'/movies/'.ltrim($validated['detailPath'], '/')
-                    : null,
-                'calls' => $diagnostics,
-            ];
+            $payload['debug'] = ['params' => $validated, 'attempts' => $attempts];
         }
 
         return response()->json(['data' => $payload]);
+    }
+
+    /**
+     * Build the ordered list of clients to try: the last-known working mirror
+     * first (if any), then the primary host, then configured fallback mirrors.
+     *
+     * @return array<string,MovieBoxClient>
+     */
+    protected function mirrorClients(): array
+    {
+        $clients = ['primary' => $this->client];
+
+        foreach ((array) config('moviebox.mirrors', []) as $mirror) {
+            if (! is_array($mirror) || empty($mirror['host'])) {
+                continue;
+            }
+            $clients[$mirror['host']] ??= new MovieBoxClient($mirror);
+        }
+
+        $working = Cache::get('moviebox:working_mirror');
+        if ($working && isset($clients[$working])) {
+            $clients = [$working => $clients[$working]] + $clients;
+        }
+
+        return $clients;
+    }
+
+    protected function rememberWorkingMirror(string $name): void
+    {
+        Cache::put('moviebox:working_mirror', $name, now()->addHours(6));
+    }
+
+    /**
+     * Gather playable sources + subtitles from a single mirror (resilient).
+     *
+     * @param  array{subjectId:string,season:int,episode:int,detailPath:?string}  $v
+     * @return array{sources:array,hls:array,subtitles:array,diag:array}
+     */
+    protected function collectFromClient(MovieBoxClient $client, array $v): array
+    {
+        $downloads = $streams = $hls = $subtitles = [];
+        $diag = [];
+
+        // Direct MP4 files (most reliable, browser-playable).
+        try {
+            $d = $client->download($v['subjectId'], $v['season'], $v['episode'], $v['detailPath'] ?? null);
+            $downloads = $this->normalizeSources($d['downloads'] ?? [], resolutionKey: 'resolution');
+            $subtitles = $this->normalizeCaptions($d['captions'] ?? []);
+            $diag['download'] = [
+                'ok' => true,
+                'hasResource' => $d['hasResource'] ?? null,
+                'downloadCount' => is_array($d['downloads'] ?? null) ? count($d['downloads']) : 0,
+                'captionCount' => is_array($d['captions'] ?? null) ? count($d['captions']) : 0,
+            ];
+        } catch (\Throwable $e) {
+            report($e);
+            $diag['download'] = ['ok' => false, 'type' => class_basename($e), 'error' => $e->getMessage()];
+        }
+
+        // Adaptive streams / HLS on top.
+        try {
+            $p = $client->play($v['subjectId'], $v['season'], $v['episode'], $v['detailPath'] ?? null);
+            $streams = $this->normalizeSources($p['streams'] ?? []);
+            $hls = array_values(array_filter(array_map(
+                fn ($h) => is_array($h) ? ($h['url'] ?? null) : (is_string($h) ? $h : null),
+                $p['hls'] ?? []
+            )));
+            $diag['play'] = [
+                'ok' => true,
+                'hasResource' => $p['hasResource'] ?? null,
+                'streamCount' => is_array($p['streams'] ?? null) ? count($p['streams']) : 0,
+                'hlsCount' => is_array($p['hls'] ?? null) ? count($p['hls']) : 0,
+            ];
+        } catch (\Throwable $e) {
+            report($e);
+            $diag['play'] = ['ok' => false, 'type' => class_basename($e), 'error' => $e->getMessage()];
+        }
+
+        return [
+            'sources' => $this->mergeSources($downloads, $streams),
+            'hls' => $hls,
+            'subtitles' => $subtitles,
+            'diag' => $diag,
+        ];
     }
 
     /**
@@ -130,25 +164,45 @@ class StreamController extends Controller
         return $merged;
     }
 
-    /** Downloadable media files + subtitle files. */
+    /** Downloadable media files + subtitle files (with mirror fallback). */
     public function download(Request $request): JsonResponse
     {
         $validated = $this->validatePayload($request);
 
-        $data = $this->client->download(
-            $validated['subjectId'],
-            $validated['season'],
-            $validated['episode'],
-            $validated['detailPath'] ?? null
-        );
+        foreach ($this->mirrorClients() as $name => $client) {
+            try {
+                $data = $client->download(
+                    $validated['subjectId'],
+                    $validated['season'],
+                    $validated['episode'],
+                    $validated['detailPath'] ?? null
+                );
+            } catch (\Throwable $e) {
+                report($e);
+
+                continue;
+            }
+
+            $downloads = $this->normalizeSources($data['downloads'] ?? [], resolutionKey: 'resolution');
+            $subtitles = $this->normalizeCaptions($data['captions'] ?? []);
+
+            if ($downloads !== [] || $subtitles !== []) {
+                $this->rememberWorkingMirror($name);
+
+                return response()->json([
+                    'data' => [
+                        'downloads' => $downloads,
+                        'subtitles' => $subtitles,
+                        'limited' => (bool) ($data['limited'] ?? false),
+                        'hasResource' => true,
+                        'mirror' => $name,
+                    ],
+                ]);
+            }
+        }
 
         return response()->json([
-            'data' => [
-                'downloads' => $this->normalizeSources($data['downloads'] ?? [], resolutionKey: 'resolution'),
-                'subtitles' => $this->normalizeCaptions($data['captions'] ?? []),
-                'limited' => (bool) ($data['limited'] ?? false),
-                'hasResource' => (bool) ($data['hasResource'] ?? true),
-            ],
+            'data' => ['downloads' => [], 'subtitles' => [], 'limited' => false, 'hasResource' => false],
         ]);
     }
 

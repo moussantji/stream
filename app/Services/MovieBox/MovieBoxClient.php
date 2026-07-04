@@ -43,7 +43,17 @@ class MovieBoxClient
 
     protected bool $bootstrapped = false;
 
-    protected const TOKEN_CACHE_KEY = 'moviebox:token';
+    /** Short name of the active host, used for mirror labelling. */
+    public function hostLabel(): string
+    {
+        return $this->host;
+    }
+
+    protected function tokenCacheKey(): string
+    {
+        // Per-host so mirror clients don't share aoneroom's token.
+        return 'moviebox:token:'.sha1($this->apiHost);
+    }
 
     /**
      * @param  array<string,mixed>  $config  Optional overrides for config/moviebox.php
@@ -284,7 +294,7 @@ class MovieBoxClient
 
     protected function resolveToken(): string
     {
-        return Cache::remember(self::TOKEN_CACHE_KEY, $this->tokenTtl, fn () => $this->fetchToken());
+        return Cache::remember($this->tokenCacheKey(), $this->tokenTtl, fn () => $this->fetchToken());
     }
 
     /**
@@ -359,6 +369,7 @@ class MovieBoxClient
 
         return Http::withHeaders(array_merge($defaults, $headers))
             ->withOptions($options)
+            ->connectTimeout(min(10, $this->timeout)) // fail fast on dead mirrors
             ->timeout($this->timeout)
             ->acceptJson();
     }

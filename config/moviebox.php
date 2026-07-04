@@ -23,6 +23,36 @@ return [
 
     'scheme' => env('MOVIEBOX_SCHEME', 'https'),
 
+    /*
+    | Fallback mirrors for the /play and /download endpoints. When the primary
+    | host returns no playable resource (hasResource=false), the app tries these
+    | in order and caches whichever works. aoneroom is great for browsing but
+    | often serves no media in some regions, while other mirrors do.
+    |
+    | Format (comma separated): "host" or "host|apiHost".
+    | e.g. MOVIEBOX_MIRRORS="lok-lok.cc, moviebox.ph|h5-api.aoneroom.com"
+    */
+    'mirrors' => (function () {
+        $raw = env('MOVIEBOX_MIRRORS');
+        $entries = ($raw !== null && $raw !== '')
+            ? explode(',', $raw)
+            : ['lok-lok.cc']; // sensible default: a commonly-working mirror
+
+        return array_values(array_filter(array_map(function ($entry) {
+            $entry = trim((string) $entry);
+            if ($entry === '') {
+                return null;
+            }
+            [$host, $apiHost] = array_pad(explode('|', $entry), 2, null);
+            $host = trim((string) $host);
+
+            return $host === '' ? null : [
+                'host' => $host,
+                'api_host' => trim((string) ($apiHost ?: $host)),
+            ];
+        }, $entries)));
+    })(),
+
     // Seconds to cache the bootstrapped bearer token.
     'token_ttl' => (int) env('MOVIEBOX_TOKEN_TTL', 1800),
 
