@@ -14,6 +14,11 @@
 
 * { box-sizing: border-box; }
 
+/* The `hidden` attribute must always win over element display rules below
+   (e.g. .modal-root sets display:grid, which would otherwise override it and
+   leave the blurred overlay covering the page and blocking clicks). */
+[hidden] { display: none !important; }
+
 html, body { margin: 0; padding: 0; }
 
 body {
