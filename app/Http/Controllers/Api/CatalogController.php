@@ -217,6 +217,7 @@ class CatalogController extends Controller
 
         $cast = is_array($detail) ? $this->normalizeCast($detail['staffList'] ?? []) : [];
         $dubs = is_array($detail) ? $this->normalizeDubs($detail['dubs'] ?? []) : [];
+        $dubs = $this->ensureFrenchVersion($dubs, $item);
 
         // No dedicated recommendation endpoint in the mobile API; surface a few
         // titles that share the primary genre instead.
@@ -244,6 +245,73 @@ class CatalogController extends Controller
                 'detailAvailable' => is_array($detail),
             ],
         ]);
+    }
+
+    /**
+     * If a title has no French dub track, many French versions exist instead as
+     * a *separate* catalog entry (e.g. "From [Version française]"). Look one up
+     * by title and, if found, offer it as a selectable "Français (VF)" version.
+     *
+     * @param  array<int,array<string,mixed>>  $dubs
+     * @param  array<string,mixed>  $item
+     * @return array<int,array<string,mixed>>
+     */
+    protected function ensureFrenchVersion(array $dubs, array $item): array
+    {
+        foreach ($dubs as $dub) {
+            if (str_starts_with($dub['code'] ?? '', 'fr') || stripos($dub['label'] ?? '', 'fran') !== false) {
+                return $dubs; // already has a French option
+            }
+        }
+
+        if (empty($item['title']) || empty($item['subjectId'])) {
+            return $dubs;
+        }
+
+        $vf = $this->findFrenchVersion((string) $item['title'], (string) $item['subjectId']);
+        if ($vf === null) {
+            return $dubs;
+        }
+
+        if ($dubs === []) {
+            $dubs[] = ['subjectId' => (string) $item['subjectId'], 'label' => 'Original', 'code' => '', 'original' => true];
+        }
+        $dubs[] = $vf;
+
+        return $dubs;
+    }
+
+    /**
+     * Search the catalog for a "<title> version française" counterpart.
+     *
+     * @return array<string,mixed>|null
+     */
+    protected function findFrenchVersion(string $title, string $excludeSubjectId): ?array
+    {
+        // Strip bracketed tags like "[Version française]" / "(2024)".
+        $clean = trim(preg_replace('/[\[\(].*?[\]\)]/u', '', $title)) ?: $title;
+
+        foreach ([$clean.' version française', $clean.' français'] as $query) {
+            try {
+                $res = $this->client->search($query, 0, 1, 10);
+            } catch (\Throwable $e) {
+                report($e);
+
+                continue;
+            }
+
+            foreach ($res['items'] ?? [] as $found) {
+                $sid = (string) ($found['subjectId'] ?? '');
+                $t = mb_strtolower((string) ($found['title'] ?? ''));
+
+                if ($sid !== '' && $sid !== $excludeSubjectId
+                    && (str_contains($t, 'française') || str_contains($t, 'francaise') || str_contains($t, 'version fr'))) {
+                    return ['subjectId' => $sid, 'label' => 'Français (VF)', 'code' => 'fr', 'original' => false];
+                }
+            }
+        }
+
+        return null;
     }
 
     /**
