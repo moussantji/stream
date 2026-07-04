@@ -79,6 +79,8 @@ class StreamController extends Controller
         // fall past the pagination window and surface as "no stream available".
         $maxPages = $isMovie ? 1 : 40;
         $matched = [];
+        $firstPageFiles = [];      // fallback pool if the subject is really a movie
+        $hasEpisodeStructure = false;
         $page = 1;
 
         do {
@@ -106,10 +108,20 @@ class StreamController extends Controller
             }
 
             foreach ($list as $it) {
-                if (is_array($it)
-                    && (int) ($it['se'] ?? -1) === $season
-                    && (int) ($it['ep'] ?? -1) === $episode
-                    && ! empty($it['resourceLink'])) {
+                if (! is_array($it) || empty($it['resourceLink'])) {
+                    continue;
+                }
+
+                $se = (int) ($it['se'] ?? 0);
+                $ep = (int) ($it['ep'] ?? 0);
+
+                if ($se > 0 || $ep > 0) {
+                    $hasEpisodeStructure = true;
+                }
+                if ($page === 1) {
+                    $firstPageFiles[] = $it;
+                }
+                if ($se === $season && $ep === $episode) {
                     $matched[] = $it;
                 }
             }
@@ -117,6 +129,18 @@ class StreamController extends Controller
             $hasMore = (bool) ($res['pager']['hasMore'] ?? false);
             $page++;
         } while ($matched === [] && $hasMore && $page <= $maxPages);
+
+        // Some titles (e.g. an auto-discovered "version française") are actually
+        // a single movie in the catalog with no per-episode files. When an
+        // episode was requested but the subject exposes no episode structure at
+        // all, fall back to its single video instead of "no stream available".
+        // A real series with a genuinely missing episode keeps returning [] so
+        // we never play the wrong episode.
+        if (! $isMovie && $matched === [] && ! $hasEpisodeStructure && $firstPageFiles !== []) {
+            $diag['fallback'] = 'movie-single-file (no episode structure)';
+
+            return $firstPageFiles;
+        }
 
         return $matched;
     }
