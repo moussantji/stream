@@ -248,10 +248,24 @@ class MovieBoxClient
 
         try {
             $token = $this->fetchToken();
+            $this->token = $token;
             $report['tokenBootstrap'] = $token !== '' ? 'ok ('.strlen($token).' chars)' : 'empty token';
         } catch (\Throwable $e) {
             $report['tokenBootstrap'] = 'FAILED';
             $report['tokenError'] = class_basename($e).': '.$e->getMessage();
+        }
+
+        // The /download and /play endpoints need the account + token cookies
+        // set by the app-info request. Report which cookies we actually got.
+        try {
+            $this->fetchAppCookies();
+            $names = array_values(array_filter(array_map(
+                fn ($c) => $c['Name'] ?? null,
+                $this->cookieJar->toArray()
+            )));
+            $report['cookies'] = $names !== [] ? $names : 'NONE (app-info set no cookies)';
+        } catch (\Throwable $e) {
+            $report['cookies'] = 'error: '.$e->getMessage();
         }
 
         return $report;

@@ -95,6 +95,9 @@ class StreamController extends Controller
             $payload['debug'] = [
                 'params' => $validated,
                 'host' => $this->client->baseUrl(),
+                'referer' => $validated['detailPath']
+                    ? $this->client->baseUrl().'/movies/'.ltrim($validated['detailPath'], '/')
+                    : null,
                 'calls' => $diagnostics,
             ];
         }
