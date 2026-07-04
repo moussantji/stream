@@ -128,6 +128,33 @@ export function carousel(cardNodes) {
         }
     }, { passive: false });
 
+    // --- Auto-scroll: advances gently on its own, loops back at the end, and
+    // pauses while the user hovers/interacts. Self-cleans when detached. ---
+    let autoTimer = null;
+    let paused = false;
+    const stopAuto = () => { if (autoTimer) { clearInterval(autoTimer); autoTimer = null; } };
+    const tick = () => {
+        if (!scroller.isConnected) { stopAuto(); return; }
+        if (paused || document.hidden) return;
+        const max = scroller.scrollWidth - scroller.clientWidth - 2;
+        if (max <= 4) return; // nothing to scroll
+        if (scroller.scrollLeft >= max - 2) {
+            scroller.scrollTo({ left: 0, behavior: 'smooth' }); // loop back to start
+        } else {
+            scroller.scrollBy({ left: Math.min(step() * 0.8, max - scroller.scrollLeft), behavior: 'smooth' });
+        }
+    };
+    autoTimer = setInterval(tick, 4500);
+
+    const pause = () => { paused = true; };
+    const resume = () => { paused = false; };
+    viewport.addEventListener('pointerenter', pause);
+    viewport.addEventListener('pointerleave', resume);
+    viewport.addEventListener('focusin', pause);
+    viewport.addEventListener('focusout', resume);
+    // Briefly pause after a manual wheel scroll so it doesn't fight the user.
+    scroller.addEventListener('wheel', () => { pause(); clearTimeout(scroller._rz); scroller._rz = setTimeout(resume, 2500); }, { passive: true });
+
     return viewport;
 }
 
