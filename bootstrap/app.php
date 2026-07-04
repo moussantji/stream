@@ -12,9 +12,11 @@ return Application::configure(basePath: dirname(__DIR__))
         health: '/up',
     )
     ->withMiddleware(function (Middleware $middleware) {
-        $middleware->api(prepend: [
-            \Laravel\Sanctum\Http\Middleware\EnsureFrontendRequestsAreStateful::class,
-        ]);
+        // This SPA authenticates with Bearer personal-access-tokens (stored in
+        // localStorage), NOT with session cookies. We therefore keep the API
+        // stateless: enabling Sanctum's stateful middleware would treat
+        // same-origin requests as cookie-based and enforce CSRF, breaking
+        // login/register with a 419 "CSRF token mismatch".
     })
     ->withExceptions(function (Exceptions $exceptions) {
         $exceptions->render(function (Throwable $e, \Illuminate\Http\Request $request) {

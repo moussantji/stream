@@ -186,22 +186,29 @@ video.hero-bg { pointer-events: none; }
 
 /* ---------------- Detail ---------------- */
 .detail-hero { position: relative; padding: 32px 0 24px; overflow: hidden; isolation: isolate; }
-/* Trailer/poster as a blurred backdrop behind the description. */
+/* Trailer/poster as a backdrop behind the description — kept clear (only a
+   slight dim for text legibility), no heavy blur. */
 .detail-hero-bg {
     position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover;
-    z-index: -2; transform: scale(1.12);
-    filter: blur(20px) brightness(.45) saturate(1.25);
+    z-index: -2;
+    filter: brightness(.78);
     pointer-events: none;
 }
-/* Red glow (matching the brand logo) + darkening for legibility. */
+/* Centre stays clear so the trailer is visible; only the EDGES get a red glow
+   (brand colour) plus a soft darkening vignette. */
 .detail-hero-overlay {
     position: absolute; inset: 0; z-index: -1;
-    background:
-        radial-gradient(circle at 25% 15%, rgba(229, 9, 20, .55), transparent 55%),
-        radial-gradient(circle at 85% 90%, rgba(255, 61, 71, .35), transparent 50%),
-        linear-gradient(to bottom, rgba(11, 11, 15, .55), rgba(11, 11, 15, .9));
+    background: radial-gradient(ellipse at center, transparent 45%, rgba(11, 11, 15, .55) 100%);
+    box-shadow:
+        inset 0 0 130px 26px rgba(229, 9, 20, .55),
+        inset 0 0 55px rgba(229, 9, 20, .6);
+    pointer-events: none;
 }
 .detail-hero .container { position: relative; z-index: 1; display: grid; grid-template-columns: 260px 1fr; gap: 32px; }
+/* Keep text readable over the now-clearer backdrop. */
+.detail-hero .detail-title,
+.detail-hero .detail-desc,
+.detail-hero .detail-meta { text-shadow: 0 1px 12px rgba(0, 0, 0, .85); }
 .detail-poster { border-radius: var(--radius); overflow: hidden; aspect-ratio: 2/3; background: var(--bg-card); box-shadow: var(--shadow); }
 .detail-poster img { width: 100%; height: 100%; object-fit: cover; }
 .detail-title { font-size: clamp(24px, 4vw, 40px); font-weight: 900; margin: 0 0 12px; }
