@@ -30,6 +30,10 @@ return [
     // (it is still used as a fallback beyond this when the API fails).
     'snapshot_ttl' => (int) env('MOVIEBOX_SNAPSHOT_TTL', 900),
 
+    // Persist every individual movie/series received into the catalog_items
+    // table (a growing local library, queryable and API-independent).
+    'persist_items' => filter_var(env('MOVIEBOX_PERSIST_ITEMS', true), FILTER_VALIDATE_BOOL),
+
     // Outbound request timeout, seconds.
     'timeout' => (int) env('MOVIEBOX_TIMEOUT', 30),
 

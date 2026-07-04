@@ -3,6 +3,8 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\CatalogItem;
+use App\Models\CatalogSnapshot;
 use App\Services\Catalog\CatalogRepository;
 use App\Services\MovieBox\MovieBoxClient;
 use App\Services\MovieBox\SubjectType;
@@ -179,10 +181,22 @@ class CatalogController extends Controller
         return response()->json(['data' => $data]);
     }
 
-    /** Health probe for the MovieBox backend connection. */
+    /** Health probe for the MovieBox backend connection + local storage stats. */
     public function diagnostics(): JsonResponse
     {
-        return response()->json(['data' => $this->client->probe()]);
+        $report = $this->client->probe();
+
+        try {
+            $report['storage'] = [
+                'items' => CatalogItem::count(),
+                'snapshots' => CatalogSnapshot::count(),
+                'persistItems' => (bool) config('moviebox.persist_items', true),
+            ];
+        } catch (\Throwable $e) {
+            $report['storage'] = ['error' => $e->getMessage()];
+        }
+
+        return response()->json(['data' => $report]);
     }
 
     // -----------------------------------------------------------------
