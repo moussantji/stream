@@ -25,6 +25,22 @@ function historyToItem(h) {
     };
 }
 
+// Muted, autoplaying, looping trailer video used as a hero background.
+// Falls back to the poster image if the video errors.
+function trailerVideo(url, poster, cls) {
+    const v = el('video', { class: cls, src: url, loop: '', playsinline: '', preload: 'metadata' });
+    v.muted = true;
+    v.autoplay = true;
+    v.setAttribute('muted', '');
+    v.setAttribute('autoplay', '');
+    if (poster) {
+        v.poster = poster;
+        v.addEventListener('error', () => v.replaceWith(el('img', { class: cls, src: poster, alt: '' })), { once: true });
+    }
+    v.play?.().catch(() => {});
+    return v;
+}
+
 const PLAY_SVG = '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>';
 const PLUS_SVG = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14" stroke-linecap="round"/></svg>';
 const CHECK_SVG = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
@@ -55,7 +71,11 @@ export async function homePage(app) {
     }
 
     const heroItem = (sections[0]?.items || trending)[0];
-    if (heroItem) app.appendChild(hero(heroItem));
+    if (heroItem) {
+        const heroNode = hero(heroItem);
+        app.appendChild(heroNode);
+        loadHeroTrailer(heroNode);
+    }
 
     if (historyRes.status === 'fulfilled' && historyRes.value.length) {
         app.appendChild(continueRow(historyRes.value));
@@ -72,8 +92,9 @@ function hero(item) {
     if (item.imdbRating) meta.push(el('span', { class: 'rating', text: `★ ${item.imdbRating}` }));
     if (item.genres?.length) meta.push(el('span', { text: item.genres.slice(0, 3).join(' · ') }));
 
-    return el('section', { class: 'hero' }, [
-        item.cover ? el('img', { class: 'hero-bg', src: item.cover, alt: '' }) : null,
+    const bg = item.cover ? el('img', { class: 'hero-bg', src: item.cover, alt: '' }) : el('div', { class: 'hero-bg' });
+    const section = el('section', { class: 'hero' }, [
+        bg,
         el('div', { class: 'hero-content' }, [
             el('h1', { class: 'hero-title', text: item.title }),
             el('div', { class: 'hero-meta' }, meta),
@@ -84,6 +105,23 @@ function hero(item) {
             ]),
         ]),
     ]);
+    section.__bg = bg;
+    section.__item = item;
+    return section;
+}
+
+// Fetch the hero item's trailer and swap the background image for a video.
+async function loadHeroTrailer(section) {
+    const item = section.__item;
+    if (!item) return;
+    try {
+        const d = await api.detail({ subjectId: item.subjectId, subjectType: item.subjectType, title: item.title, cover: item.cover });
+        if (d && d.trailer && section.isConnected) {
+            const video = trailerVideo(d.trailer, item.cover, 'hero-bg');
+            section.__bg.replaceWith(video);
+            section.__bg = video;
+        }
+    } catch { /* keep the poster image */ }
 }
 
 function continueRow(history) {
@@ -439,6 +477,7 @@ export async function detailPage(app, params) {
     }
 
     const { item, isSeries, seasons, cast, recommendations } = data;
+    const trailer = data.trailer;
     clear(app);
 
     // Favorite state
@@ -507,7 +546,13 @@ export async function detailPage(app, params) {
         item.cover ? el('img', { src: item.cover, alt: item.title }) : el('div', { class: 'ph' }),
     ]);
 
+    const heroBg = trailer
+        ? trailerVideo(trailer, item.cover, 'detail-hero-bg')
+        : (item.cover ? el('img', { class: 'detail-hero-bg', src: item.cover, alt: '' }) : null);
+
     app.appendChild(el('section', { class: 'detail-hero' }, [
+        heroBg,
+        el('div', { class: 'detail-hero-overlay' }),
         el('div', { class: 'container' }, [poster, info]),
     ]));
 
