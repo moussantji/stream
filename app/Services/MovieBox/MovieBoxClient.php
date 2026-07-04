@@ -232,6 +232,31 @@ class MovieBoxClient
     // Bootstrap (token + cookies)
     // -----------------------------------------------------------------
 
+    /**
+     * Diagnostic probe: tests a fresh token bootstrap (bypassing cache) and
+     * reports the resolved hosts. Never throws — returns a report array.
+     *
+     * @return array<string,mixed>
+     */
+    public function probe(): array
+    {
+        $report = [
+            'host' => $this->baseUrl(),
+            'apiHost' => $this->apiBaseUrl(),
+            'proxy' => $this->proxy ? 'configured' : 'none',
+        ];
+
+        try {
+            $token = $this->fetchToken();
+            $report['tokenBootstrap'] = $token !== '' ? 'ok ('.strlen($token).' chars)' : 'empty token';
+        } catch (\Throwable $e) {
+            $report['tokenBootstrap'] = 'FAILED';
+            $report['tokenError'] = class_basename($e).': '.$e->getMessage();
+        }
+
+        return $report;
+    }
+
     public function ensureBootstrapped(): void
     {
         if ($this->bootstrapped) {

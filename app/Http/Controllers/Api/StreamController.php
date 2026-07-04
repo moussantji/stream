@@ -21,6 +21,8 @@ class StreamController extends Controller
     public function play(Request $request): JsonResponse
     {
         $validated = $this->validatePayload($request);
+        $debug = $request->boolean('debug') || config('app.debug');
+        $diagnostics = [];
 
         $streams = [];
         $hls = [];
@@ -40,8 +42,17 @@ class StreamController extends Controller
             $downloads = $this->normalizeSources($download['downloads'] ?? [], resolutionKey: 'resolution');
             $subtitles = $this->normalizeCaptions($download['captions'] ?? []);
             $hasResource = $hasResource || (bool) ($download['hasResource'] ?? false);
+            $diagnostics['download'] = [
+                'ok' => true,
+                'hasResource' => $download['hasResource'] ?? null,
+                'downloadCount' => is_array($download['downloads'] ?? null) ? count($download['downloads']) : 0,
+                'captionCount' => is_array($download['captions'] ?? null) ? count($download['captions']) : 0,
+                'limited' => $download['limited'] ?? null,
+                'limitedCode' => $download['limitedCode'] ?? null,
+            ];
         } catch (\Throwable $e) {
             report($e);
+            $diagnostics['download'] = ['ok' => false, 'type' => class_basename($e), 'error' => $e->getMessage()];
         }
 
         // The /play endpoint may add adaptive streams / HLS on top.
@@ -58,22 +69,37 @@ class StreamController extends Controller
                 $data['hls'] ?? []
             )));
             $hasResource = $hasResource || (bool) ($data['hasResource'] ?? false);
+            $diagnostics['play'] = [
+                'ok' => true,
+                'hasResource' => $data['hasResource'] ?? null,
+                'streamCount' => is_array($data['streams'] ?? null) ? count($data['streams']) : 0,
+                'hlsCount' => is_array($data['hls'] ?? null) ? count($data['hls']) : 0,
+            ];
         } catch (\Throwable $e) {
             report($e);
+            $diagnostics['play'] = ['ok' => false, 'type' => class_basename($e), 'error' => $e->getMessage()];
         }
 
         // Prefer direct MP4 downloads, then merge in any extra resolutions the
         // play endpoint offered (deduplicated by resolution).
         $sources = $this->mergeSources($downloads, $streams);
 
-        return response()->json([
-            'data' => [
-                'sources' => $sources,
-                'hls' => $hls,
-                'subtitles' => $subtitles,
-                'hasResource' => $hasResource || $sources !== [] || $hls !== [],
-            ],
-        ]);
+        $payload = [
+            'sources' => $sources,
+            'hls' => $hls,
+            'subtitles' => $subtitles,
+            'hasResource' => $hasResource || $sources !== [] || $hls !== [],
+        ];
+
+        if ($debug) {
+            $payload['debug'] = [
+                'params' => $validated,
+                'host' => $this->client->baseUrl(),
+                'calls' => $diagnostics,
+            ];
+        }
+
+        return response()->json(['data' => $payload]);
     }
 
     /**

@@ -82,6 +82,24 @@ class CatalogController extends Controller
         ]);
     }
 
+    /** Health probe for the MovieBox backend connection. */
+    public function diagnostics(): JsonResponse
+    {
+        $report = $this->client->probe();
+
+        try {
+            $home = $this->client->home();
+            $report['home'] = [
+                'ok' => true,
+                'sections' => is_array($home['operatingList'] ?? null) ? count($home['operatingList']) : 0,
+            ];
+        } catch (\Throwable $e) {
+            $report['home'] = ['ok' => false, 'error' => class_basename($e).': '.$e->getMessage()];
+        }
+
+        return response()->json(['data' => $report]);
+    }
+
     /** Autocomplete suggestions. */
     public function suggest(Request $request): JsonResponse
     {
