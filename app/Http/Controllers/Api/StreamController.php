@@ -634,10 +634,10 @@ class StreamController extends Controller
         return (bool) preg_match('/hevc|h\.?265/i', (string) $codec);
     }
 
-    /** Whether the HEVC->hvc1 remux endpoint is configured. */
+    /** Whether the HEVC->hvc1 fix endpoint is available. */
     protected function remuxEnabled(): bool
     {
-        return trim((string) config('moviebox.ffmpeg', '')) !== '';
+        return (bool) config('moviebox.hevc_fix', true) && function_exists('curl_init');
     }
 
     /**
@@ -654,10 +654,14 @@ class StreamController extends Controller
     }
 
     /**
-     * Stream an HEVC MP4 remuxed on the fly to `hvc1`-tagged fragmented MP4.
-     * This is a container-only rewrite (`-c copy`, no re-encoding) so it is
-     * cheap and lossless; it exists solely to make HEVC titles that only ship
-     * as `hev1` playable on iOS (where AVPlayer otherwise plays audio only).
+     * Proxy an HEVC MP4 and rewrite the sample-entry fourcc `hev1` -> `hvc1`
+     * on the fly so Safari / iOS AVPlayer renders the picture (they play
+     * `hev1` as audio-only). Pure PHP (cURL) — no ffmpeg, so it runs on shared
+     * / cPanel hosting. Range requests are honoured, so seeking still works.
+     *
+     * The fourcc only differs in two bytes ('hev1' -> 'hvc1': e->v, v->c), so
+     * the patch is applied byte-wise as the stream flows and is safe across
+     * chunk / range boundaries.
      */
     public function remuxHevc(Request $request): \Symfony\Component\HttpFoundation\StreamedResponse
     {
@@ -679,53 +683,202 @@ class StreamController extends Controller
             }
         }
         abort_unless($allowed, 403, 'Host not allowed.');
+        abort_unless($this->remuxEnabled(), 501, 'HEVC fix is disabled on this server.');
 
-        $ffmpeg = trim((string) config('moviebox.ffmpeg', ''));
-        abort_if($ffmpeg === '', 501, 'HEVC remux is disabled on this server.');
+        $info = $this->hevcPatchInfo($url);
+        $total = (int) $info['total'];
+        $offsets = $info['offsets'];
+        abort_if($total <= 0, 502, 'Could not read the media file.');
 
-        $cmd = [
-            $ffmpeg, '-hide_banner', '-loglevel', 'error',
-            '-user_agent', (string) config('moviebox.user_agent'),
-            '-i', $url,
-            '-map', '0',
-            '-c', 'copy', '-tag:v', 'hvc1',
-            '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-            '-f', 'mp4', 'pipe:1',
-        ];
+        [$start, $end] = $this->parseRange($request->header('Range'), $total);
+        $hasRange = $request->header('Range') !== null;
+        $status = $hasRange ? 206 : 200;
 
-        return response()->stream(function () use ($cmd) {
-            $descriptors = [1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
-            $process = @proc_open($cmd, $descriptors, $pipes);
-            if (! is_resource($process)) {
-                return;
-            }
-
-            stream_set_blocking($pipes[1], true);
-            while (! feof($pipes[1])) {
-                $chunk = fread($pipes[1], 65536);
-                if ($chunk === false) {
-                    break;
-                }
-                echo $chunk;
-                flush();
-                if (connection_aborted()) {
-                    break;
-                }
-            }
-
-            foreach ($pipes as $pipe) {
-                if (is_resource($pipe)) {
-                    fclose($pipe);
-                }
-            }
-            proc_terminate($process);
-            proc_close($process);
-        }, 200, [
+        $headers = [
             'Content-Type' => 'video/mp4',
-            'Cache-Control' => 'no-store',
-            'Accept-Ranges' => 'none',
+            'Accept-Ranges' => 'bytes',
+            'Content-Length' => (string) ($end - $start + 1),
+            'Cache-Control' => 'public, max-age=3600',
             'Access-Control-Allow-Origin' => '*',
+        ];
+        if ($hasRange) {
+            $headers['Content-Range'] = "bytes {$start}-{$end}/{$total}";
+        }
+
+        $ua = (string) config('moviebox.user_agent');
+
+        return response()->stream(function () use ($url, $start, $end, $offsets, $ua) {
+            @set_time_limit(0);
+            $absPos = $start;
+            $ch = curl_init($url);
+            curl_setopt_array($ch, [
+                CURLOPT_FOLLOWLOCATION => true,
+                CURLOPT_CONNECTTIMEOUT => 15,
+                CURLOPT_TIMEOUT => 0,
+                CURLOPT_BUFFERSIZE => 65536,
+                CURLOPT_HTTPHEADER => [
+                    'Range: bytes='.$start.'-'.$end,
+                    'User-Agent: '.$ua,
+                ],
+                CURLOPT_WRITEFUNCTION => function ($ch, $data) use (&$absPos, $offsets) {
+                    $len = strlen($data);
+                    foreach ($offsets as $o) {
+                        // 'hev1' -> 'hvc1': byte o+1 'e'->'v', byte o+2 'v'->'c'.
+                        $p1 = $o + 1 - $absPos;
+                        if ($p1 >= 0 && $p1 < $len) {
+                            $data[$p1] = 'v';
+                        }
+                        $p2 = $o + 2 - $absPos;
+                        if ($p2 >= 0 && $p2 < $len) {
+                            $data[$p2] = 'c';
+                        }
+                    }
+                    echo $data;
+                    $absPos += $len;
+
+                    return connection_aborted() ? 0 : $len;
+                },
+            ]);
+            curl_exec($ch);
+            curl_close($ch);
+        }, $status, $headers);
+    }
+
+    /**
+     * Locate the byte offsets of every `hev1` sample-entry fourcc inside the
+     * file's `moov` box (walking the box tree with tiny range requests so it
+     * works whether moov is at the front or the end). Cached per URL.
+     *
+     * @return array{total:int,offsets:array<int,int>}
+     */
+    protected function hevcPatchInfo(string $url): array
+    {
+        $cacheKey = 'hevcpatch:'.sha1($url);
+        $cached = Cache::get($cacheKey);
+        if (is_array($cached)) {
+            return $cached;
+        }
+
+        $total = 0;
+        $offsets = [];
+        $pos = 0;
+
+        for ($i = 0; $i < 64; $i++) {
+            $head = $this->curlRange($url, $pos, $pos + 15, $total);
+            if ($head === null || strlen($head) < 8) {
+                break;
+            }
+
+            $size = unpack('N', substr($head, 0, 4))[1];
+            $type = substr($head, 4, 4);
+            $headerSize = 8;
+
+            if ($size === 1) {
+                if (strlen($head) < 16) {
+                    break;
+                }
+                $hi = unpack('N', substr($head, 8, 4))[1];
+                $lo = unpack('N', substr($head, 12, 4))[1];
+                $size = $hi * 4294967296 + $lo;
+                $headerSize = 16;
+            } elseif ($size === 0) {
+                $size = $total > 0 ? $total - $pos : 0;
+            }
+
+            if ($type === 'moov') {
+                $moovLen = min($size, 8 * 1024 * 1024);
+                $moov = $this->curlRange($url, $pos, $pos + $moovLen - 1, $total);
+                if ($moov !== null) {
+                    $off = 0;
+                    while (($idx = strpos($moov, 'hev1', $off)) !== false) {
+                        $offsets[] = $pos + $idx;
+                        $off = $idx + 4;
+                    }
+                }
+                break;
+            }
+
+            if ($size < $headerSize) {
+                break;
+            }
+            $pos += $size;
+            if ($total > 0 && $pos >= $total) {
+                break;
+            }
+        }
+
+        $result = ['total' => $total, 'offsets' => array_values(array_unique($offsets))];
+        Cache::put($cacheKey, $result, 6 * 3600);
+
+        return $result;
+    }
+
+    /**
+     * Fetch a byte range via cURL. Captures the file's total size from the
+     * Content-Range header into $total.
+     */
+    protected function curlRange(string $url, int $start, int $end, int &$total): ?string
+    {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_CONNECTTIMEOUT => 15,
+            CURLOPT_TIMEOUT => (int) config('moviebox.timeout', 30),
+            CURLOPT_HTTPHEADER => [
+                'Range: bytes='.$start.'-'.$end,
+                'User-Agent: '.(string) config('moviebox.user_agent'),
+            ],
+            CURLOPT_HEADERFUNCTION => function ($ch, $line) use (&$total) {
+                if (stripos($line, 'Content-Range:') === 0 && preg_match('#/(\d+)#', $line, $m)) {
+                    $total = (int) $m[1];
+                }
+
+                return strlen($line);
+            },
         ]);
+        $body = curl_exec($ch);
+        $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($body === false || $code >= 400) {
+            return null;
+        }
+
+        return $body;
+    }
+
+    /**
+     * Parse a single HTTP Range header against the known total size.
+     *
+     * @return array{0:int,1:int} [start, end] (inclusive)
+     */
+    protected function parseRange(?string $header, int $total): array
+    {
+        $last = max(0, $total - 1);
+        if ($header === null || ! preg_match('/bytes=(\d*)-(\d*)/', $header, $m)) {
+            return [0, $last];
+        }
+
+        $start = $m[1] === '' ? null : (int) $m[1];
+        $end = $m[2] === '' ? null : (int) $m[2];
+
+        if ($start === null) {
+            // Suffix range: the final N bytes.
+            $len = $end ?? 0;
+            $start = max(0, $total - $len);
+            $end = $last;
+        } else {
+            if ($end === null || $end > $last) {
+                $end = $last;
+            }
+        }
+
+        if ($start > $end || $start < 0) {
+            return [0, $last];
+        }
+
+        return [$start, $end];
     }
 
     /**

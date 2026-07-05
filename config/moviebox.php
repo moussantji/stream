@@ -75,12 +75,12 @@ return [
     // Optional outbound proxy.
     'proxy' => env('MOVIEBOX_PROXY') ?: null,
 
-    // Path to the ffmpeg binary used by the HEVC remux endpoint (/api/mv-hevc).
-    // iOS' AVPlayer only renders HEVC tagged `hvc1`; MovieBox files are often
-    // tagged `hev1` (audio plays, no picture). We remux (stream-copy, no
-    // re-encode) to `hvc1` fragmented MP4 on the fly so iPhones show the video.
-    // Requires ffmpeg installed on the server. Set to '' to disable the feature.
-    'ffmpeg' => env('MOVIEBOX_FFMPEG', 'ffmpeg'),
+    // iOS HEVC fix. MovieBox HEVC files are tagged `hev1`, which Safari/AVPlayer
+    // plays as audio-only (no picture). The /api/mv-hevc endpoint proxies the
+    // file and rewrites the sample-entry fourcc `hev1` -> `hvc1` on the fly in
+    // pure PHP (no ffmpeg — works on shared/cPanel hosting). Range requests are
+    // honoured so seeking still works. Set false to disable.
+    'hevc_fix' => filter_var(env('MOVIEBOX_HEVC_FIX', true), FILTER_VALIDATE_BOOL),
 
     // HMAC signing secret (base64). Override only if the upstream rotates it.
     'secret_key' => env('MOVIEBOX_SECRET_KEY', '76iRl07s0xSN9jqmEWAt79EBJZulIQIsV64FZr2O'),
