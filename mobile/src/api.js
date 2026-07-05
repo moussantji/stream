@@ -27,6 +27,7 @@ export const api = {
     trending: (page = 1) => get('/api/trending', { page }),
     category: (tab, page = 1) => get('/api/category', { tab, page }),
     search: (q, type = 'all', page = 1) => get('/api/search', { q, type, page }),
+    suggest: (q) => get('/api/suggest', { q }),
     detail: (item) => get('/api/detail', {
         subjectId: item.subjectId,
         subjectType: item.subjectType,
@@ -34,6 +35,12 @@ export const api = {
         cover: item.cover,
     }),
     play: (item, season = 0, episode = 0) => get('/api/play', {
+        subjectId: item.subjectId,
+        season,
+        episode,
+        title: item.title,
+    }),
+    downloads: (item, season = 0, episode = 0) => get('/api/downloads', {
         subjectId: item.subjectId,
         season,
         episode,

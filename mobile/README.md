@@ -7,9 +7,8 @@ l'icône 🔍 en haut, bannière en vedette sur l'accueil, fiche détail avec gr
 image, lecteur vidéo, et **téléchargement hors ligne (uniquement dans l'app)**.
 
 > ⚠️ **Les films ne s'affichent pas ?** L'app utilise le backend du **site**.
-> Va dans **Mon compte → « URL du serveur »**, saisis l'adresse publique de ton
-> site (ex. `https://ton-site.com`), puis **Enregistrer** / **Tester**. L'URL est
-> mémorisée sur le téléphone.
+> Mets l'URL publique de ton site dans `src/config.js` (`API_BASE`), sans `/api`.
+> L'onglet **Mon compte → « Tester la connexion »** permet de vérifier.
 
 ## 1. Prérequis
 
@@ -18,12 +17,7 @@ image, lecteur vidéo, et **téléchargement hors ligne (uniquement dans l'app)*
 
 ## 2. Configurer l'URL de l'API
 
-Deux façons :
-
-1. **Dans l'app** (recommandé) : onglet **Mon compte → « URL du serveur »** →
-   saisis l'URL du site → **Enregistrer**. Mémorisée sur le téléphone.
-2. **Valeur par défaut** : édite `src/config.js` → `DEFAULT_API_BASE`
-   (ex. `https://ton-site.com`).
+Édite **`src/config.js`** → `API_BASE` (racine du site, **sans** `/api`) :
 
 Selon le contexte :
 - **Backend en ligne (site)** : `https://ton-domaine.com` (recommandé).

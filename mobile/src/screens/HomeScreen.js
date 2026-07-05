@@ -1,5 +1,7 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { ScrollView, View, Text, FlatList, ActivityIndicator, TouchableOpacity, ImageBackground, useWindowDimensions, StyleSheet } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { Ionicons } from '@expo/vector-icons';
 import { api } from '../api';
 import { getApiBase } from '../config';
 import PosterCard from '../components/PosterCard';
@@ -31,7 +33,7 @@ function Hero({ item, onPress }) {
     );
 }
 
-function Tabs({ current, onChange }) {
+function CategoryTabs({ current, onChange }) {
     return (
         <View style={styles.tabs}>
             {TABS.map((t) => (
@@ -46,6 +48,7 @@ function Tabs({ current, onChange }) {
 
 export default function HomeScreen({ navigation }) {
     const { width } = useWindowDimensions();
+    const insets = useSafeAreaInsets();
     const [tab, setTab] = useState('tendance');
     const [sections, setSections] = useState([]);
     const [items, setItems] = useState([]);
@@ -63,7 +66,7 @@ export default function HomeScreen({ navigation }) {
                 const trending = t.status === 'fulfilled' ? t.value : null;
                 if (!home && !trending) {
                     const reason = (h.reason && h.reason.message) || (t.reason && t.reason.message) || '';
-                    throw new Error(`Impossible de charger les données.\n\n${reason}\n\nDans « Mon compte → URL du serveur », mets l'adresse RACINE de ton site (ex. https://ton-site.com), SANS « /api ».`);
+                    throw new Error(`Impossible de charger les données.\n\n${reason}\n\nDéfinis l'URL de ton site dans src/config.js (API_BASE).`);
                 }
                 const secs = [];
                 if (trending && trending.items && trending.items.length) secs.push({ title: 'Les plus regardés', items: trending.items });
@@ -89,78 +92,77 @@ export default function HomeScreen({ navigation }) {
 
     const openDetail = (item) => navigation.navigate('Detail', { item });
 
-    const header = (
-        <>
-            <Tabs current={tab} onChange={setTab} />
-            {loading ? null : <Hero item={hero} onPress={() => hero && openDetail(hero)} />}
-        </>
+    const searchBar = (
+        <View style={[styles.searchWrap, { paddingTop: insets.top + 8 }]}>
+            <TouchableOpacity style={styles.searchBar} activeOpacity={0.85} onPress={() => navigation.navigate('Search')}>
+                <Ionicons name="search" size={18} color={colors.dim} />
+                <Text style={styles.searchPlaceholder}>Rechercher un film, une série…</Text>
+            </TouchableOpacity>
+        </View>
     );
 
+    let body;
     if (error) {
-        return (
-            <View style={{ flex: 1, backgroundColor: colors.bg }}>
-                <Tabs current={tab} onChange={setTab} />
-                <View style={styles.center}>
-                    <Text style={styles.errText}>{error}</Text>
-                    <TouchableOpacity onPress={load} style={styles.retry}><Text style={styles.retryText}>Réessayer</Text></TouchableOpacity>
-                </View>
+        body = (
+            <View style={styles.center}>
+                <Text style={styles.errText}>{error}</Text>
+                <TouchableOpacity onPress={load} style={styles.retry}><Text style={styles.retryText}>Réessayer</Text></TouchableOpacity>
             </View>
         );
-    }
-
-    if (loading) {
-        return (
-            <View style={{ flex: 1, backgroundColor: colors.bg }}>
-                <Tabs current={tab} onChange={setTab} />
-                <View style={styles.center}><ActivityIndicator color={colors.accent} size="large" /></View>
-            </View>
-        );
-    }
-
-    // Category grid (Séries TV / Film).
-    if (tab !== 'tendance') {
+    } else if (loading) {
+        body = <View style={styles.center}><ActivityIndicator color={colors.accent} size="large" /></View>;
+    } else if (tab !== 'tendance') {
         const colW = Math.floor((width - 12 * 4) / 3);
-        return (
+        body = (
             <FlatList
-                style={{ backgroundColor: colors.bg }}
                 data={items}
                 key="grid3"
                 numColumns={3}
                 keyExtractor={(it, idx) => `${it.subjectId}-${idx}`}
-                ListHeaderComponent={header}
+                ListHeaderComponent={<Hero item={hero} onPress={() => hero && openDetail(hero)} />}
                 columnWrapperStyle={{ paddingHorizontal: 12, justifyContent: 'space-between' }}
                 renderItem={({ item }) => <PosterCard item={item} width={colW} onPress={() => openDetail(item)} />}
                 ListEmptyComponent={<Text style={styles.empty}>Aucun titre.</Text>}
             />
         );
+    } else {
+        body = (
+            <ScrollView>
+                <Hero item={hero} onPress={() => hero && openDetail(hero)} />
+                {sections.map((s, i) => (
+                    <View key={`${s.title}-${i}`} style={{ marginTop: 18 }}>
+                        <Text style={styles.rowTitle}>{s.title}</Text>
+                        <FlatList
+                            horizontal
+                            data={s.items}
+                            keyExtractor={(it, idx) => `${it.subjectId}-${idx}`}
+                            showsHorizontalScrollIndicator={false}
+                            contentContainerStyle={{ paddingHorizontal: 12 }}
+                            renderItem={({ item }) => <PosterCard item={item} onPress={() => openDetail(item)} />}
+                        />
+                    </View>
+                ))}
+                <View style={{ height: 24 }} />
+            </ScrollView>
+        );
     }
 
-    // Tendance: hero + horizontal rows.
     return (
-        <ScrollView style={{ backgroundColor: colors.bg }}>
-            {header}
-            {sections.map((s, i) => (
-                <View key={`${s.title}-${i}`} style={{ marginTop: 18 }}>
-                    <Text style={styles.rowTitle}>{s.title}</Text>
-                    <FlatList
-                        horizontal
-                        data={s.items}
-                        keyExtractor={(it, idx) => `${it.subjectId}-${idx}`}
-                        showsHorizontalScrollIndicator={false}
-                        contentContainerStyle={{ paddingHorizontal: 12 }}
-                        renderItem={({ item }) => <PosterCard item={item} onPress={() => openDetail(item)} />}
-                    />
-                </View>
-            ))}
-            <View style={{ height: 24 }} />
-        </ScrollView>
+        <View style={{ flex: 1, backgroundColor: colors.bg }}>
+            {searchBar}
+            <CategoryTabs current={tab} onChange={setTab} />
+            <View style={{ flex: 1 }}>{body}</View>
+        </View>
     );
 }
 
 const styles = StyleSheet.create({
     center: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 28 },
-    tabs: { flexDirection: 'row', paddingHorizontal: 12, paddingTop: 8, backgroundColor: colors.header },
-    tab: { marginRight: 22, paddingVertical: 8, alignItems: 'center' },
+    searchWrap: { backgroundColor: colors.header, paddingHorizontal: 12, paddingBottom: 8 },
+    searchBar: { flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: colors.card, borderRadius: 999, paddingHorizontal: 14, paddingVertical: 11 },
+    searchPlaceholder: { color: colors.dim, fontSize: 14 },
+    tabs: { flexDirection: 'row', paddingHorizontal: 12, backgroundColor: colors.header },
+    tab: { marginRight: 22, paddingVertical: 10, alignItems: 'center' },
     tabLabel: { color: colors.dim, fontSize: 16, fontWeight: '700' },
     tabActive: { color: colors.text },
     tabBar: { height: 3, backgroundColor: colors.accent, borderRadius: 3, alignSelf: 'stretch', marginTop: 5 },

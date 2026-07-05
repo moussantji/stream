@@ -1,42 +1,9 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
+// URL du backend du SITE (celui qui sert /api/*).
+// 👉 Mets ici l'adresse publique de ton site, SANS "/api" à la fin.
+//    ex: https://ton-domaine.com
+// (Émulateur Android + backend local: http://10.0.2.2:8000)
+export const API_BASE = 'https://ton-site.com';
 
-// URL par défaut du backend du SITE (celui qui sert /api/*).
-// Remplace-la par l'URL publique de ton site OU change-la directement dans
-// l'app : onglet « Mon compte » → « URL du serveur ». Elle est alors mémorisée
-// sur le téléphone (pas besoin de recompiler).
-export const DEFAULT_API_BASE = 'https://ton-site.com';
-
-const STORAGE_KEY = 'moviebox.apiBase';
-let current = DEFAULT_API_BASE;
-
-/** Current API base URL (sync, used by the API client). */
 export function getApiBase() {
-    return current;
-}
-
-/** Load the saved URL at startup. */
-export async function loadApiBase() {
-    try {
-        const saved = await AsyncStorage.getItem(STORAGE_KEY);
-        if (saved) current = saved;
-    } catch {
-        /* ignore */
-    }
-    return current;
-}
-
-/** Persist a new API base URL (trims trailing slashes). */
-export async function setApiBase(url) {
-    // Normalise: drop trailing slashes AND a trailing "/api" (common mistake —
-    // the app already appends "/api/..." itself, so the base must be the site
-    // ROOT, e.g. https://ton-site.com).
-    let clean = String(url || '').trim().replace(/\s+/g, '').replace(/\/+$/, '');
-    clean = clean.replace(/\/api$/i, '');
-    current = clean || DEFAULT_API_BASE;
-    try {
-        await AsyncStorage.setItem(STORAGE_KEY, current);
-    } catch {
-        /* ignore */
-    }
-    return current;
+    return API_BASE;
 }
