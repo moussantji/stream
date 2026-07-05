@@ -1,8 +1,10 @@
 # MovieBox — application mobile (Expo / React Native)
 
-Application mobile React Native (Expo) qui consomme la **même API** que le site
-Laravel (`/api/*`). Elle fournit l'accueil, la recherche, la fiche détail
-(saisons/épisodes) et un lecteur vidéo.
+Application mobile React Native (Expo) qui consomme le **même backend API** que
+le site Laravel (`/api/*`). Interface façon MovieBox : navigation par onglets en
+bas (Accueil / Recherche / Téléchargés), bannière en vedette sur l'accueil,
+fiche détail avec grande image, lecteur vidéo, et **téléchargement hors ligne
+(uniquement dans l'app)**.
 
 ## 1. Prérequis
 
@@ -72,11 +74,19 @@ public/downloads/moviebox.apk
 Le bouton « App » de l'en-tête (et la config du site) pointe déjà vers
 `/downloads/moviebox.apk`.
 
+## Téléchargement hors ligne (app uniquement)
+
+- Depuis l'écran de lecture, bouton **« Télécharger »** → choix de la qualité →
+  le fichier MP4 est enregistré dans le stockage **privé de l'app**
+  (`expo-file-system`), puis lisible hors connexion depuis l'onglet
+  **« Téléchargés »**.
+- Cette fonctionnalité n'existe **que dans l'app** : le site web n'expose aucun
+  bouton de téléchargement.
+
 ## Limites connues
 
 - Le lecteur utilise `expo-av` : il lit le **MP4** et le **HLS**. Les flux
   **DASH** (certains épisodes) ne sont pas encore pris en charge — l'écran
-  l'indique. On pourra ajouter un lecteur DASH (ex. `react-native-video` +
-  build dev) plus tard.
+  l'indique (et le téléchargement n'est proposé que s'il existe un MP4).
 - Pas encore d'authentification / favoris / historique dans l'app (l'API le
   permet ; à ajouter selon les besoins).
