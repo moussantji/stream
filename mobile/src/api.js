@@ -8,11 +8,15 @@ function qs(params = {}) {
 }
 
 async function get(path, params) {
-    const res = await fetch(`${getApiBase()}${path}${qs(params)}`, {
-        headers: { Accept: 'application/json' },
-    });
+    const url = `${getApiBase()}${path}${qs(params)}`;
+    let res;
+    try {
+        res = await fetch(url, { headers: { Accept: 'application/json' } });
+    } catch (e) {
+        throw new Error(`Connexion impossible :\n${url}`);
+    }
     if (!res.ok) {
-        throw new Error(`Erreur réseau (${res.status})`);
+        throw new Error(`HTTP ${res.status} :\n${url}`);
     }
     const json = await res.json();
     return json && Object.prototype.hasOwnProperty.call(json, 'data') ? json.data : json;

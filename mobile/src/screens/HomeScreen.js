@@ -62,7 +62,8 @@ export default function HomeScreen({ navigation }) {
                 const home = h.status === 'fulfilled' ? h.value : null;
                 const trending = t.status === 'fulfilled' ? t.value : null;
                 if (!home && !trending) {
-                    throw new Error(`Impossible de joindre le serveur.\n\nURL de l'API : ${getApiBase()}\n\nDéfinis l'URL de ton site dans « Mon compte → URL du serveur ».`);
+                    const reason = (h.reason && h.reason.message) || (t.reason && t.reason.message) || '';
+                    throw new Error(`Impossible de charger les données.\n\n${reason}\n\nDans « Mon compte → URL du serveur », mets l'adresse RACINE de ton site (ex. https://ton-site.com), SANS « /api ».`);
                 }
                 const secs = [];
                 if (trending && trending.items && trending.items.length) secs.push({ title: 'Les plus regardés', items: trending.items });

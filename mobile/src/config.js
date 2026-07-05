@@ -27,7 +27,11 @@ export async function loadApiBase() {
 
 /** Persist a new API base URL (trims trailing slashes). */
 export async function setApiBase(url) {
-    const clean = String(url || '').trim().replace(/\/+$/, '');
+    // Normalise: drop trailing slashes AND a trailing "/api" (common mistake —
+    // the app already appends "/api/..." itself, so the base must be the site
+    // ROOT, e.g. https://ton-site.com).
+    let clean = String(url || '').trim().replace(/\s+/g, '').replace(/\/+$/, '');
+    clean = clean.replace(/\/api$/i, '');
     current = clean || DEFAULT_API_BASE;
     try {
         await AsyncStorage.setItem(STORAGE_KEY, current);
