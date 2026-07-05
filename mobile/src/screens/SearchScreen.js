@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { View, TextInput, FlatList, ActivityIndicator, Text, TouchableOpacity, useWindowDimensions, StyleSheet } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { Ionicons } from '@expo/vector-icons';
 import { api } from '../api';
 import PosterCard from '../components/PosterCard';
 import { getRecentSearches, addRecentSearch, clearRecentSearches } from '../recent';
@@ -83,7 +82,7 @@ export default function SearchScreen({ navigation }) {
                     keyboardShouldPersistTaps="handled"
                     renderItem={({ item }) => (
                         <TouchableOpacity style={styles.row} onPress={() => runSearch(item)}>
-                            <Ionicons name="search" size={17} color={colors.dim} />
+                            <Text style={styles.rowIcon}>🔍</Text>
                             <Text style={styles.rowText} numberOfLines={1}>{item}</Text>
                         </TouchableOpacity>
                     )}
@@ -106,7 +105,7 @@ export default function SearchScreen({ navigation }) {
                 )}
                 {recent.map((r, i) => (
                     <TouchableOpacity key={`${r}-${i}`} style={styles.row} onPress={() => runSearch(r)}>
-                        <Ionicons name="time-outline" size={18} color={colors.dim} />
+                        <Text style={styles.rowIcon}>🕘</Text>
                         <Text style={styles.rowText} numberOfLines={1}>{r}</Text>
                     </TouchableOpacity>
                 ))}
@@ -118,10 +117,10 @@ export default function SearchScreen({ navigation }) {
         <View style={{ flex: 1, backgroundColor: colors.bg }}>
             <View style={[styles.bar, { paddingTop: insets.top + 8 }]}>
                 <TouchableOpacity onPress={() => navigation.goBack()} hitSlop={10} style={{ padding: 4 }}>
-                    <Ionicons name="arrow-back" size={24} color={colors.text} />
+                    <Text style={{ color: colors.text, fontSize: 26 }}>←</Text>
                 </TouchableOpacity>
                 <View style={styles.inputWrap}>
-                    <Ionicons name="search" size={18} color={colors.dim} />
+                    <Text style={{ fontSize: 15 }}>🔍</Text>
                     <TextInput
                         style={styles.input}
                         value={q}
@@ -136,7 +135,7 @@ export default function SearchScreen({ navigation }) {
                     />
                     {q ? (
                         <TouchableOpacity onPress={() => { setQ(''); setResults(null); setSuggestions([]); }} hitSlop={10}>
-                            <Ionicons name="close-circle" size={18} color={colors.dim} />
+                            <Text style={{ color: colors.dim, fontSize: 16 }}>✕</Text>
                         </TouchableOpacity>
                     ) : null}
                 </View>
@@ -153,6 +152,7 @@ const styles = StyleSheet.create({
     center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
     empty: { color: colors.dim, textAlign: 'center', marginTop: 40 },
     row: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingHorizontal: 16, paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: colors.border },
+    rowIcon: { fontSize: 15 },
     rowText: { color: colors.text, fontSize: 15, flex: 1 },
     recentHead: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 14 },
     recentTitle: { color: colors.text, fontSize: 15, fontWeight: '700' },

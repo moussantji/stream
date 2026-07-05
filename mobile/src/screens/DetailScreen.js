@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { ScrollView, View, Text, Image, ImageBackground, TouchableOpacity, ActivityIndicator, Alert, StyleSheet } from 'react-native';
 import { Video, ResizeMode } from 'expo-av';
-import { Ionicons } from '@expo/vector-icons';
 import { api } from '../api';
 import { colors } from '../theme';
 import { ensureDir, safeName, createDownload, formatSize } from '../download';
@@ -14,21 +13,19 @@ export default function DetailScreen({ route, navigation }) {
     const [files, setFiles] = useState([]);
     const [dlKey, setDlKey] = useState(null);
     const [progress, setProgress] = useState(0);
+    const [activeSubjectId, setActiveSubjectId] = useState(item.subjectId);
 
     useEffect(() => {
         (async () => {
             try {
                 const d = await api.detail(item);
                 setData(d);
-                if (d.seasons && d.seasons.length) {
-                    setSeason(d.seasons[0]);
-                } else {
-                    // Movie: load the downloadable files (qualities).
-                    try {
-                        const dl = await api.downloads(item, 0, 0);
-                        setFiles(dl.downloads || []);
-                    } catch { /* ignore */ }
-                }
+                const seasons = (d.isSeries && d.seasons) || [];
+                if (seasons.length) setSeason(seasons[0]);
+                // Default to the French version if one exists (else keep original).
+                const dubs = d.dubs || [];
+                const fr = dubs.find((x) => (x.code || '').startsWith('fr') || /fran/i.test(x.label || ''));
+                setActiveSubjectId((fr && fr.subjectId) || (d.item && d.item.subjectId) || item.subjectId);
             } catch {
                 setData({ item });
             } finally {
@@ -37,27 +34,43 @@ export default function DetailScreen({ route, navigation }) {
         })();
     }, []);
 
+    const meta = data ? (data.item || item) : item;
+    const seasons = (data && data.isSeries && data.seasons) || [];
+    const isSeries = seasons.length > 0;
+    const dubs = (data && data.dubs) || [];
+    const currentItem = { ...meta, subjectId: activeSubjectId };
+
+    // Movie: (re)load the downloadable files for the active version.
+    useEffect(() => {
+        if (!data || isSeries || !activeSubjectId) return;
+        let alive = true;
+        (async () => {
+            try {
+                const dl = await api.downloads(currentItem, 0, 0);
+                if (alive) setFiles(dl.downloads || []);
+            } catch {
+                if (alive) setFiles([]);
+            }
+        })();
+        return () => { alive = false; };
+    }, [activeSubjectId, data, isSeries]);
+
     if (loading) {
         return <View style={styles.center}><ActivityIndicator color={colors.accent} size="large" /></View>;
     }
 
-    const meta = data.item || item;
-    const seasons = (data.isSeries && data.seasons) || [];
-    const isSeries = seasons.length > 0;
     const trailer = data.trailer;
 
     const play = () => {
         if (isSeries) {
             const s = season || seasons[0];
             const firstEp = (s.episodes && s.episodes[0]) || 1;
-            navigation.navigate('Watch', { item: meta, season: s.season, episode: firstEp });
+            navigation.navigate('Watch', { item: currentItem, season: s.season, episode: firstEp });
         } else {
-            navigation.navigate('Watch', { item: meta, season: 0, episode: 0 });
+            navigation.navigate('Watch', { item: currentItem, season: 0, episode: 0 });
         }
     };
 
-    // Fire-and-forget download (runs in the background: you can keep browsing /
-    // start watching the stream meanwhile). Files land in the Downloads tab.
     const doDownload = async (file) => {
         const quality = file.quality || (file.resolution ? `${file.resolution}p` : 'auto');
         const filename = `${safeName(meta.title)}_${quality}.mp4`;
@@ -79,14 +92,7 @@ export default function DetailScreen({ route, navigation }) {
         <ScrollView style={{ backgroundColor: colors.bg }}>
             <View style={styles.backdrop}>
                 {trailer ? (
-                    <Video
-                        style={StyleSheet.absoluteFill}
-                        source={{ uri: trailer }}
-                        resizeMode={ResizeMode.COVER}
-                        shouldPlay
-                        isLooping
-                        isMuted
-                    />
+                    <Video style={StyleSheet.absoluteFill} source={{ uri: trailer }} resizeMode={ResizeMode.COVER} shouldPlay isLooping isMuted />
                 ) : meta.cover ? (
                     <ImageBackground source={{ uri: meta.cover }} style={StyleSheet.absoluteFill} resizeMode="cover" />
                 ) : null}
@@ -105,14 +111,35 @@ export default function DetailScreen({ route, navigation }) {
 
             <View style={{ padding: 16 }}>
                 <TouchableOpacity style={styles.play} onPress={play}>
-                    <Ionicons name="play" size={18} color="#fff" />
-                    <Text style={styles.playText}>{isSeries ? `Lecture S${(season || seasons[0]).season}` : 'Lecture'}</Text>
+                    <Text style={styles.playText}>▶  {isSeries ? `Lecture S${(season || seasons[0]).season}` : 'Lecture'}</Text>
                 </TouchableOpacity>
+
+                {/* Version / langue (ex. Hindi → Français VF) */}
+                {dubs.length > 1 ? (
+                    <View style={{ marginTop: 16 }}>
+                        <Text style={styles.section}>Version / langue</Text>
+                        <View style={styles.dubRow}>
+                            {dubs.map((d, i) => {
+                                const active = d.subjectId === activeSubjectId;
+                                return (
+                                    <TouchableOpacity
+                                        key={`${d.subjectId}-${i}`}
+                                        style={[styles.dub, active && styles.dubActive]}
+                                        onPress={() => setActiveSubjectId(d.subjectId)}
+                                    >
+                                        <Text style={[styles.dubText, active && styles.dubTextActive]}>
+                                            {d.label}{d.original ? ' (VO)' : ''}
+                                        </Text>
+                                    </TouchableOpacity>
+                                );
+                            })}
+                        </View>
+                    </View>
+                ) : null}
 
                 <Text style={styles.genres}>{(meta.genres || []).join('  ·  ')}</Text>
                 {meta.description ? <Text style={styles.desc}>{meta.description}</Text> : null}
 
-                {/* Movie: downloadable files list */}
                 {!isSeries && files.length ? (
                     <View style={{ marginTop: 20 }}>
                         <Text style={styles.section}>Fichiers · téléchargement</Text>
@@ -127,11 +154,7 @@ export default function DetailScreen({ route, navigation }) {
                                         {f.size ? <Text style={styles.fileSize}>{formatSize(f.size)}</Text> : null}
                                     </View>
                                     <TouchableOpacity style={styles.dlBtn} onPress={() => doDownload(f)} disabled={!!dlKey}>
-                                        {busy ? (
-                                            <Text style={styles.dlPct}>{Math.round(progress * 100)}%</Text>
-                                        ) : (
-                                            <Ionicons name="download-outline" size={22} color={colors.text} />
-                                        )}
+                                        {busy ? <Text style={styles.dlPct}>{Math.round(progress * 100)}%</Text> : <Text style={styles.dlIcon}>⬇</Text>}
                                     </TouchableOpacity>
                                 </View>
                             );
@@ -140,7 +163,6 @@ export default function DetailScreen({ route, navigation }) {
                     </View>
                 ) : null}
 
-                {/* Series: episodes (tap = lecture; téléchargement depuis le lecteur) */}
                 {isSeries ? (
                     <View style={{ marginTop: 20 }}>
                         <Text style={styles.section}>Épisodes</Text>
@@ -155,7 +177,7 @@ export default function DetailScreen({ route, navigation }) {
                         ) : null}
                         <View style={styles.epGrid}>
                             {(season ? season.episodes : []).map((ep) => (
-                                <TouchableOpacity key={ep} style={styles.ep} onPress={() => navigation.navigate('Watch', { item: meta, season: season.season, episode: ep })}>
+                                <TouchableOpacity key={ep} style={styles.ep} onPress={() => navigation.navigate('Watch', { item: currentItem, season: season.season, episode: ep })}>
                                     <Text style={styles.epText}>E{ep}</Text>
                                 </TouchableOpacity>
                             ))}
@@ -176,15 +198,21 @@ const styles = StyleSheet.create({
     title: { color: '#fff', fontSize: 22, fontWeight: '900' },
     sub: { color: '#d6d6de', fontSize: 13, marginTop: 6 },
     vf: { color: colors.accent2, fontSize: 12, fontWeight: '700', marginTop: 6 },
-    play: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, backgroundColor: colors.accent, borderRadius: 8, paddingVertical: 12 },
+    play: { alignItems: 'center', justifyContent: 'center', backgroundColor: colors.accent, borderRadius: 8, paddingVertical: 12 },
     playText: { color: '#fff', fontWeight: '800', fontSize: 15 },
+    section: { color: colors.text, fontSize: 16, fontWeight: '700', marginBottom: 10 },
+    dubRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+    dub: { backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, borderRadius: 999, paddingHorizontal: 14, paddingVertical: 8 },
+    dubActive: { backgroundColor: colors.accent, borderColor: 'transparent' },
+    dubText: { color: colors.text, fontWeight: '600', fontSize: 13 },
+    dubTextActive: { color: '#fff' },
     genres: { color: colors.dim, fontSize: 13, marginTop: 14 },
     desc: { color: '#d6d6de', fontSize: 14, lineHeight: 21, marginTop: 10 },
-    section: { color: colors.text, fontSize: 16, fontWeight: '700', marginBottom: 10 },
     fileRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: colors.card, borderRadius: 10, paddingHorizontal: 14, paddingVertical: 12, marginBottom: 8 },
     fileQ: { color: colors.text, fontSize: 15, fontWeight: '700' },
     fileSize: { color: colors.dim, fontSize: 12, marginTop: 2 },
     dlBtn: { minWidth: 44, alignItems: 'flex-end' },
+    dlIcon: { color: colors.text, fontSize: 20 },
     dlPct: { color: colors.accent2, fontWeight: '800' },
     hint: { color: colors.dim, fontSize: 12, lineHeight: 18, marginTop: 6 },
     tab: { backgroundColor: colors.card, borderRadius: 8, borderWidth: 1, borderColor: colors.border, paddingHorizontal: 14, paddingVertical: 8, marginRight: 8 },
