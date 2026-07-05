@@ -92,6 +92,10 @@ img { display: block; }
 .suggestions button:hover { background: var(--bg-card); }
 
 .auth-area { display: flex; align-items: center; gap: 10px; }
+.app-dl { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+
+/* Mobile bottom navigation (hidden on desktop). */
+.bottom-nav { display: none; }
 
 .btn {
     border: 1px solid transparent; border-radius: 8px; padding: 8px 16px;
@@ -501,4 +505,32 @@ video.hero-bg { pointer-events: none; }
     .grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 12px; }
     .channel-grid { grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 12px; }
     .section-title { font-size: 18px; }
+
+    /* Bottom nav replaces the top hamburger menu on phones. */
+    .nav-toggle { display: none; }
+    .main-nav { display: none; }
+    .app-dl span { display: none; }
+    .app-dl { padding: 8px 10px; }
+
+    .bottom-nav {
+        display: flex;
+        position: fixed; left: 0; right: 0; bottom: 0; z-index: 60;
+        justify-content: space-around; align-items: stretch;
+        background: rgba(11, 11, 15, .97);
+        border-top: 1px solid var(--border);
+        backdrop-filter: blur(14px);
+        padding-bottom: env(safe-area-inset-bottom);
+    }
+    .bottom-nav a, .bottom-nav button {
+        flex: 1; min-width: 0;
+        display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
+        background: none; border: none; color: var(--text-dim);
+        font-size: 10px; font-weight: 600; padding: 8px 0 7px;
+    }
+    .bottom-nav svg { width: 23px; height: 23px; }
+    .bottom-nav a.active { color: var(--accent-2); }
+    .bottom-nav a:active, .bottom-nav button:active { transform: scale(.94); }
+
+    .app-main { padding-bottom: 74px; }
+    .toast-root { bottom: 84px; }
 }

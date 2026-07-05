@@ -131,6 +131,12 @@ initSearch();
 initNavToggle();
 route();
 
+// Bottom-nav search button: scroll up and focus the header search field.
+document.getElementById('bn-search')?.addEventListener('click', () => {
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+    document.getElementById('search-input')?.focus();
+});
+
 // Refresh the stored user (e.g. to pick up is_admin) for existing sessions.
 if (isAuthed()) {
     api.me().then((u) => { if (u) setAuth(getToken(), u); }).catch(() => {});

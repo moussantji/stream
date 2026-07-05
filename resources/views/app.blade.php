@@ -35,6 +35,11 @@
                 <div class="suggestions" id="suggestions" hidden></div>
             </form>
 
+            <a class="btn btn-ghost app-dl" href="/downloads/moviebox.apk" download title="Télécharger l'application Android">
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14"/></svg>
+                <span>App</span>
+            </a>
+
             <div class="auth-area" id="auth-area">
                 <!-- populated by JS -->
             </div>
@@ -42,6 +47,29 @@
     </header>
 
     <main id="app" class="app-main" aria-live="polite"></main>
+
+    <nav class="bottom-nav" id="bottom-nav" aria-label="Navigation">
+        <a href="/" data-link data-nav="/">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/></svg>
+            <span>Accueil</span>
+        </a>
+        <a href="/films" data-link data-nav="/films">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 4v16M17 4v16M3 9h4M3 15h4M17 9h4M17 15h4"/></svg>
+            <span>Films</span>
+        </a>
+        <a href="/series" data-link data-nav="/series">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="13" rx="2"/><path d="M8 3l4 4 4-4"/></svg>
+            <span>Séries</span>
+        </a>
+        <button type="button" id="bn-search">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/></svg>
+            <span>Rechercher</span>
+        </button>
+        <a href="/library" data-link data-nav="/library" data-auth-only>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+            <span>Ma liste</span>
+        </a>
+    </nav>
 
     <footer class="site-footer">
         <p>All media and images are sourced from third-party providers on the internet, and their copyrights belong to their original creators. This project stores no content and is provided for educational purposes only.</p>
