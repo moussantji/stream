@@ -2,9 +2,13 @@
 
 Application mobile React Native (Expo) qui consomme le **même backend API** que
 le site Laravel (`/api/*`). Interface façon MovieBox : navigation par onglets en
-bas (Accueil / Recherche / Téléchargés), bannière en vedette sur l'accueil,
-fiche détail avec grande image, lecteur vidéo, et **téléchargement hors ligne
-(uniquement dans l'app)**.
+bas (**Accueil / Tendance / Téléchargements / Mon compte**), recherche via
+l'icône 🔍 en haut, bannière en vedette sur l'accueil, fiche détail avec grande
+image, lecteur vidéo, et **téléchargement hors ligne (uniquement dans l'app)**.
+
+> ⚠️ **Les films ne s'affichent pas ?** L'URL de l'API dans `src/config.js`
+> (`API_BASE`) doit être joignable depuis le téléphone (voir §2). L'onglet
+> « Mon compte » propose un bouton **« Tester la connexion »** pour vérifier.
 
 ## 1. Prérequis
 
@@ -13,7 +17,7 @@ fiche détail avec grande image, lecteur vidéo, et **téléchargement hors lign
 
 ## 2. Configurer l'URL de l'API
 
-Édite `app.json` → `expo.extra.apiBase` (ou `src/config.js`) :
+Édite `src/config.js` → `API_BASE` :
 
 - **Émulateur Android** : `http://10.0.2.2:8000` (déjà configuré) — atteint le
   `localhost` de ta machine.

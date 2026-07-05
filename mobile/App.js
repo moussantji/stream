@@ -1,13 +1,15 @@
 import React from 'react';
-import { Text } from 'react-native';
+import { Text, TouchableOpacity } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
-import { NavigationContainer, DarkTheme } from '@react-navigation/native';
+import { NavigationContainer, DarkTheme, useNavigation } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 
 import HomeScreen from './src/screens/HomeScreen';
+import TrendingScreen from './src/screens/TrendingScreen';
 import SearchScreen from './src/screens/SearchScreen';
 import DownloadsScreen from './src/screens/DownloadsScreen';
+import AccountScreen from './src/screens/AccountScreen';
 import DetailScreen from './src/screens/DetailScreen';
 import WatchScreen from './src/screens/WatchScreen';
 import { colors } from './src/theme';
@@ -28,8 +30,19 @@ const navTheme = {
 };
 
 const tabIcon = (glyph) => ({ focused }) => (
-    <Text style={{ fontSize: 20, opacity: focused ? 1 : 0.55 }}>{glyph}</Text>
+    <Text style={{ fontSize: 20, opacity: focused ? 1 : 0.5 }}>{glyph}</Text>
 );
+
+function SearchButton() {
+    const navigation = useNavigation();
+    return (
+        <TouchableOpacity onPress={() => navigation.navigate('Search')} hitSlop={12} style={{ marginRight: 14 }}>
+            <Text style={{ fontSize: 20 }}>🔍</Text>
+        </TouchableOpacity>
+    );
+}
+
+const searchHeader = { headerRight: () => <SearchButton /> };
 
 function Tabs() {
     return (
@@ -37,14 +50,16 @@ function Tabs() {
             screenOptions={{
                 headerStyle: { backgroundColor: colors.header },
                 headerTintColor: colors.text,
-                tabBarStyle: { backgroundColor: colors.header, borderTopColor: colors.border },
+                tabBarStyle: { backgroundColor: colors.header, borderTopColor: colors.border, height: 62, paddingBottom: 8, paddingTop: 6 },
+                tabBarLabelStyle: { fontSize: 11, fontWeight: '600' },
                 tabBarActiveTintColor: colors.accent2,
                 tabBarInactiveTintColor: colors.dim,
             }}
         >
-            <Tab.Screen name="HomeTab" component={HomeScreen} options={{ title: 'MovieBox', tabBarLabel: 'Accueil', tabBarIcon: tabIcon('🏠') }} />
-            <Tab.Screen name="SearchTab" component={SearchScreen} options={{ title: 'Recherche', tabBarLabel: 'Recherche', tabBarIcon: tabIcon('🔍') }} />
-            <Tab.Screen name="DownloadsTab" component={DownloadsScreen} options={{ title: 'Téléchargements', tabBarLabel: 'Téléchargés', tabBarIcon: tabIcon('⬇️') }} />
+            <Tab.Screen name="HomeTab" component={HomeScreen} options={{ title: 'MovieBox', tabBarLabel: 'Accueil', tabBarIcon: tabIcon('🏠'), ...searchHeader }} />
+            <Tab.Screen name="TrendingTab" component={TrendingScreen} options={{ title: 'Tendance', tabBarLabel: 'Tendance', tabBarIcon: tabIcon('🔥'), ...searchHeader }} />
+            <Tab.Screen name="DownloadsTab" component={DownloadsScreen} options={{ title: 'Téléchargements', tabBarLabel: 'Téléchargements', tabBarIcon: tabIcon('⬇️') }} />
+            <Tab.Screen name="AccountTab" component={AccountScreen} options={{ title: 'Mon compte', tabBarLabel: 'Mon compte', tabBarIcon: tabIcon('👤') }} />
         </Tab.Navigator>
     );
 }
@@ -61,6 +76,7 @@ export default function App() {
                 }}
             >
                 <RootStack.Screen name="Tabs" component={Tabs} options={{ headerShown: false }} />
+                <RootStack.Screen name="Search" component={SearchScreen} options={{ title: 'Recherche' }} />
                 <RootStack.Screen name="Detail" component={DetailScreen} options={{ title: '', headerTransparent: true }} />
                 <RootStack.Screen name="Watch" component={WatchScreen} options={{ title: 'Lecture' }} />
             </RootStack.Navigator>

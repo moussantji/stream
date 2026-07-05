@@ -6,7 +6,7 @@ import PosterCard from '../components/PosterCard';
 import { colors } from '../theme';
 
 const TABS = [
-    { key: 'tendance', label: 'Tendance' },
+    { key: 'tendance', label: 'Pour toi' },
     { key: 'series', label: 'Séries TV' },
     { key: 'films', label: 'Film' },
 ];
