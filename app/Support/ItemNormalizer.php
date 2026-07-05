@@ -55,11 +55,15 @@ class ItemNormalizer
 
         $rating = self::floatOrNull($get('imdbRatingValue') ?? $get('imdbRate'));
 
+        $rawTitle = (string) ($get('title') ?? $raw['title'] ?? '');
+        $title = TextSanitizer::title($rawTitle !== '' ? $rawTitle : null);
+
         return [
             'subjectId' => (string) $subjectId,
             'subjectType' => $type,
             'typeLabel' => SubjectType::resolve($type)->label(),
-            'title' => TextSanitizer::title($get('title') ?? $raw['title'] ?? null),
+            'title' => $title,
+            'french' => self::hasFrenchAudio($raw, $subject, $rawTitle.' '.$title),
             'description' => TextSanitizer::description($get('description')),
             'cover' => self::cover($raw, $subject),
             'genres' => self::genres($get('genre')),
@@ -91,6 +95,47 @@ class ItemNormalizer
         }
 
         return null;
+    }
+
+    /**
+     * Whether the title appears to have a French audio track (for the "VF"
+     * badge): French markers in the title, a French language field, or a
+     * French entry in a dubs list.
+     *
+     * @param  array<string,mixed>  $raw
+     * @param  array<string,mixed>  $subject
+     */
+    protected static function hasFrenchAudio(array $raw, array $subject, string $title): bool
+    {
+        $t = mb_strtolower($title);
+        if (str_contains($t, 'français') || str_contains($t, 'française') || str_contains($t, 'francaise')
+            || str_contains($t, 'version fr') || preg_match('/(?<![\p{L}])(vf|vff|truefrench|multi)(?![\p{L}])/u', $t)) {
+            return true;
+        }
+
+        foreach (['language', 'lang', 'lanCode', 'audioLang', 'lanName'] as $key) {
+            $v = mb_strtolower((string) ($raw[$key] ?? $subject[$key] ?? ''));
+            if ($v === 'fr' || $v === 'fra' || $v === 'fre' || str_starts_with($v, 'fr-')
+                || str_contains($v, 'french') || str_contains($v, 'français')) {
+                return true;
+            }
+        }
+
+        $dubs = $raw['dubs'] ?? $subject['dubs'] ?? null;
+        if (is_array($dubs)) {
+            foreach ($dubs as $dub) {
+                if (! is_array($dub)) {
+                    continue;
+                }
+                $code = mb_strtolower((string) ($dub['lanCode'] ?? $dub['code'] ?? ''));
+                $name = mb_strtolower((string) ($dub['lanName'] ?? $dub['label'] ?? ''));
+                if (str_starts_with($code, 'fr') || str_contains($name, 'fran') || str_contains($name, 'french')) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     /**

@@ -63,6 +63,7 @@ export function card(item, opts = {}) {
     const posterWrap = el('div', { class: 'card-poster' }, [
         poster,
         el('div', { class: 'card-type', text: item.typeLabel || '' }),
+        item.french ? el('div', { class: 'card-fr', title: 'Audio français disponible' }, [el('span', { text: 'VF' })]) : null,
         el('div', { class: 'card-play' }, [el('span', { html: PLAY_ICON })]),
     ]);
 

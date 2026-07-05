@@ -154,42 +154,98 @@ function onReachBottom(sentinel, cb) {
     return observer;
 }
 
-// Generic paginated grid with INFINITE SCROLL (auto-loads the next page when
-// the user nears the bottom). fetchPage(page) -> { items, pager: { hasMore } }.
-function paginatedGrid(container, fetchPage, { emptyMsg = 'Rien à afficher.' } = {}) {
+// Paginated grid with ADVANCED client-side filters (genre / year / min rating /
+// sort) + INFINITE SCROLL. fetchPage(page) -> { items, pager: { hasMore } }.
+function filterableGrid(container, fetchPage, { emptyMsg = 'Rien à afficher.' } = {}) {
+    const genreSel = el('select', { class: 'select' }, [el('option', { value: '', text: 'Tous les genres' })]);
+    const yearSel = el('select', { class: 'select' }, [el('option', { value: '', text: 'Toutes les années' })]);
+    const ratingSel = el('select', { class: 'select' }, [
+        el('option', { value: '', text: 'Note : toutes' }),
+        el('option', { value: '5', text: '5+' }),
+        el('option', { value: '6', text: '6+' }),
+        el('option', { value: '7', text: '7+' }),
+        el('option', { value: '8', text: '8+' }),
+    ]);
+    const sortSel = el('select', { class: 'select' }, [
+        el('option', { value: 'relevance', text: 'Par défaut' }),
+        el('option', { value: 'rating', text: 'Mieux notés' }),
+        el('option', { value: 'rating_asc', text: 'Moins bien notés' }),
+        el('option', { value: 'year_desc', text: 'Plus récents' }),
+        el('option', { value: 'year_asc', text: 'Plus anciens' }),
+        el('option', { value: 'title', text: 'Titre (A→Z)' }),
+        el('option', { value: 'title_desc', text: 'Titre (Z→A)' }),
+    ]);
+    container.appendChild(el('div', { class: 'filter-bar' }, [
+        el('label', { class: 'filter' }, [el('span', { text: 'Genre' }), genreSel]),
+        el('label', { class: 'filter' }, [el('span', { text: 'Année' }), yearSel]),
+        el('label', { class: 'filter' }, [el('span', { text: 'Note min.' }), ratingSel]),
+        el('label', { class: 'filter' }, [el('span', { text: 'Trier' }), sortSel]),
+    ]));
+
     const gridWrap = el('div', {}, [loadingState()]);
     const sentinel = el('div', { class: 'infinite-sentinel' });
     container.appendChild(gridWrap);
     container.appendChild(sentinel);
 
     let page = 1;
-    let gridEl = null;
     let loading = false;
     let done = false;
     let observer = null;
+    let all = [];
 
     const stop = () => { done = true; if (observer) { observer.disconnect(); observer = null; } clear(sentinel); };
+
+    const populateFilters = () => {
+        const genres = new Set();
+        const years = new Set();
+        all.forEach((it) => { (it.genres || []).forEach((g) => genres.add(g)); if (it.year) years.add(it.year); });
+
+        const kg = genreSel.value;
+        clear(genreSel);
+        genreSel.appendChild(el('option', { value: '', text: 'Tous les genres' }));
+        [...genres].sort((a, b) => a.localeCompare(b)).forEach((g) => genreSel.appendChild(el('option', { value: g, text: g })));
+        genreSel.value = kg;
+
+        const ky = yearSel.value;
+        clear(yearSel);
+        yearSel.appendChild(el('option', { value: '', text: 'Toutes les années' }));
+        [...years].sort((a, b) => b - a).forEach((y) => yearSel.appendChild(el('option', { value: String(y), text: String(y) })));
+        yearSel.value = ky;
+    };
+
+    const render = () => {
+        let items = all.slice();
+        if (genreSel.value) items = items.filter((it) => (it.genres || []).includes(genreSel.value));
+        if (yearSel.value) items = items.filter((it) => String(it.year) === yearSel.value);
+        if (ratingSel.value) items = items.filter((it) => (it.imdbRating || 0) >= parseFloat(ratingSel.value));
+
+        switch (sortSel.value) {
+            case 'rating': items.sort((a, b) => (b.imdbRating || 0) - (a.imdbRating || 0)); break;
+            case 'rating_asc': items.sort((a, b) => (a.imdbRating || 0) - (b.imdbRating || 0)); break;
+            case 'year_desc': items.sort((a, b) => (b.year || 0) - (a.year || 0)); break;
+            case 'year_asc': items.sort((a, b) => (a.year || 0) - (b.year || 0)); break;
+            case 'title': items.sort((a, b) => (a.title || '').localeCompare(b.title || '')); break;
+            case 'title_desc': items.sort((a, b) => (b.title || '').localeCompare(a.title || '')); break;
+            default: break;
+        }
+
+        clear(gridWrap);
+        if (!all.length) gridWrap.appendChild(emptyState(emptyMsg));
+        else gridWrap.appendChild(items.length ? grid(items) : emptyState('Aucun résultat avec ces filtres.'));
+    };
+
+    [genreSel, yearSel, ratingSel, sortSel].forEach((s) => { s.onchange = render; });
 
     const load = async () => {
         if (loading || done) return;
         loading = true;
         clear(sentinel);
         sentinel.appendChild(el('div', { class: 'infinite-loader' }, [el('div', { class: 'spinner' })]));
-
         try {
             const data = await fetchPage(page);
-            const items = data.items || [];
-
-            if (!items.length && page === 1) {
-                clear(gridWrap);
-                gridWrap.appendChild(emptyState(emptyMsg));
-                stop();
-                return;
-            }
-
-            if (!gridEl) { gridEl = grid(items); clear(gridWrap); gridWrap.appendChild(gridEl); }
-            else items.forEach((it) => gridEl.appendChild(card(it)));
-
+            all = all.concat(data.items || []);
+            populateFilters();
+            render();
             page += 1;
             clear(sentinel);
             if (!data.pager || !data.pager.hasMore) stop();
@@ -210,15 +266,15 @@ export async function trendingPage(app, title = 'Les plus regardés') {
     clear(app);
     const container = el('div', { class: 'container' }, [el('h2', { class: 'section-title', text: title })]);
     app.appendChild(container);
-    paginatedGrid(container, (page) => api.trending(page), { emptyMsg: 'Rien à afficher pour le moment.' });
+    filterableGrid(container, (page) => api.trending(page), { emptyMsg: 'Rien à afficher pour le moment.' });
 }
 
-// ---------- CATEGORY (Films / Séries / Animation) ----------
+// ---------- CATEGORY (Films / Séries) ----------
 export async function categoryPage(app, tab, title) {
     clear(app);
     const container = el('div', { class: 'container' }, [el('h2', { class: 'section-title', text: title })]);
     app.appendChild(container);
-    paginatedGrid(container, (page) => api.category(tab, page), { emptyMsg: 'Aucun contenu pour le moment.' });
+    filterableGrid(container, (page) => api.category(tab, page), { emptyMsg: 'Aucun contenu pour le moment.' });
 }
 
 // ---------- LOCAL CATALOG (MySQL) ----------
@@ -373,114 +429,21 @@ export async function searchPage(app, params) {
     container.appendChild(el('h2', { class: 'section-title', text: `Résultats pour « ${q} »` }));
 
     // Type filter (server-side): switching reloads the query.
-    const typeTabs = el('div', { class: 'season-tabs' }, [['all', 'Tous'], ['movies', 'Films'], ['tv-series', 'Séries']].map(([t, label]) =>
+    container.appendChild(el('div', { class: 'season-tabs' }, [['all', 'Tous'], ['movies', 'Films'], ['tv-series', 'Séries']].map(([t, label]) =>
         el('button', {
             class: `season-tab ${t === type ? 'active' : ''}`,
             text: label,
             onclick: () => navigate(`/search?q=${encodeURIComponent(q)}&type=${t}`),
-        })));
-    container.appendChild(typeTabs);
-
-    // Client-side refinement filters (genre / year / sort).
-    const genreSel = el('select', { class: 'select' }, [el('option', { value: '', text: 'Tous les genres' })]);
-    const yearSel = el('select', { class: 'select' }, [el('option', { value: '', text: 'Toutes les années' })]);
-    const sortSel = el('select', { class: 'select' }, [
-        el('option', { value: 'relevance', text: 'Pertinence' }),
-        el('option', { value: 'rating', text: 'Mieux notés' }),
-        el('option', { value: 'year_desc', text: 'Plus récents' }),
-        el('option', { value: 'year_asc', text: 'Plus anciens' }),
-        el('option', { value: 'title', text: 'Titre (A→Z)' }),
-    ]);
-    const filterBar = el('div', { class: 'filter-bar' }, [
-        el('label', { class: 'filter' }, [el('span', { text: 'Genre' }), genreSel]),
-        el('label', { class: 'filter' }, [el('span', { text: 'Année' }), yearSel]),
-        el('label', { class: 'filter' }, [el('span', { text: 'Trier' }), sortSel]),
-    ]);
-    container.appendChild(filterBar);
-
-    const gridWrap = el('div', {}, [loadingState('Recherche…')]);
-    const sentinel = el('div', { class: 'infinite-sentinel' });
-    container.appendChild(gridWrap);
-    container.appendChild(sentinel);
+        }))));
 
     if (!q) {
-        clear(gridWrap);
-        gridWrap.appendChild(emptyState('Saisis un mot-clé pour lancer une recherche.'));
+        container.appendChild(emptyState('Saisis un mot-clé pour lancer une recherche.'));
         return;
     }
 
-    let page = 1;
-    let loading = false;
-    let done = false;
-    let observer = null;
-    let all = [];
-
-    const stop = () => { done = true; if (observer) { observer.disconnect(); observer = null; } clear(sentinel); };
-
-    const populateFilters = () => {
-        const genres = new Set();
-        const years = new Set();
-        all.forEach((it) => { (it.genres || []).forEach((g) => genres.add(g)); if (it.year) years.add(it.year); });
-
-        const keepG = genreSel.value;
-        clear(genreSel);
-        genreSel.appendChild(el('option', { value: '', text: 'Tous les genres' }));
-        [...genres].sort((a, b) => a.localeCompare(b)).forEach((g) => genreSel.appendChild(el('option', { value: g, text: g })));
-        genreSel.value = keepG;
-
-        const keepY = yearSel.value;
-        clear(yearSel);
-        yearSel.appendChild(el('option', { value: '', text: 'Toutes les années' }));
-        [...years].sort((a, b) => b - a).forEach((y) => yearSel.appendChild(el('option', { value: String(y), text: String(y) })));
-        yearSel.value = keepY;
-    };
-
-    const render = () => {
-        let items = all.slice();
-        if (genreSel.value) items = items.filter((it) => (it.genres || []).includes(genreSel.value));
-        if (yearSel.value) items = items.filter((it) => String(it.year) === yearSel.value);
-
-        switch (sortSel.value) {
-            case 'rating': items.sort((a, b) => (b.imdbRating || 0) - (a.imdbRating || 0)); break;
-            case 'year_desc': items.sort((a, b) => (b.year || 0) - (a.year || 0)); break;
-            case 'year_asc': items.sort((a, b) => (a.year || 0) - (b.year || 0)); break;
-            case 'title': items.sort((a, b) => (a.title || '').localeCompare(b.title || '')); break;
-            default: break;
-        }
-
-        clear(gridWrap);
-        if (!all.length) {
-            gridWrap.appendChild(emptyState('Aucun résultat pour cette recherche.', 'Essaie un autre mot-clé ou un autre type.'));
-        } else {
-            gridWrap.appendChild(items.length ? grid(items) : emptyState('Aucun résultat avec ces filtres.'));
-        }
-    };
-
-    [genreSel, yearSel, sortSel].forEach((sel) => { sel.onchange = render; });
-
-    const load = async () => {
-        if (loading || done) return;
-        loading = true;
-        clear(sentinel);
-        sentinel.appendChild(el('div', { class: 'infinite-loader' }, [el('div', { class: 'spinner' })]));
-        try {
-            const data = await api.search(q, type, page);
-            all = all.concat(data.items || []);
-            populateFilters();
-            render();
-            page += 1;
-            clear(sentinel);
-            if (!data.pager || !data.pager.hasMore) stop();
-        } catch (e) {
-            clear(sentinel);
-            sentinel.appendChild(errorState(e.message, () => { loading = false; load(); }));
-        } finally {
-            loading = false;
-        }
-    };
-
-    observer = onReachBottom(sentinel, load);
-    await load();
+    // Search is intentionally NOT content-filtered server-side, so hidden
+    // categories (sex/animation) remain reachable here.
+    filterableGrid(container, (page) => api.search(q, type, page), { emptyMsg: 'Aucun résultat pour cette recherche.' });
 }
 
 // ---------- DETAIL ----------

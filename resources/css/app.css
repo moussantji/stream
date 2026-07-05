@@ -176,6 +176,14 @@ video.hero-bg { pointer-events: none; }
 .card-poster img { width: 100%; height: 100%; object-fit: cover; }
 .card-poster .ph { width:100%; height:100%; display:grid; place-items:center; color:var(--text-dim); font-size:12px; }
 .card-type { position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,.65); border-radius: 6px; padding: 2px 8px; font-size: 11px; font-weight: 700; }
+.card-fr {
+    position: absolute; top: 8px; right: 8px; display: flex; align-items: center; gap: 5px;
+    background: rgba(0,0,0,.72); border-radius: 6px; padding: 3px 7px; font-size: 11px; font-weight: 800; letter-spacing: .04em;
+}
+.card-fr::before {
+    content: ''; width: 14px; height: 10px; border-radius: 2px;
+    background: linear-gradient(to right, #0055A4 0 33%, #fff 33% 66%, #EF4135 66% 100%);
+}
 .card-play { position: absolute; inset: 0; display: grid; place-items: center; background: rgba(0,0,0,.35); opacity: 0; transition: opacity .18s; }
 .card:hover .card-play { opacity: 1; }
 .card-play span { width: 52px; height: 52px; border-radius: 50%; background: rgba(229,9,20,.92); display: grid; place-items: center; }

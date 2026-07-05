@@ -62,7 +62,9 @@ return [
         fn ($w) => mb_strtolower(trim($w)),
         explode(',', (string) env(
             'MOVIEBOX_BLOCKED_KEYWORDS',
-            'hentai,ecchi,yaoi,yuri,hardcore,porn,porno,pornographic,xxx,x-rated,erotic,erotique,erotica,nsfw,adult,18+,gay,lgbt,lgbtq,lesbian,lesbienne,homosexual,homosexuel,homosexuelle,queer,bara'
+            'hentai,ecchi,yaoi,yuri,hardcore,porn,porno,pornographic,xxx,x-rated,erotic,erotique,erotica,nsfw,adult,18+,'
+            .'sex,sexe,sexuel,sexuelle,sexual,gay,lgbt,lgbtq,lesbian,lesbienne,homosexual,homosexuel,homosexuelle,queer,bara,'
+            .'animation,anime,animated,cartoon,dessin animé,dessin anime'
         ))
     ))),
 
