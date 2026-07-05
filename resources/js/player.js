@@ -4,6 +4,18 @@
 import { api } from './api.js';
 import { el } from './ui.js';
 
+const isHevcSource = (s) => !!s && /hevc|265/i.test(String(s.codec || ''));
+
+// Apple's AVFoundation (Safari on iOS/macOS) only renders HEVC tagged `hvc1`;
+// MovieBox ships `hev1` (audio plays, no picture). Firefox/Chrome/Android
+// tolerate `hev1`, so only Safari needs the server-side hvc1 remux.
+function appleNeedsRemux() {
+    const ua = navigator.userAgent;
+    const isiOS = /iP(hone|od|ad)/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
+    const isSafari = /Safari/.test(ua) && !/(Chrome|Chromium|Android|Edg|OPR|Firefox|CriOS|FxiOS)/.test(ua);
+    return isiOS || isSafari;
+}
+
 let hlsModule = null;
 async function loadHls() {
     if (!hlsModule) {
@@ -133,6 +145,12 @@ export class Player {
         v.addEventListener('waiting', () => { this.spinner.hidden = false; });
         v.addEventListener('playing', () => { this.spinner.hidden = true; });
         v.addEventListener('canplay', () => { this.spinner.hidden = true; });
+        v.addEventListener('error', () => this.onVideoError());
+        // Playing HEVC on Safari can succeed for audio while the picture never
+        // decodes (videoWidth stays 0) -> retry through the hvc1 remux.
+        v.addEventListener('loadeddata', () => {
+            if (v.videoWidth === 0 && v.videoHeight === 0) this.onVideoError();
+        });
         v.addEventListener('timeupdate', () => this.updateProgress());
         v.addEventListener('progress', () => this.updateProgress());
         v.addEventListener('loadedmetadata', () => this.updateProgress());
@@ -235,11 +253,11 @@ export class Player {
         if (this.currentSources.length > 1) {
             menu.appendChild(el('div', { class: 'vp-menu-title', text: 'Qualité' }));
             this.currentSources.forEach((s) => {
-                const active = v.currentSrc === s.url;
+                const active = this._activeSource && this._activeSource.url === s.url;
                 menu.appendChild(el('button', {
                     class: `vp-menu-item ${active ? 'active' : ''}`,
                     text: s.quality || (s.resolution ? s.resolution + 'p' : 'auto'),
-                    onclick: () => { this.setMp4(s.url); this.menu.hidden = true; },
+                    onclick: () => { this.setMp4(s); this.menu.hidden = true; },
                 }));
             });
         }
@@ -264,7 +282,7 @@ export class Player {
         this.currentSources = sources;
 
         if (sources.length) {
-            this.setMp4(sources[0].url);
+            this.setMp4(sources[0]);
         } else if (hls.length) {
             await this.setHls(hls[0]);
         } else if (dash.length) {
@@ -291,8 +309,26 @@ export class Player {
         }
     }
 
-    setMp4(url) {
+    // Resolve the best URL for an MP4 source: on Safari, HEVC is routed through
+    // the hvc1 remux so the picture renders (audio-only otherwise).
+    mp4UrlFor(source) {
+        if (source && source.remux && isHevcSource(source) && appleNeedsRemux()) {
+            return source.remux;
+        }
+        return source ? source.url : null;
+    }
+
+    setMp4(source) {
+        // Accept either a source object or a bare URL string (back-compat).
+        if (typeof source === 'string') source = { url: source };
         this.destroyHls();
+        this._activeSource = source;
+        const url = this.mp4UrlFor(source);
+        this._triedRemux = !!(source && source.remux && url === source.remux);
+        this._setSrc(url);
+    }
+
+    _setSrc(url) {
         const t = this.video.currentTime;
         const wasPlaying = !this.video.paused;
         this.video.src = url;
@@ -300,6 +336,16 @@ export class Player {
             if (t) this.video.currentTime = t;
             if (wasPlaying) this.play();
         }, { once: true });
+    }
+
+    // If a direct HEVC source fails to render (error, or metadata loaded but no
+    // video track), fall back once to the server-side hvc1 remux.
+    onVideoError() {
+        const s = this._activeSource;
+        if (s && s.remux && !this._triedRemux) {
+            this._triedRemux = true;
+            this._setSrc(s.remux);
+        }
     }
 
     async setHls(url) {
