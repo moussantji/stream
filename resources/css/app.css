@@ -188,6 +188,28 @@ video.hero-bg { pointer-events: none; }
     content: ''; width: 14px; height: 10px; border-radius: 2px;
     background: linear-gradient(to right, #0055A4 0 33%, #fff 33% 66%, #EF4135 66% 100%);
 }
+.card-rating {
+    position: absolute; bottom: 8px; left: 8px;
+    background: rgba(0,0,0,.75); border-radius: 5px; padding: 2px 7px;
+    font-size: 11px; font-weight: 800; color: #f5c518;
+}
+
+/* MovieBox-style category strip on the home page. */
+.home-tabs {
+    display: flex; gap: 22px; overflow-x: auto; scrollbar-width: none;
+    padding: 14px clamp(16px, 4vw, 48px) 0;
+    max-width: 1600px; margin: 0 auto;
+}
+.home-tabs::-webkit-scrollbar { display: none; }
+.home-tab {
+    position: relative; color: var(--text-dim); font-weight: 700; font-size: 17px;
+    white-space: nowrap; padding: 4px 0 10px;
+}
+.home-tab.active { color: var(--text); }
+.home-tab.active::after {
+    content: ''; position: absolute; left: 0; right: 0; bottom: 0; height: 3px;
+    background: var(--accent); border-radius: 3px;
+}
 .card-play { position: absolute; inset: 0; display: grid; place-items: center; background: rgba(0,0,0,.35); opacity: 0; transition: opacity .18s; }
 .card:hover .card-play { opacity: 1; }
 .card-play span { width: 52px; height: 52px; border-radius: 50%; background: rgba(229,9,20,.92); display: grid; place-items: center; }

@@ -64,6 +64,7 @@ export function card(item, opts = {}) {
         poster,
         el('div', { class: 'card-type', text: item.typeLabel || '' }),
         item.french ? el('div', { class: 'card-fr', title: 'Audio français disponible' }, [el('span', { text: 'VF' })]) : null,
+        item.imdbRating ? el('div', { class: 'card-rating' }, [el('span', { text: `★ ${item.imdbRating}` })]) : null,
         el('div', { class: 'card-play' }, [el('span', { html: PLAY_ICON })]),
     ]);
 
@@ -75,7 +76,6 @@ export function card(item, opts = {}) {
 
     const sub = [];
     if (item.year) sub.push(el('span', { text: String(item.year) }));
-    if (item.imdbRating) sub.push(el('span', { class: 'rating', text: `★ ${item.imdbRating}` }));
 
     return el('div', {
         class: 'card',

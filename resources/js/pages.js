@@ -76,6 +76,14 @@ export async function homePage(app) {
         return;
     }
 
+    // MovieBox-style category strip at the very top.
+    const catTabs = [['/', 'Tendance'], ['/tv', 'Live'], ['/series', 'Séries TV'], ['/films', 'Film']];
+    app.appendChild(el('div', { class: 'home-tabs' }, catTabs.map(([href, label]) =>
+        el('a', {
+            class: `home-tab ${window.location.pathname === href ? 'active' : ''}`,
+            href, 'data-link': '', 'data-nav': href, text: label,
+        }))));
+
     const heroItem = (sections[0]?.items || trending)[0];
     if (heroItem) {
         const heroNode = hero(heroItem);
