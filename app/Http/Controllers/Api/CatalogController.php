@@ -42,6 +42,18 @@ class CatalogController extends Controller
             fn () => ['sections' => $this->buildHomeSections()],
         );
 
+        // Filter at serve time (cache stores unfiltered data) so admin blocklist
+        // / keyword changes hide titles immediately.
+        $sections = [];
+        foreach (($data['sections'] ?? []) as $section) {
+            $items = ContentFilter::apply($section['items'] ?? []);
+            if ($items !== []) {
+                $section['items'] = $items;
+                $sections[] = $section;
+            }
+        }
+        $data['sections'] = $sections;
+
         return response()->json(['data' => $data]);
     }
 
@@ -60,7 +72,7 @@ class CatalogController extends Controller
                     $res = $this->client->search($query, $type->value, $page, 20);
 
                     return [
-                        'items' => ContentFilter::apply(ItemNormalizer::many($res['items'] ?? [])),
+                        'items' => ItemNormalizer::many($res['items'] ?? []),
                         'pager' => $this->pager($res, $page, 20),
                     ];
                 } catch (\Throwable $e) {
@@ -70,6 +82,8 @@ class CatalogController extends Controller
                 }
             },
         );
+
+        $data['items'] = ContentFilter::apply($data['items'] ?? []);
 
         return response()->json(['data' => $data]);
     }
@@ -89,6 +103,7 @@ class CatalogController extends Controller
 
         // Title is static; ensure it is present even when served from an old snapshot.
         $data['title'] = $config['title'];
+        $data['items'] = ContentFilter::apply($data['items'] ?? []);
 
         return response()->json(['data' => $data]);
     }
@@ -226,15 +241,15 @@ class CatalogController extends Controller
     public function discover(): JsonResponse
     {
         $data = $this->repo->remember('catalog:discover', $this->ttl(), function () {
-            $movies = $this->flattenTab(2);
-            $series = $this->flattenTab(5);
-
             return [
-                'popular' => array_map(fn ($i) => $i['title'], array_slice($movies, 0, 10)),
-                'hotMovies' => $movies,
-                'hotSeries' => $series,
+                'hotMovies' => $this->flattenTab(2),
+                'hotSeries' => $this->flattenTab(5),
             ];
         });
+
+        $data['hotMovies'] = ContentFilter::apply($data['hotMovies'] ?? []);
+        $data['hotSeries'] = ContentFilter::apply($data['hotSeries'] ?? []);
+        $data['popular'] = array_map(fn ($i) => $i['title'], array_slice($data['hotMovies'], 0, 10));
 
         return response()->json(['data' => $data]);
     }
@@ -261,6 +276,10 @@ class CatalogController extends Controller
             fn () => $this->buildDetail($validated),
             isEmpty: fn ($d) => empty($d['item']),
         );
+
+        if (! empty($data['recommendations'])) {
+            $data['recommendations'] = ContentFilter::apply($data['recommendations']);
+        }
 
         return response()->json(['data' => $data]);
     }
@@ -318,7 +337,8 @@ class CatalogController extends Controller
         try {
             $data = $this->client->search($query, $subjectType, 1, $perPage);
 
-            return ContentFilter::apply(ItemNormalizer::many($data['items'] ?? []));
+            // Unfiltered here; discovery surfaces apply ContentFilter at serve time.
+            return ItemNormalizer::many($data['items'] ?? []);
         } catch (\Throwable $e) {
             report($e);
 
@@ -373,7 +393,7 @@ class CatalogController extends Controller
         // suggests the next page likely has more (the tab endpoint exposes no
         // reliable total).
         return [
-            'items' => ContentFilter::apply($items),
+            'items' => $items, // filtered at serve time
             'pager' => ['page' => $page, 'hasMore' => $rawCount >= 10],
         ];
     }
@@ -421,7 +441,7 @@ class CatalogController extends Controller
                 $rawItems = $block['banner']['banners'];
             }
 
-            $items = ContentFilter::apply(ItemNormalizer::many(is_array($rawItems) ? $rawItems : []));
+            $items = ItemNormalizer::many(is_array($rawItems) ? $rawItems : []);
             if ($items !== []) {
                 $sections[] = ['title' => $block['title'] ?? 'Featured', 'items' => $items];
             }
