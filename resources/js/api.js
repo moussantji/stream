@@ -140,6 +140,9 @@ export const api = {
     adminStats: () => unwrap(request('admin/stats')),
     adminImport: (pages = 15) => unwrap(request('admin/import', { method: 'POST', body: { pages } })),
     exportLinks: (params) => downloadFile('admin/export-links', params, 'moviebox-links.txt'),
+    adminBlockedTitles: () => unwrap(request('admin/blocked-titles')),
+    adminAddBlockedTitle: (term) => unwrap(request('admin/blocked-titles', { method: 'POST', body: { term } })),
+    adminDeleteBlockedTitle: (id) => request(`admin/blocked-titles/${id}`, { method: 'DELETE' }),
 
     // ---- Library ----
     favorites: () => unwrap(request('favorites')),

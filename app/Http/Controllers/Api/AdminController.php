@@ -3,12 +3,15 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\BlockedTitle;
 use App\Models\CatalogItem;
 use App\Services\Catalog\CatalogExporter;
 use App\Services\MovieBox\SubjectType;
+use App\Support\ContentFilter;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\Cache;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 
 class AdminController extends Controller
@@ -107,6 +110,41 @@ class AdminController extends Controller
             'message' => "Import lancé en arrière-plan ({$pages} pages par catégorie). Recharge la page dans quelques minutes pour voir le total augmenter.",
             'pages' => $pages,
         ]]);
+    }
+
+    // -----------------------------------------------------------------
+    // Blocked titles (hidden from discovery, still reachable via search)
+    // -----------------------------------------------------------------
+
+    public function blockedTitles(Request $request): JsonResponse
+    {
+        $this->authorizeAdmin($request);
+
+        return response()->json(['data' => BlockedTitle::orderBy('term')->get(['id', 'term'])]);
+    }
+
+    public function addBlockedTitle(Request $request): JsonResponse
+    {
+        $this->authorizeAdmin($request);
+
+        $validated = $request->validate([
+            'term' => ['required', 'string', 'min:2', 'max:200'],
+        ]);
+
+        $entry = BlockedTitle::firstOrCreate(['term' => trim($validated['term'])]);
+        Cache::forget(ContentFilter::BLOCKED_CACHE_KEY);
+
+        return response()->json(['data' => $entry->only('id', 'term')], 201);
+    }
+
+    public function deleteBlockedTitle(Request $request, int $id): JsonResponse
+    {
+        $this->authorizeAdmin($request);
+
+        BlockedTitle::whereKey($id)->delete();
+        Cache::forget(ContentFilter::BLOCKED_CACHE_KEY);
+
+        return response()->json(['data' => ['deleted' => true]]);
     }
 
     protected function authorizeAdmin(Request $request): void

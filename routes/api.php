@@ -67,4 +67,8 @@ Route::middleware('auth:sanctum')->prefix('admin')->group(function () {
     Route::get('stats', [AdminController::class, 'stats']);
     Route::get('export-links', [AdminController::class, 'exportLinks']);
     Route::post('import', [AdminController::class, 'import']);
+
+    Route::get('blocked-titles', [AdminController::class, 'blockedTitles']);
+    Route::post('blocked-titles', [AdminController::class, 'addBlockedTitle']);
+    Route::delete('blocked-titles/{id}', [AdminController::class, 'deleteBlockedTitle']);
 });

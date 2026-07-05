@@ -445,6 +445,10 @@ video.hero-bg { pointer-events: none; }
 .admin-hint { color: var(--text-dim); font-size: 13px; margin: 0 0 16px; line-height: 1.5; }
 .admin-controls { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-end; }
 .admin-status { color: var(--text-dim); font-size: 14px; margin: 14px 0 0; min-height: 1em; }
+.blocked-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.blocked-item { display: flex; align-items: center; gap: 8px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 999px; padding: 6px 6px 6px 14px; font-size: 13px; }
+.blocked-x { background: transparent; border: none; color: var(--accent-2); font-weight: 800; width: 22px; height: 22px; border-radius: 50%; }
+.blocked-x:hover { background: rgba(255,61,71,.15); }
 
 /* ---------------- Live TV channels ---------------- */
 .channel-grid {

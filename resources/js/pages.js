@@ -912,6 +912,53 @@ export async function adminPage(app) {
         ]),
         status,
     ]));
+
+    // --- Titres masqués (hors recherche) ---
+    const blockedListWrap = el('div', { class: 'blocked-list' });
+    const blockedInput = el('input', { class: 'select', type: 'text', placeholder: 'Nom du film/série (ou subjectId)', style: 'flex:1;min-width:220px' });
+    const blockedStatus = el('p', { class: 'admin-status' });
+
+    const renderBlocked = (list) => {
+        clear(blockedListWrap);
+        if (!list.length) {
+            blockedListWrap.appendChild(el('p', { class: 'admin-hint', text: 'Aucun titre masqué pour l\'instant.' }));
+            return;
+        }
+        list.forEach((b) => {
+            blockedListWrap.appendChild(el('div', { class: 'blocked-item' }, [
+                el('span', { text: b.term }),
+                el('button', {
+                    class: 'blocked-x', text: '✕', title: 'Retirer',
+                    onclick: async () => {
+                        try { await api.adminDeleteBlockedTitle(b.id); loadBlocked(); }
+                        catch (e) { blockedStatus.textContent = e.message; }
+                    },
+                }),
+            ]));
+        });
+    };
+    const loadBlocked = async () => {
+        try { renderBlocked(await api.adminBlockedTitles()); }
+        catch (e) { blockedStatus.textContent = e.message; }
+    };
+    const addBlocked = async () => {
+        const term = blockedInput.value.trim();
+        if (term.length < 2) { blockedStatus.textContent = 'Saisis au moins 2 caractères.'; return; }
+        blockedStatus.textContent = '';
+        try { await api.adminAddBlockedTitle(term); blockedInput.value = ''; loadBlocked(); }
+        catch (e) { blockedStatus.textContent = e.message; }
+    };
+    blockedInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') addBlocked(); });
+
+    body.appendChild(el('div', { class: 'admin-panel' }, [
+        el('h3', { text: 'Titres masqués (hors recherche)' }),
+        el('p', { class: 'admin-hint', text: "Ces titres n'apparaissent plus sur l'accueil, les catégories, les tendances ni les suggestions — mais restent trouvables via la recherche. Correspondance par nom (contient) ou par subjectId exact." }),
+        el('div', { class: 'admin-controls' }, [blockedInput, el('button', { class: 'btn btn-primary', text: 'Masquer', onclick: addBlocked })]),
+        blockedStatus,
+        blockedListWrap,
+    ]));
+
+    loadBlocked();
 }
 
 // ---------- LIBRARY ----------
