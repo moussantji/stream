@@ -17,6 +17,9 @@ export default function PosterCard({ item, onPress, width = 120 }) {
                 {item.french ? (
                     <View style={styles.fr}><Text style={styles.frText}>VF</Text></View>
                 ) : null}
+                {item.imdbRating ? (
+                    <View style={styles.rating}><Text style={styles.ratingText}>★ {item.imdbRating}</Text></View>
+                ) : null}
             </View>
             <Text numberOfLines={2} style={styles.title}>{item.title}</Text>
         </TouchableOpacity>
@@ -34,4 +37,9 @@ const styles = StyleSheet.create({
         backgroundColor: 'rgba(0,0,0,0.72)', borderRadius: 5, paddingHorizontal: 6, paddingVertical: 2,
     },
     frText: { color: '#fff', fontSize: 10, fontWeight: '800', letterSpacing: 0.5 },
+    rating: {
+        position: 'absolute', bottom: 6, left: 6,
+        backgroundColor: 'rgba(0,0,0,0.75)', borderRadius: 5, paddingHorizontal: 6, paddingVertical: 2,
+    },
+    ratingText: { color: '#f5c518', fontSize: 10, fontWeight: '800' },
 });

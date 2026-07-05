@@ -21,6 +21,7 @@ async function get(path, params) {
 export const api = {
     home: () => get('/api/home'),
     trending: (page = 1) => get('/api/trending', { page }),
+    category: (tab, page = 1) => get('/api/category', { tab, page }),
     search: (q, type = 'all', page = 1) => get('/api/search', { q, type, page }),
     detail: (item) => get('/api/detail', {
         subjectId: item.subjectId,
