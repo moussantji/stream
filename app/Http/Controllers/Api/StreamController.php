@@ -585,15 +585,22 @@ class StreamController extends Controller
             }
 
             $resolution = (int) ($file['resolution'] ?? 0);
-            $sources[] = [
+            $codec = $file['codecName'] ?? null;
+            $source = [
                 'url' => $url,
                 'resolution' => $resolution,
                 'quality' => $resolution > 0 ? $resolution.'p' : 'auto',
                 'size' => isset($file['size']) ? (int) $file['size'] : null,
                 'format' => $this->extFromUrl($url),
-                'codec' => $file['codecName'] ?? null,
+                'codec' => $codec,
                 'durationSeconds' => isset($file['duration']) ? (int) $file['duration'] : null,
             ];
+            // iOS-friendly playback URL for HEVC: routed through the remux proxy
+            // that retags hev1 -> hvc1 so AVPlayer renders the picture.
+            if ($this->isHevc($codec) && is_string($url) && $this->remuxEnabled()) {
+                $source['remux'] = $this->remuxUrl($url);
+            }
+            $sources[] = $source;
         }
 
         // Deduplicate by resolution, preferring H.264 (avc) over HEVC/H.265 for
@@ -625,6 +632,100 @@ class StreamController extends Controller
     protected function isHevc(?string $codec): bool
     {
         return (bool) preg_match('/hevc|h\.?265/i', (string) $codec);
+    }
+
+    /** Whether the HEVC->hvc1 remux endpoint is configured. */
+    protected function remuxEnabled(): bool
+    {
+        return trim((string) config('moviebox.ffmpeg', '')) !== '';
+    }
+
+    /**
+     * Build a same-origin, HMAC-signed URL that streams the given HEVC file
+     * remuxed to `hvc1` fragmented MP4 (so iOS renders the video). The
+     * signature prevents the endpoint being abused as an open transcode relay.
+     */
+    protected function remuxUrl(string $url): string
+    {
+        $exp = time() + 6 * 3600;
+        $sig = hash_hmac('sha256', $url.'|'.$exp, (string) config('app.key'));
+
+        return url('/api/mv-hevc').'?'.http_build_query(['u' => $url, 'e' => $exp, 's' => $sig]);
+    }
+
+    /**
+     * Stream an HEVC MP4 remuxed on the fly to `hvc1`-tagged fragmented MP4.
+     * This is a container-only rewrite (`-c copy`, no re-encoding) so it is
+     * cheap and lossless; it exists solely to make HEVC titles that only ship
+     * as `hev1` playable on iOS (where AVPlayer otherwise plays audio only).
+     */
+    public function remuxHevc(Request $request): \Symfony\Component\HttpFoundation\StreamedResponse
+    {
+        $url = (string) $request->query('u', '');
+        $exp = (int) $request->query('e', 0);
+        $sig = (string) $request->query('s', '');
+
+        abort_if($url === '' || $exp <= 0 || $sig === '', 404);
+        abort_if(time() > $exp, 410, 'Link expired — reload the page.');
+        $expected = hash_hmac('sha256', $url.'|'.$exp, (string) config('app.key'));
+        abort_unless(hash_equals($expected, $sig), 403, 'Invalid signature.');
+
+        $host = parse_url($url, PHP_URL_HOST) ?: '';
+        $allowed = false;
+        foreach ((array) config('moviebox.cdn_proxy_allow', []) as $suffix) {
+            if ($suffix !== '' && str_ends_with($host, $suffix)) {
+                $allowed = true;
+                break;
+            }
+        }
+        abort_unless($allowed, 403, 'Host not allowed.');
+
+        $ffmpeg = trim((string) config('moviebox.ffmpeg', ''));
+        abort_if($ffmpeg === '', 501, 'HEVC remux is disabled on this server.');
+
+        $cmd = [
+            $ffmpeg, '-hide_banner', '-loglevel', 'error',
+            '-user_agent', (string) config('moviebox.user_agent'),
+            '-i', $url,
+            '-map', '0',
+            '-c', 'copy', '-tag:v', 'hvc1',
+            '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+            '-f', 'mp4', 'pipe:1',
+        ];
+
+        return response()->stream(function () use ($cmd) {
+            $descriptors = [1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+            $process = @proc_open($cmd, $descriptors, $pipes);
+            if (! is_resource($process)) {
+                return;
+            }
+
+            stream_set_blocking($pipes[1], true);
+            while (! feof($pipes[1])) {
+                $chunk = fread($pipes[1], 65536);
+                if ($chunk === false) {
+                    break;
+                }
+                echo $chunk;
+                flush();
+                if (connection_aborted()) {
+                    break;
+                }
+            }
+
+            foreach ($pipes as $pipe) {
+                if (is_resource($pipe)) {
+                    fclose($pipe);
+                }
+            }
+            proc_terminate($process);
+            proc_close($process);
+        }, 200, [
+            'Content-Type' => 'video/mp4',
+            'Cache-Control' => 'no-store',
+            'Accept-Ranges' => 'none',
+            'Access-Control-Allow-Origin' => '*',
+        ]);
     }
 
     /**

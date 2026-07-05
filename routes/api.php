@@ -51,6 +51,9 @@ Route::get('mv/{token}/{path}', [StreamController::class, 'proxy'])
     ->where('path', '.*')
     ->middleware('throttle:1000,1');
 
+// HEVC -> hvc1 remux (stream-copy) so iOS renders HEVC-only titles.
+Route::get('mv-hevc', [StreamController::class, 'remuxHevc'])->middleware('throttle:1000,1');
+
 // ---- Personal library (Sanctum-protected) ---------------------------------
 Route::middleware('auth:sanctum')->group(function () {
     Route::get('favorites', [LibraryController::class, 'favorites']);

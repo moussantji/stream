@@ -1,16 +1,26 @@
 import React, { useEffect, useState } from 'react';
-import { View, Text, ActivityIndicator, StyleSheet, useWindowDimensions, TouchableOpacity, Modal, Alert, ScrollView } from 'react-native';
+import { View, Text, ActivityIndicator, StyleSheet, useWindowDimensions, TouchableOpacity, Modal, Alert, ScrollView, Platform } from 'react-native';
 import { Video, ResizeMode } from 'expo-av';
 import { api } from '../api';
 import { colors } from '../theme';
 import { ensureDir, safeName, createDownload } from '../download';
 
+const isHevc = (s) => /hevc|265/i.test(String(s && s.codec || ''));
+
 // Prefer H.264 (avc) over HEVC/H.265 for device compatibility (HEVC often plays
 // audio without video on Android and can fail on iOS).
 function pickSource(sources) {
     const withUrl = (sources || []).filter((s) => s.url);
-    const avc = withUrl.filter((s) => !/hevc|265/i.test(String(s.codec || '')));
+    const avc = withUrl.filter((s) => !isHevc(s));
     return (avc.length ? avc : withUrl)[0] || null;
+}
+
+// On iOS, HEVC only renders when tagged hvc1; route those sources through the
+// server-side remux endpoint (field `remux`) so the picture shows up.
+function playUri(source) {
+    if (!source) return null;
+    if (Platform.OS === 'ios' && isHevc(source) && source.remux) return source.remux;
+    return source.url;
 }
 
 export default function WatchScreen({ route, navigation }) {
@@ -18,6 +28,7 @@ export default function WatchScreen({ route, navigation }) {
     const { width } = useWindowDimensions();
 
     const [uri, setUri] = useState(localUri || null);
+    const [selUrl, setSelUrl] = useState(null);
     const [sources, setSources] = useState([]);
     const [loading, setLoading] = useState(!localUri);
     const [message, setMessage] = useState(null);
@@ -41,7 +52,7 @@ export default function WatchScreen({ route, navigation }) {
                 setSources(srcs);
                 const best = pickSource(srcs);
                 const hls = (data.hls || [])[0];
-                if (best) setUri(best.url);
+                if (best) { setSelUrl(best.url); setUri(playUri(best)); }
                 else if (hls) setUri(hls);
                 else if ((data.dash || []).length) setMessage("Épisode disponible uniquement en DASH (lecture non prise en charge dans l'app).");
                 else setMessage('Aucune source de lecture disponible.');
@@ -102,9 +113,9 @@ export default function WatchScreen({ route, navigation }) {
                 <View style={styles.qualityRow}>
                     {sources.map((s, i) => {
                         const label = s.quality || (s.resolution ? `${s.resolution}p` : 'auto');
-                        const active = uri === s.url;
+                        const active = selUrl === s.url;
                         return (
-                            <TouchableOpacity key={i} style={[styles.qBtn, active && styles.qBtnActive]} onPress={() => { setMessage(null); setUri(s.url); }}>
+                            <TouchableOpacity key={i} style={[styles.qBtn, active && styles.qBtnActive]} onPress={() => { setMessage(null); setSelUrl(s.url); setUri(playUri(s)); }}>
                                 <Text style={[styles.qText, active && styles.qTextActive]}>{label}</Text>
                             </TouchableOpacity>
                         );
