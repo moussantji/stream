@@ -596,16 +596,35 @@ class StreamController extends Controller
             ];
         }
 
-        // Deduplicate by resolution (keep first) and order highest quality first.
+        // Deduplicate by resolution, preferring H.264 (avc) over HEVC/H.265 for
+        // device compatibility (many phones only render H.264 — HEVC often plays
+        // audio without video, or nothing on iOS via a DASH fallback).
         $byKey = [];
         foreach ($sources as $source) {
             $key = $source['resolution'] ?: $source['url'];
-            $byKey[$key] ??= $source;
+            $existing = $byKey[$key] ?? null;
+            if ($existing === null) {
+                $byKey[$key] = $source;
+                continue;
+            }
+            if ($this->isHevc($existing['codec'] ?? null) && ! $this->isHevc($source['codec'] ?? null)) {
+                $byKey[$key] = $source;
+            }
         }
         $out = array_values($byKey);
-        usort($out, fn ($a, $b) => $b['resolution'] <=> $a['resolution']);
+        // Highest resolution first, but H.264 ahead of HEVC at equal resolution.
+        usort($out, function ($a, $b) {
+            return [$b['resolution'], $this->isHevc($a['codec'] ?? null) ? 0 : 1]
+                <=> [$a['resolution'], $this->isHevc($b['codec'] ?? null) ? 0 : 1];
+        });
 
         return $out;
+    }
+
+    /** True if the codec name looks like HEVC / H.265. */
+    protected function isHevc(?string $codec): bool
+    {
+        return (bool) preg_match('/hevc|h\.?265/i', (string) $codec);
     }
 
     /**

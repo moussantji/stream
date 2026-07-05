@@ -5,6 +5,14 @@ import { api } from '../api';
 import { colors } from '../theme';
 import { ensureDir, safeName, createDownload } from '../download';
 
+// Prefer H.264 (avc) over HEVC/H.265 for device compatibility (HEVC often plays
+// audio without video on Android and can fail on iOS).
+function pickSource(sources) {
+    const withUrl = (sources || []).filter((s) => s.url);
+    const avc = withUrl.filter((s) => !/hevc|265/i.test(String(s.codec || '')));
+    return (avc.length ? avc : withUrl)[0] || null;
+}
+
 export default function WatchScreen({ route, navigation }) {
     const { item, season = 0, episode = 0, localUri, title: localTitle } = route.params;
     const { width } = useWindowDimensions();
@@ -29,10 +37,11 @@ export default function WatchScreen({ route, navigation }) {
         (async () => {
             try {
                 const data = await api.play(item, season, episode);
-                setSources(data.sources || []);
-                const mp4 = (data.sources || []).find((s) => s.url);
+                const srcs = data.sources || [];
+                setSources(srcs);
+                const best = pickSource(srcs);
                 const hls = (data.hls || [])[0];
-                if (mp4) setUri(mp4.url);
+                if (best) setUri(best.url);
                 else if (hls) setUri(hls);
                 else if ((data.dash || []).length) setMessage("Épisode disponible uniquement en DASH (lecture non prise en charge dans l'app).");
                 else setMessage('Aucune source de lecture disponible.');
@@ -71,11 +80,37 @@ export default function WatchScreen({ route, navigation }) {
                 {loading ? (
                     <ActivityIndicator color={colors.accent} size="large" />
                 ) : uri ? (
-                    <Video style={{ width, height: videoHeight }} source={{ uri }} useNativeControls resizeMode={ResizeMode.CONTAIN} shouldPlay />
+                    <Video
+                        style={{ width, height: videoHeight }}
+                        source={{ uri }}
+                        useNativeControls
+                        resizeMode={ResizeMode.CONTAIN}
+                        shouldPlay
+                        usePoster={!!(item && item.cover)}
+                        posterSource={item && item.cover ? { uri: item.cover } : undefined}
+                        posterStyle={{ resizeMode: 'cover' }}
+                        onError={() => setMessage("Lecture impossible (format non pris en charge sur cet appareil). Essaie une autre qualité.")}
+                    />
                 ) : (
                     <Text style={styles.msg}>{message}</Text>
                 )}
             </View>
+
+            {message && uri ? <Text style={styles.warn}>{message}</Text> : null}
+
+            {!localUri && sources.length > 1 ? (
+                <View style={styles.qualityRow}>
+                    {sources.map((s, i) => {
+                        const label = s.quality || (s.resolution ? `${s.resolution}p` : 'auto');
+                        const active = uri === s.url;
+                        return (
+                            <TouchableOpacity key={i} style={[styles.qBtn, active && styles.qBtnActive]} onPress={() => { setMessage(null); setUri(s.url); }}>
+                                <Text style={[styles.qText, active && styles.qTextActive]}>{label}</Text>
+                            </TouchableOpacity>
+                        );
+                    })}
+                </View>
+            ) : null}
 
             {!localUri && sources.length > 0 ? (
                 <View style={styles.tools}>
@@ -114,6 +149,12 @@ export default function WatchScreen({ route, navigation }) {
 const styles = StyleSheet.create({
     wrap: { flex: 1, backgroundColor: colors.bg },
     msg: { color: colors.dim, textAlign: 'center', paddingHorizontal: 24 },
+    warn: { color: colors.accent2, fontSize: 12, paddingHorizontal: 16, paddingTop: 10 },
+    qualityRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, paddingHorizontal: 16, paddingTop: 12 },
+    qBtn: { backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, borderRadius: 8, paddingHorizontal: 14, paddingVertical: 8 },
+    qBtnActive: { backgroundColor: colors.accent, borderColor: 'transparent' },
+    qText: { color: colors.text, fontWeight: '600', fontSize: 13 },
+    qTextActive: { color: '#fff' },
     tools: { padding: 16 },
     dlBtn: { backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, borderRadius: 8, paddingVertical: 12, alignItems: 'center' },
     dlText: { color: colors.text, fontWeight: '700' },
