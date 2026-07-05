@@ -52,6 +52,10 @@ return [
         'hakunaymatata.com'
     ))))),
 
+    // Block direct browser navigation to /api/* (someone pasting the URL). The
+    // SPA (fetch/XHR) and the native app are unaffected. Set false to disable.
+    'protect_api' => filter_var(env('MOVIEBOX_PROTECT_API', true), FILTER_VALIDATE_BOOL),
+
     // Content filtering: titles whose genre/title/description match any of these
     // keywords are hidden from DISCOVERY surfaces (home, trending, categories,
     // recommendations, local library). They remain reachable via SEARCH so the

@@ -17,6 +17,10 @@ return Application::configure(basePath: dirname(__DIR__))
         // stateless: enabling Sanctum's stateful middleware would treat
         // same-origin requests as cookie-based and enforce CSRF, breaking
         // login/register with a 419 "CSRF token mismatch".
+
+        // Block direct browser navigation to /api/* (viewing the JSON by pasting
+        // the URL). fetch()/XHR (SPA) and native-app requests are unaffected.
+        $middleware->appendToGroup('api', \App\Http\Middleware\BlockBrowserApiAccess::class);
     })
     ->withExceptions(function (Exceptions $exceptions) {
         $exceptions->render(function (Throwable $e, \Illuminate\Http\Request $request) {
