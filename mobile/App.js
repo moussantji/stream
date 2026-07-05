@@ -3,7 +3,8 @@ import { StatusBar } from 'expo-status-bar';
 import { NavigationContainer, DarkTheme, useNavigation } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
-import { TouchableOpacity, Text } from 'react-native';
+import { TouchableOpacity } from 'react-native';
+import { Ionicons } from '@expo/vector-icons';
 
 import HomeScreen from './src/screens/HomeScreen';
 import TrendingScreen from './src/screens/TrendingScreen';
@@ -29,15 +30,13 @@ const navTheme = {
     },
 };
 
-const tabIcon = (glyph) => ({ focused }) => (
-    <Text style={{ fontSize: 20, opacity: focused ? 1 : 0.5 }}>{glyph}</Text>
-);
+const tabIcon = (name) => ({ color, size }) => <Ionicons name={name} size={size ?? 23} color={color} />;
 
 function SearchButton() {
     const navigation = useNavigation();
     return (
         <TouchableOpacity onPress={() => navigation.navigate('Search')} hitSlop={12} style={{ marginRight: 14 }}>
-            <Text style={{ fontSize: 20 }}>🔍</Text>
+            <Ionicons name="search" size={22} color={colors.text} />
         </TouchableOpacity>
     );
 }
@@ -54,10 +53,10 @@ function Tabs() {
                 tabBarInactiveTintColor: colors.dim,
             }}
         >
-            <Tab.Screen name="HomeTab" component={HomeScreen} options={{ headerShown: false, tabBarLabel: 'Accueil', tabBarIcon: tabIcon('🏠') }} />
-            <Tab.Screen name="TrendingTab" component={TrendingScreen} options={{ title: 'Tendance', tabBarLabel: 'Tendance', tabBarIcon: tabIcon('🔥'), headerRight: () => <SearchButton /> }} />
-            <Tab.Screen name="DownloadsTab" component={DownloadsScreen} options={{ title: 'Téléchargements', tabBarLabel: 'Téléchargements', tabBarIcon: tabIcon('⬇️') }} />
-            <Tab.Screen name="AccountTab" component={AccountScreen} options={{ title: 'Mon compte', tabBarLabel: 'Mon compte', tabBarIcon: tabIcon('👤') }} />
+            <Tab.Screen name="HomeTab" component={HomeScreen} options={{ headerShown: false, tabBarLabel: 'Accueil', tabBarIcon: tabIcon('home') }} />
+            <Tab.Screen name="TrendingTab" component={TrendingScreen} options={{ title: 'Tendance', tabBarLabel: 'Tendance', tabBarIcon: tabIcon('flame'), headerRight: () => <SearchButton /> }} />
+            <Tab.Screen name="DownloadsTab" component={DownloadsScreen} options={{ title: 'Téléchargements', tabBarLabel: 'Téléchargements', tabBarIcon: tabIcon('download') }} />
+            <Tab.Screen name="AccountTab" component={AccountScreen} options={{ title: 'Mon compte', tabBarLabel: 'Mon compte', tabBarIcon: tabIcon('person') }} />
         </Tab.Navigator>
     );
 }

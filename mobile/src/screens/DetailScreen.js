@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { ScrollView, View, Text, Image, ImageBackground, TouchableOpacity, ActivityIndicator, Alert, StyleSheet } from 'react-native';
 import { Video, ResizeMode } from 'expo-av';
+import { Ionicons } from '@expo/vector-icons';
 import { api } from '../api';
 import { colors } from '../theme';
 import { ensureDir, safeName, createDownload, formatSize } from '../download';
@@ -111,7 +112,8 @@ export default function DetailScreen({ route, navigation }) {
 
             <View style={{ padding: 16 }}>
                 <TouchableOpacity style={styles.play} onPress={play}>
-                    <Text style={styles.playText}>▶  {isSeries ? `Lecture S${(season || seasons[0]).season}` : 'Lecture'}</Text>
+                    <Ionicons name="play" size={18} color="#fff" />
+                    <Text style={styles.playText}>{isSeries ? `Lecture S${(season || seasons[0]).season}` : 'Lecture'}</Text>
                 </TouchableOpacity>
 
                 {/* Version / langue (ex. Hindi → Français VF) */}
@@ -154,7 +156,7 @@ export default function DetailScreen({ route, navigation }) {
                                         {f.size ? <Text style={styles.fileSize}>{formatSize(f.size)}</Text> : null}
                                     </View>
                                     <TouchableOpacity style={styles.dlBtn} onPress={() => doDownload(f)} disabled={!!dlKey}>
-                                        {busy ? <Text style={styles.dlPct}>{Math.round(progress * 100)}%</Text> : <Text style={styles.dlIcon}>⬇</Text>}
+                                        {busy ? <Text style={styles.dlPct}>{Math.round(progress * 100)}%</Text> : <Ionicons name="download-outline" size={22} color={colors.text} />}
                                     </TouchableOpacity>
                                 </View>
                             );
@@ -198,7 +200,7 @@ const styles = StyleSheet.create({
     title: { color: '#fff', fontSize: 22, fontWeight: '900' },
     sub: { color: '#d6d6de', fontSize: 13, marginTop: 6 },
     vf: { color: colors.accent2, fontSize: 12, fontWeight: '700', marginTop: 6 },
-    play: { alignItems: 'center', justifyContent: 'center', backgroundColor: colors.accent, borderRadius: 8, paddingVertical: 12 },
+    play: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, backgroundColor: colors.accent, borderRadius: 8, paddingVertical: 12 },
     playText: { color: '#fff', fontWeight: '800', fontSize: 15 },
     section: { color: colors.text, fontSize: 16, fontWeight: '700', marginBottom: 10 },
     dubRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },

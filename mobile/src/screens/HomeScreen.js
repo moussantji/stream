@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { ScrollView, View, Text, FlatList, ActivityIndicator, TouchableOpacity, ImageBackground, useWindowDimensions, StyleSheet } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { Ionicons } from '@expo/vector-icons';
 import { api } from '../api';
 import { getApiBase } from '../config';
 import PosterCard from '../components/PosterCard';
@@ -94,7 +95,7 @@ export default function HomeScreen({ navigation }) {
     const searchBar = (
         <View style={[styles.searchWrap, { paddingTop: insets.top + 8 }]}>
             <TouchableOpacity style={styles.searchBar} activeOpacity={0.85} onPress={() => navigation.navigate('Search')}>
-                <Text style={{ fontSize: 15 }}>🔍</Text>
+                <Ionicons name="search" size={18} color={colors.dim} />
                 <Text style={styles.searchPlaceholder}>Rechercher un film, une série…</Text>
             </TouchableOpacity>
         </View>
