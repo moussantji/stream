@@ -105,6 +105,11 @@ export class Player {
         this.time = el('span', { class: 'vp-time', text: '0:00 / 0:00' });
 
         this.ccBtn = el('button', { class: 'vp-btn', 'aria-label': 'Sous-titres', html: I.cc, hidden: 'hidden' });
+
+        // Dedicated quality control (separate from the settings gear).
+        this.qualityBtn = el('button', { class: 'vp-btn vp-quality', 'aria-label': 'Qualité', text: 'Auto', hidden: 'hidden' });
+        this.qualityMenu = el('div', { class: 'vp-menu', hidden: 'hidden' });
+
         this.gearBtn = el('button', { class: 'vp-btn', 'aria-label': 'Réglages', html: I.gear });
         this.fsBtn = el('button', { class: 'vp-btn', 'aria-label': 'Plein écran', html: I.enterFs });
 
@@ -118,6 +123,7 @@ export class Player {
                 this.time,
                 el('div', { class: 'vp-spacer' }),
                 this.ccBtn,
+                el('div', { class: 'vp-settings' }, [this.qualityBtn, this.qualityMenu]),
                 el('div', { class: 'vp-settings' }, [this.gearBtn, this.menu]),
                 this.fsBtn,
             ]),
@@ -178,9 +184,14 @@ export class Player {
         // Subtitles
         this.ccBtn.onclick = () => this.cycleSubtitle();
 
+        // Quality menu (dedicated button)
+        this.qualityBtn.onclick = (e) => { e.stopPropagation(); this.qualityMenu.hidden ? this.openQualityMenu() : (this.qualityMenu.hidden = true); };
+
         // Settings menu
         this.gearBtn.onclick = (e) => { e.stopPropagation(); this.menu.hidden ? this.openMenu() : (this.menu.hidden = true); };
-        document.addEventListener('click', this._docClick = (e) => { if (!this.wrap.contains(e.target)) this.menu.hidden = true; });
+        document.addEventListener('click', this._docClick = (e) => {
+            if (!this.wrap.contains(e.target)) { this.menu.hidden = true; this.qualityMenu.hidden = true; }
+        });
 
         // Fullscreen
         this.fsBtn.onclick = () => this.toggleFullscreen();
@@ -240,27 +251,53 @@ export class Player {
     }
 
     toggleFullscreen() {
-        if (document.fullscreenElement === this.wrap) document.exitFullscreen?.();
-        else this.wrap.requestFullscreen?.();
+        const doc = document;
+        const inFs = doc.fullscreenElement === this.wrap || doc.webkitFullscreenElement === this.wrap;
+        if (inFs) {
+            (doc.exitFullscreen || doc.webkitExitFullscreen || (() => {})).call(doc);
+            return;
+        }
+        if (this.wrap.requestFullscreen) {
+            this.wrap.requestFullscreen();
+        } else if (this.wrap.webkitRequestFullscreen) {
+            this.wrap.webkitRequestFullscreen();
+        } else if (this.video.webkitEnterFullscreen) {
+            // iPhone Safari: only the <video> element supports fullscreen.
+            this.video.webkitEnterFullscreen();
+        }
+    }
+
+    // Dedicated quality menu (MP4 sources only; HLS/DASH are adaptive).
+    openQualityMenu() {
+        const menu = this.qualityMenu;
+        menu.innerHTML = '';
+        menu.appendChild(el('div', { class: 'vp-menu-title', text: 'Qualité de l\u2019image' }));
+        this.currentSources.forEach((s) => {
+            const active = this._activeSource && this._activeSource.url === s.url;
+            menu.appendChild(el('button', {
+                class: `vp-menu-item ${active ? 'active' : ''}`,
+                text: s.quality || (s.resolution ? s.resolution + 'p' : 'auto'),
+                onclick: () => { this.setMp4(s); this.qualityMenu.hidden = true; },
+            }));
+        });
+        this.menu.hidden = true;
+        menu.hidden = false;
+    }
+
+    // Reflect the active source on the quality button; hide it when there is
+    // nothing to switch (single source, or adaptive HLS/DASH).
+    updateQualityUi() {
+        const s = this._activeSource;
+        const label = s ? (s.quality || (s.resolution ? s.resolution + 'p' : 'Auto')) : 'Auto';
+        this.qualityBtn.textContent = label;
+        this.qualityBtn.hidden = !(this.currentSources && this.currentSources.length > 1);
     }
 
     openMenu() {
         const v = this.video;
         const menu = this.menu;
         menu.innerHTML = '';
-
-        // Quality (MP4 sources only; HLS/DASH are adaptive)
-        if (this.currentSources.length > 1) {
-            menu.appendChild(el('div', { class: 'vp-menu-title', text: 'Qualité' }));
-            this.currentSources.forEach((s) => {
-                const active = this._activeSource && this._activeSource.url === s.url;
-                menu.appendChild(el('button', {
-                    class: `vp-menu-item ${active ? 'active' : ''}`,
-                    text: s.quality || (s.resolution ? s.resolution + 'p' : 'auto'),
-                    onclick: () => { this.setMp4(s); this.menu.hidden = true; },
-                }));
-            });
-        }
+        this.qualityMenu.hidden = true;
 
         // Playback speed
         menu.appendChild(el('div', { class: 'vp-menu-title', text: 'Vitesse' }));
@@ -280,6 +317,7 @@ export class Player {
         this.destroyDash();
         const { sources = [], hls = [], dash = [], subtitles = [], startTime = 0, onProgress } = data;
         this.currentSources = sources;
+        this._activeSource = null;
 
         if (sources.length) {
             this.setMp4(sources[0]);
@@ -292,6 +330,7 @@ export class Player {
         }
 
         this.setSubtitles(subtitles);
+        this.updateQualityUi();
 
         if (startTime > 0) {
             this.video.addEventListener('loadedmetadata', () => {
@@ -326,6 +365,7 @@ export class Player {
         const url = this.mp4UrlFor(source);
         this._triedRemux = !!(source && source.remux && url === source.remux);
         this._setSrc(url);
+        this.updateQualityUi();
     }
 
     _setSrc(url) {

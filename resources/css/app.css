@@ -366,6 +366,10 @@ video.hero-bg { pointer-events: none; }
 .vp-btn svg { width: 24px; height: 24px; }
 .vp-btn:hover { background: rgba(255, 255, 255, .15); opacity: 1; }
 .vp-btn.active { color: var(--accent-2); }
+.vp-quality {
+    width: auto; min-width: 40px; padding: 0 10px; font-size: 13px; font-weight: 700;
+    letter-spacing: .02em;
+}
 .vp-time { color: #fff; font-size: 13px; font-variant-numeric: tabular-nums; margin-left: 4px; white-space: nowrap; }
 
 .vp-vol { display: flex; align-items: center; }
