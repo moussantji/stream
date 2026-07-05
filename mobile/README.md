@@ -6,9 +6,10 @@ bas (**Accueil / Tendance / Téléchargements / Mon compte**), recherche via
 l'icône 🔍 en haut, bannière en vedette sur l'accueil, fiche détail avec grande
 image, lecteur vidéo, et **téléchargement hors ligne (uniquement dans l'app)**.
 
-> ⚠️ **Les films ne s'affichent pas ?** L'URL de l'API dans `src/config.js`
-> (`API_BASE`) doit être joignable depuis le téléphone (voir §2). L'onglet
-> « Mon compte » propose un bouton **« Tester la connexion »** pour vérifier.
+> ⚠️ **Les films ne s'affichent pas ?** L'app utilise le backend du **site**.
+> Va dans **Mon compte → « URL du serveur »**, saisis l'adresse publique de ton
+> site (ex. `https://ton-site.com`), puis **Enregistrer** / **Tester**. L'URL est
+> mémorisée sur le téléphone.
 
 ## 1. Prérequis
 
@@ -17,14 +18,21 @@ image, lecteur vidéo, et **téléchargement hors ligne (uniquement dans l'app)*
 
 ## 2. Configurer l'URL de l'API
 
-Édite `src/config.js` → `API_BASE` :
+Deux façons :
 
-- **Émulateur Android** : `http://10.0.2.2:8000` (déjà configuré) — atteint le
-  `localhost` de ta machine.
-- **Téléphone réel (même Wi‑Fi)** : `http://TON_IP_LAN:8000` (ex. `http://192.168.1.20:8000`).
-- **Production** : `https://ton-domaine.com`.
+1. **Dans l'app** (recommandé) : onglet **Mon compte → « URL du serveur »** →
+   saisis l'URL du site → **Enregistrer**. Mémorisée sur le téléphone.
+2. **Valeur par défaut** : édite `src/config.js` → `DEFAULT_API_BASE`
+   (ex. `https://ton-site.com`).
 
-> En prod, sers l'API en **HTTPS** (Android bloque le HTTP en clair par défaut).
+Selon le contexte :
+- **Backend en ligne (site)** : `https://ton-domaine.com` (recommandé).
+- **Émulateur Android + backend local** : `http://10.0.2.2:8000`.
+- **Téléphone réel + backend local (même Wi‑Fi)** : `http://TON_IP_LAN:8000`
+  (lance `php artisan serve --host=0.0.0.0`).
+
+> En prod, sers l'API en **HTTPS** (Android bloque le HTTP en clair par défaut
+> dans les builds release).
 
 ## 3. Lancer en développement
 

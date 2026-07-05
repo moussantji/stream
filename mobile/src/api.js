@@ -1,4 +1,4 @@
-import { API_BASE } from './config';
+import { getApiBase } from './config';
 
 function qs(params = {}) {
     const parts = Object.entries(params)
@@ -8,7 +8,7 @@ function qs(params = {}) {
 }
 
 async function get(path, params) {
-    const res = await fetch(`${API_BASE}${path}${qs(params)}`, {
+    const res = await fetch(`${getApiBase()}${path}${qs(params)}`, {
         headers: { Accept: 'application/json' },
     });
     if (!res.ok) {

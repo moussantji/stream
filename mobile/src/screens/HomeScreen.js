@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { ScrollView, View, Text, FlatList, ActivityIndicator, TouchableOpacity, ImageBackground, useWindowDimensions, StyleSheet } from 'react-native';
 import { api } from '../api';
-import { API_BASE } from '../config';
+import { getApiBase } from '../config';
 import PosterCard from '../components/PosterCard';
 import { colors } from '../theme';
 
@@ -62,7 +62,7 @@ export default function HomeScreen({ navigation }) {
                 const home = h.status === 'fulfilled' ? h.value : null;
                 const trending = t.status === 'fulfilled' ? t.value : null;
                 if (!home && !trending) {
-                    throw new Error(`Impossible de joindre le serveur.\n\nURL de l'API : ${API_BASE}\n\nVérifie que le backend tourne et que l'URL (app.json → expo.extra.apiBase) est joignable depuis ce téléphone.`);
+                    throw new Error(`Impossible de joindre le serveur.\n\nURL de l'API : ${getApiBase()}\n\nDéfinis l'URL de ton site dans « Mon compte → URL du serveur ».`);
                 }
                 const secs = [];
                 if (trending && trending.items && trending.items.length) secs.push({ title: 'Les plus regardés', items: trending.items });

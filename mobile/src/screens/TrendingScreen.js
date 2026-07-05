@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { View, Text, FlatList, ActivityIndicator, TouchableOpacity, useWindowDimensions, StyleSheet } from 'react-native';
 import { api } from '../api';
-import { API_BASE } from '../config';
+import { getApiBase } from '../config';
 import PosterCard from '../components/PosterCard';
 import { colors } from '../theme';
 
@@ -21,7 +21,7 @@ export default function TrendingScreen({ navigation }) {
             setHasMore(!!(data.pager && data.pager.hasMore));
             setError(null);
         } catch (e) {
-            if (p === 1) setError(`Impossible de joindre le serveur.\n\n${API_BASE}`);
+            if (p === 1) setError(`Impossible de joindre le serveur.\n\n${getApiBase()}`);
         } finally {
             setLoading(false);
         }

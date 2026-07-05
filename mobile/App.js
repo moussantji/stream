@@ -1,5 +1,5 @@
-import React from 'react';
-import { Text, TouchableOpacity } from 'react-native';
+import React, { useEffect, useState } from 'react';
+import { Text, TouchableOpacity, View, ActivityIndicator } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { NavigationContainer, DarkTheme, useNavigation } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
@@ -13,6 +13,7 @@ import AccountScreen from './src/screens/AccountScreen';
 import DetailScreen from './src/screens/DetailScreen';
 import WatchScreen from './src/screens/WatchScreen';
 import { colors } from './src/theme';
+import { loadApiBase } from './src/config';
 
 const Tab = createBottomTabNavigator();
 const RootStack = createNativeStackNavigator();
@@ -65,6 +66,20 @@ function Tabs() {
 }
 
 export default function App() {
+    const [ready, setReady] = useState(false);
+
+    useEffect(() => {
+        loadApiBase().finally(() => setReady(true));
+    }, []);
+
+    if (!ready) {
+        return (
+            <View style={{ flex: 1, backgroundColor: colors.bg, alignItems: 'center', justifyContent: 'center' }}>
+                <ActivityIndicator color={colors.accent} size="large" />
+            </View>
+        );
+    }
+
     return (
         <NavigationContainer theme={navTheme}>
             <StatusBar style="light" />

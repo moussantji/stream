@@ -1,20 +1,32 @@
 import React, { useState } from 'react';
-import { ScrollView, View, Text, TouchableOpacity, Linking, ActivityIndicator, StyleSheet } from 'react-native';
+import { ScrollView, View, Text, TextInput, TouchableOpacity, Linking, ActivityIndicator, StyleSheet } from 'react-native';
 import { api } from '../api';
-import { API_BASE } from '../config';
+import { getApiBase, setApiBase, DEFAULT_API_BASE } from '../config';
 import { colors } from '../theme';
 
 export default function AccountScreen() {
+    const [url, setUrl] = useState(getApiBase());
+    const [saved, setSaved] = useState(false);
     const [testing, setTesting] = useState(false);
     const [result, setResult] = useState(null);
 
+    const save = async () => {
+        const applied = await setApiBase(url);
+        setUrl(applied);
+        setSaved(true);
+        setResult(null);
+        setTimeout(() => setSaved(false), 2000);
+    };
+
     const testConnection = async () => {
+        await setApiBase(url); // test the URL currently typed
+        setUrl(getApiBase());
         setTesting(true);
         setResult(null);
         try {
             const data = await api.home();
             const count = (data.sections || []).length;
-            setResult({ ok: true, text: `Connecté ✓  (${count} section${count > 1 ? 's' : ''} reçue${count > 1 ? 's' : ''})` });
+            setResult({ ok: true, text: `Connecté ✓  (${count} section${count > 1 ? 's' : ''})` });
         } catch (e) {
             setResult({ ok: false, text: `Échec : ${e.message}` });
         } finally {
@@ -33,22 +45,35 @@ export default function AccountScreen() {
             </View>
 
             <View style={styles.card}>
-                <Text style={styles.cardTitle}>Serveur</Text>
-                <Text style={styles.mono}>{API_BASE}</Text>
-                <TouchableOpacity style={styles.btn} onPress={testConnection} disabled={testing}>
-                    <Text style={styles.btnText}>{testing ? 'Test en cours…' : 'Tester la connexion'}</Text>
-                </TouchableOpacity>
+                <Text style={styles.cardTitle}>URL du serveur (site)</Text>
+                <Text style={styles.hint}>
+                    Mets l'adresse publique de ton site (ex. https://ton-site.com). L'app utilisera
+                    le même backend que le site. Enregistrée sur ce téléphone.
+                </Text>
+                <TextInput
+                    style={styles.input}
+                    value={url}
+                    onChangeText={setUrl}
+                    placeholder={DEFAULT_API_BASE}
+                    placeholderTextColor={colors.dim}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    keyboardType="url"
+                />
+                <View style={styles.btnRow}>
+                    <TouchableOpacity style={[styles.btn, styles.btnPrimary]} onPress={save}>
+                        <Text style={styles.btnText}>{saved ? 'Enregistré ✓' : 'Enregistrer'}</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={[styles.btn, styles.btnGhost]} onPress={testConnection} disabled={testing}>
+                        <Text style={styles.btnText}>{testing ? 'Test…' : 'Tester'}</Text>
+                    </TouchableOpacity>
+                </View>
                 {testing ? <ActivityIndicator color={colors.accent} style={{ marginTop: 10 }} /> : null}
                 {result ? <Text style={[styles.result, { color: result.ok ? '#4ade80' : colors.accent2 }]}>{result.text}</Text> : null}
-                <Text style={styles.hint}>
-                    Si les films ne s'affichent pas, cette URL n'est probablement pas joignable depuis le téléphone.
-                    Modifie-la dans « mobile/src/config.js ».
-                </Text>
             </View>
 
             <View style={styles.card}>
-                <Text style={styles.cardTitle}>Plus</Text>
-                <TouchableOpacity style={styles.rowBtn} onPress={() => Linking.openURL(API_BASE)}>
+                <TouchableOpacity style={styles.rowBtn} onPress={() => Linking.openURL(getApiBase())}>
                     <Text style={styles.rowBtnText}>Ouvrir le site web</Text>
                     <Text style={styles.chevron}>›</Text>
                 </TouchableOpacity>
@@ -66,12 +91,15 @@ const styles = StyleSheet.create({
     name: { color: colors.text, fontSize: 20, fontWeight: '800' },
     sub: { color: colors.dim, fontSize: 13, marginTop: 2 },
     card: { backgroundColor: colors.card, borderRadius: 12, borderWidth: 1, borderColor: colors.border, padding: 16, marginBottom: 16 },
-    cardTitle: { color: colors.text, fontSize: 15, fontWeight: '700', marginBottom: 10 },
-    mono: { color: colors.dim, fontSize: 13, fontFamily: 'monospace' },
-    btn: { backgroundColor: colors.accent, borderRadius: 8, paddingVertical: 11, alignItems: 'center', marginTop: 14 },
+    cardTitle: { color: colors.text, fontSize: 15, fontWeight: '700', marginBottom: 8 },
+    hint: { color: colors.dim, fontSize: 12, lineHeight: 18, marginBottom: 12 },
+    input: { backgroundColor: colors.bg, borderWidth: 1, borderColor: colors.border, borderRadius: 8, color: colors.text, paddingHorizontal: 12, paddingVertical: 10, fontSize: 14 },
+    btnRow: { flexDirection: 'row', gap: 10, marginTop: 12 },
+    btn: { flex: 1, borderRadius: 8, paddingVertical: 11, alignItems: 'center' },
+    btnPrimary: { backgroundColor: colors.accent },
+    btnGhost: { backgroundColor: 'transparent', borderWidth: 1, borderColor: colors.border },
     btnText: { color: '#fff', fontWeight: '700' },
     result: { marginTop: 12, fontSize: 14, fontWeight: '600' },
-    hint: { color: colors.dim, fontSize: 12, lineHeight: 18, marginTop: 12 },
     rowBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 6 },
     rowBtnText: { color: colors.text, fontSize: 15 },
     chevron: { color: colors.dim, fontSize: 22 },
