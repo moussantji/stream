@@ -72,7 +72,6 @@
     </nav>
 
     <footer class="site-footer">
-        <p>All media and images are sourced from third-party providers on the internet, and their copyrights belong to their original creators. This project stores no content and is provided for educational purposes only.</p>
     </footer>
 
     <div class="modal-root" id="modal-root" hidden></div>

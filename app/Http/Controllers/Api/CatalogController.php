@@ -285,7 +285,7 @@ class CatalogController extends Controller
     }
 
     /** Health probe for the MovieBox backend connection + local storage stats. */
-    public function diagnostics(): JsonResponse
+    public function diagnostics(Request $request): JsonResponse
     {
         $report = $this->client->probe();
 
@@ -299,7 +299,104 @@ class CatalogController extends Controller
             $report['storage'] = ['error' => $e->getMessage()];
         }
 
+        // Live streaming probe for a specific title: shows the raw upstream
+        // `resource` + `play-info` responses so we can see *why* a title has no
+        // stream (empty list, upstream error, IP/region gate, token failure…).
+        // Usage: /api/diagnostics?subjectId=XXXX[&season=1&episode=1]
+        if (($subjectId = trim((string) $request->query('subjectId', ''))) !== '') {
+            $report['stream'] = $this->probeStream(
+                $subjectId,
+                (int) $request->query('season', 0),
+                (int) $request->query('episode', 0)
+            );
+        }
+
         return response()->json(['data' => $report]);
+    }
+
+    /**
+     * Probe the streaming pipeline for one title and summarise the raw upstream
+     * responses (kept small: counts, flags, first error) for diagnosis.
+     *
+     * @return array<string,mixed>
+     */
+    protected function probeStream(string $subjectId, int $season, int $episode): array
+    {
+        $out = ['subjectId' => $subjectId, 'season' => $season, 'episode' => $episode];
+
+        // 1) resource endpoint (downloadable MP4 files, all seasons/episodes).
+        try {
+            $res = $this->client->resource($subjectId, 1080, 1, 20);
+            $list = is_array($res['list'] ?? null) ? $res['list'] : [];
+            $withLink = 0;
+            $sample = [];
+            foreach ($list as $it) {
+                if (! is_array($it)) {
+                    continue;
+                }
+                $hasLink = ! empty($it['resourceLink']);
+                if ($hasLink) {
+                    $withLink++;
+                }
+                if (count($sample) < 6) {
+                    $sample[] = [
+                        'se' => $it['se'] ?? null,
+                        'ep' => $it['ep'] ?? null,
+                        'resolution' => $it['resolution'] ?? null,
+                        'codec' => $it['codecName'] ?? null,
+                        'hasLink' => $hasLink,
+                    ];
+                }
+            }
+            $out['resource'] = [
+                'ok' => true,
+                'listCount' => count($list),
+                'withResourceLink' => $withLink,
+                'hasMore' => (bool) ($res['pager']['hasMore'] ?? false),
+                'sample' => $sample,
+            ];
+        } catch (\Throwable $e) {
+            $out['resource'] = ['ok' => false, 'error' => class_basename($e).': '.$e->getMessage()];
+            // Capture the raw upstream response to reveal the 406 source, and
+            // probe every host to detect a per-host "find no content".
+            try {
+                $out['resource']['raw'] = $this->client->rawResourceProbe($subjectId);
+                $out['resource']['freshDevice'] = $this->client->probeFreshDevice($subjectId);
+            } catch (\Throwable $e2) {
+                $out['resource']['rawError'] = $e2->getMessage();
+            }
+        }
+
+        // 2) play-info endpoint (adaptive DASH/HLS streams).
+        try {
+            $info = $this->client->playInfo($subjectId, $season, $episode);
+            $streams = [];
+            $raw = is_array($info) ? ($info['streams'] ?? $info['list'] ?? []) : [];
+            if (is_array($raw)) {
+                foreach ($raw as $s) {
+                    if (! is_array($s)) {
+                        continue;
+                    }
+                    $streams[] = [
+                        'format' => $s['format'] ?? null,
+                        'resolution' => $s['resolutions'] ?? $s['resolution'] ?? null,
+                        'codec' => $s['codecName'] ?? null,
+                        'hasUrl' => ! empty($s['url']),
+                        'hasSignCookie' => ! empty($s['signCookie']),
+                    ];
+                }
+            }
+            $out['playInfo'] = ['ok' => true, 'streamCount' => count($streams), 'streams' => $streams];
+        } catch (\Throwable $e) {
+            $out['playInfo'] = ['ok' => false, 'error' => class_basename($e).': '.$e->getMessage()];
+            try {
+                $out['playInfo']['raw'] = $this->client->rawPlayInfoProbe($subjectId, $season, $episode);
+            } catch (\Throwable $e2) {
+                $out['playInfo']['rawError'] = $e2->getMessage();
+            }
+        }
+
+        return $out;
     }
 
     // -----------------------------------------------------------------

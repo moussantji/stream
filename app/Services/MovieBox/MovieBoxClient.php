@@ -43,6 +43,8 @@ class MovieBoxClient
 
     protected bool $bootstrapped = false;
 
+    protected string $deviceId = '';
+
     protected const RETRY_STATUS = [403, 407, 429, 500, 502, 503, 504];
 
     protected const TOKEN_CACHE_KEY = 'moviebox:v3:token';
@@ -79,6 +81,74 @@ class MovieBoxClient
         $this->secretKey = $config['secret_key'];
         $this->tokenTtl = (int) $config['token_ttl'];
         $this->cacheTtl = (int) $config['cache_ttl'];
+
+        $this->applyDeviceIdentity($config);
+    }
+
+    /**
+     * Replace the (flagged) hardcoded device_id/gaid in client_info with a
+     * stable per-install identity so the streaming endpoints stop returning
+     * "find no content" (406).
+     *
+     * @param  array<string,mixed>  $config
+     */
+    protected function applyDeviceIdentity(array $config): void
+    {
+        $identity = $this->resolveDeviceIdentity($config);
+        $this->deviceId = $identity['device_id'];
+
+        $ci = json_decode($this->clientInfo, true);
+        if (is_array($ci)) {
+            $ci['device_id'] = $identity['device_id'];
+            $ci['gaid'] = $identity['gaid'];
+            $this->clientInfo = json_encode($ci, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        }
+    }
+
+    /**
+     * Resolve the device identity: an explicit config/env override, else a
+     * random identity persisted to storage/app/moviebox/device.json (created
+     * once, reused forever — survives cache clears and deploys).
+     *
+     * @param  array<string,mixed>  $config
+     * @return array{device_id:string,gaid:string}
+     */
+    protected function resolveDeviceIdentity(array $config): array
+    {
+        $envDevice = $config['device_id'] ?? null;
+        $envGaid = $config['gaid'] ?? null;
+        if ($envDevice && $envGaid) {
+            return ['device_id' => (string) $envDevice, 'gaid' => (string) $envGaid];
+        }
+
+        $path = storage_path('app/moviebox/device.json');
+        if (is_file($path)) {
+            $data = json_decode((string) @file_get_contents($path), true);
+            if (is_array($data) && ! empty($data['device_id']) && ! empty($data['gaid'])) {
+                return ['device_id' => (string) $data['device_id'], 'gaid' => (string) $data['gaid']];
+            }
+        }
+
+        $identity = ['device_id' => bin2hex(random_bytes(16)), 'gaid' => self::randomGaid()];
+        @mkdir(dirname($path), 0775, true);
+        @file_put_contents($path, json_encode($identity));
+
+        return $identity;
+    }
+
+    protected static function randomGaid(): string
+    {
+        return sprintf(
+            '%s-%s-%s-%s-%s',
+            bin2hex(random_bytes(4)), bin2hex(random_bytes(2)), bin2hex(random_bytes(2)),
+            bin2hex(random_bytes(2)), bin2hex(random_bytes(6))
+        );
+    }
+
+    /** Token cache key, namespaced by device so a device change re-bootstraps. */
+    protected function tokenCacheKey(): string
+    {
+        return self::TOKEN_CACHE_KEY.':'.substr(md5($this->deviceId), 0, 10);
     }
 
     // -----------------------------------------------------------------
@@ -198,6 +268,195 @@ class MovieBoxClient
         return $this->activeBase;
     }
 
+    /**
+     * Raw diagnostic request: performs a signed call and returns the status,
+     * a few revealing response headers and a body snippet WITHOUT throwing on
+     * failure. Lets us see who emits e.g. a 406 (a WAF/CDN like Cloudflare or
+     * mod_security vs. the MovieBox app itself).
+     *
+     * @return array<string,mixed>
+     */
+    public function rawProbe(string $path, array $params = [], bool $playMode = false): array
+    {
+        $this->ensureBootstrapped();
+        [$base, $response] = $this->request('GET', $path, $params, playMode: $playMode);
+
+        $headers = [];
+        foreach (['Server', 'Content-Type', 'CF-RAY', 'cf-mitigated', 'Via', 'X-Cache', 'WWW-Authenticate', 'Set-Cookie'] as $h) {
+            $v = $response->header($h);
+            if ($v !== null && $v !== '') {
+                $headers[$h] = is_array($v) ? implode(', ', $v) : $v;
+            }
+        }
+
+        return [
+            'host' => $base,
+            'status' => $response->status(),
+            'headers' => $headers,
+            'bodySnippet' => mb_substr((string) $response->body(), 0, 500),
+        ];
+    }
+
+    /** Raw diagnostic probe of the `resource` endpoint. */
+    public function rawResourceProbe(string $subjectId): array
+    {
+        return $this->rawProbe(self::RESOURCE, [
+            'subjectId' => $subjectId, 'resolution' => 1080, 'page' => 1, 'perPage' => 20,
+        ]);
+    }
+
+    /**
+     * Probe the `resource` endpoint against EVERY host in the pool to detect a
+     * per-host "find no content" (region-routed hosts can differ). Reports the
+     * status + app code/message per host without throwing.
+     *
+     * @return array<int,array<string,mixed>>
+     */
+    public function rawResourceAllHosts(string $subjectId): array
+    {
+        return $this->rawProbeAllHosts(self::RESOURCE, [
+            'subjectId' => $subjectId, 'resolution' => 1080, 'page' => 1, 'perPage' => 20,
+        ]);
+    }
+
+    /**
+     * Try the `resource` endpoint with several parameter shapes to discover
+     * which one (if any) the API currently accepts — quickly reveals an API
+     * contract change (e.g. a param that must be added/removed/renamed).
+     *
+     * @return array<int,array<string,mixed>>
+     */
+    public function rawResourceVariants(string $subjectId): array
+    {
+        $variants = [
+            'current (res=1080,page,perPage)' => ['subjectId' => $subjectId, 'resolution' => 1080, 'page' => 1, 'perPage' => 20],
+            'no resolution' => ['subjectId' => $subjectId, 'page' => 1, 'perPage' => 20],
+            'subjectId only' => ['subjectId' => $subjectId],
+            'with se/ep = 1' => ['subjectId' => $subjectId, 'se' => 1, 'ep' => 1, 'resolution' => 1080, 'page' => 1, 'perPage' => 20],
+            'res=0' => ['subjectId' => $subjectId, 'resolution' => 0, 'page' => 1, 'perPage' => 20],
+            'subjectId as int-ish string, page from 0' => ['subjectId' => $subjectId, 'resolution' => 1080, 'page' => 0, 'perPage' => 20],
+        ];
+
+        $out = [];
+        foreach ($variants as $label => $params) {
+            $out[] = ['variant' => $label] + $this->probeOnce(self::RESOURCE, $params);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Diagnostic: bootstrap a FRESH random device identity + token and retry
+     * `resource`. If this succeeds where the configured device fails, the
+     * hardcoded device_id/gaid is flagged and should be randomised per install.
+     *
+     * @return array<string,mixed>
+     */
+    public function probeFreshDevice(string $subjectId): array
+    {
+        $deviceId = bin2hex(random_bytes(16));
+        $gaid = sprintf(
+            '%s-%s-%s-%s-%s',
+            bin2hex(random_bytes(4)), bin2hex(random_bytes(2)), bin2hex(random_bytes(2)),
+            bin2hex(random_bytes(2)), bin2hex(random_bytes(6))
+        );
+        $ci = json_decode($this->clientInfo, true) ?: [];
+        $ci['device_id'] = $deviceId;
+        $ci['gaid'] = $gaid;
+
+        $savedCi = $this->clientInfo;
+        $savedToken = $this->token;
+        $savedBootstrapped = $this->bootstrapped;
+
+        $this->clientInfo = json_encode($ci, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        $this->token = null;
+
+        $result = ['deviceId' => $deviceId];
+        try {
+            // Fresh token for the new device (no auth header on this call).
+            $this->request('GET', self::MAIN_PAGE, ['page' => 1, 'tabId' => 0, 'version' => '']);
+            $result['freshTokenOk'] = is_string($this->token) && $this->token !== '' && $this->token !== $savedToken;
+            $result['resource'] = $this->probeOnce(self::RESOURCE, [
+                'subjectId' => $subjectId, 'resolution' => 1080, 'page' => 1, 'perPage' => 20,
+            ]);
+        } catch (Throwable $e) {
+            $result['error'] = class_basename($e).': '.$e->getMessage();
+        } finally {
+            $this->clientInfo = $savedCi;
+            $this->token = $savedToken;
+            $this->bootstrapped = $savedBootstrapped;
+            if (is_string($savedToken) && $savedToken !== '') {
+                Cache::put($this->tokenCacheKey(), $savedToken, $this->tokenTtl);
+            }
+        }
+
+        return $result;
+    }
+
+    /** Single signed GET on the active host, summarised, never throws. */
+    protected function probeOnce(string $path, array $params, bool $playMode = false): array
+    {
+        try {
+            $query = $params === [] ? '' : http_build_query($params, '', '&', PHP_QUERY_RFC3986);
+            $pathWithQuery = $query === '' ? $path : $path.'?'.$query;
+            $response = $this->buildClient('GET', $path, $params, null, $playMode)->get($this->activeBase.$pathWithQuery);
+            $this->absorbToken($response);
+            $json = json_decode((string) $response->body(), true);
+            $data = is_array($json) ? ($json['data'] ?? null) : null;
+
+            return [
+                'status' => $response->status(),
+                'code' => is_array($json) ? ($json['code'] ?? null) : null,
+                'message' => is_array($json) ? ($json['message'] ?? null) : null,
+                'listCount' => is_array($data) && is_array($data['list'] ?? null) ? count($data['list']) : null,
+            ];
+        } catch (Throwable $e) {
+            return ['error' => class_basename($e).': '.$e->getMessage()];
+        }
+    }
+
+    /**
+     * Perform the same signed GET against every host and summarise each result.
+     *
+     * @return array<int,array<string,mixed>>
+     */
+    public function rawProbeAllHosts(string $path, array $params = [], bool $playMode = false): array
+    {
+        $this->ensureBootstrapped();
+
+        $query = $params === [] ? '' : http_build_query($params, '', '&', PHP_QUERY_RFC3986);
+        $pathWithQuery = $query === '' ? $path : $path.'?'.$query;
+
+        $out = [];
+        foreach ($this->hostPool as $base) {
+            try {
+                $response = $this->buildClient('GET', $path, $params, null, $playMode)->get($base.$pathWithQuery);
+                $this->absorbToken($response);
+                $json = json_decode((string) $response->body(), true);
+                $data = is_array($json) ? ($json['data'] ?? null) : null;
+                $out[] = [
+                    'host' => $base,
+                    'status' => $response->status(),
+                    'code' => is_array($json) ? ($json['code'] ?? null) : null,
+                    'message' => is_array($json) ? ($json['message'] ?? null) : null,
+                    'listCount' => is_array($data) && is_array($data['list'] ?? null) ? count($data['list']) : null,
+                ];
+            } catch (Throwable $e) {
+                $out[] = ['host' => $base, 'error' => class_basename($e).': '.$e->getMessage()];
+            }
+        }
+
+        return $out;
+    }
+
+    /** Raw diagnostic probe of the `play-info` endpoint. */
+    public function rawPlayInfoProbe(string $subjectId, int $se = 0, int $ep = 0): array
+    {
+        return $this->rawProbe(self::PLAY_INFO, [
+            'subjectId' => $subjectId, 'se' => $se, 'ep' => $ep,
+        ], playMode: true);
+    }
+
     // -----------------------------------------------------------------
     // Transport
     // -----------------------------------------------------------------
@@ -208,7 +467,7 @@ class MovieBoxClient
             return;
         }
 
-        $cached = Cache::get(self::TOKEN_CACHE_KEY);
+        $cached = Cache::get($this->tokenCacheKey());
         if (is_string($cached) && $cached !== '') {
             $this->token = $cached;
             $this->bootstrapped = true;
@@ -337,7 +596,7 @@ class MovieBoxClient
         $decoded = json_decode($xUser, true);
         if (is_array($decoded) && ! empty($decoded['token'])) {
             $this->token = $decoded['token'];
-            Cache::put(self::TOKEN_CACHE_KEY, $this->token, $this->tokenTtl);
+            Cache::put($this->tokenCacheKey(), $this->token, $this->tokenTtl);
         }
     }
 

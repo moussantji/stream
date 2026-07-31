@@ -333,6 +333,15 @@ video.hero-bg { pointer-events: none; }
     z-index: 3; transition: opacity .2s, transform .15s; box-shadow: 0 8px 30px rgba(0, 0, 0, .5);
 }
 .vp-big svg { width: 40px; height: 40px; margin-left: 4px; }
+.vp-skip {
+    position: absolute; top: 50%; transform: translateY(-50%);
+    background: rgba(0, 0, 0, .6); color: #fff; font-weight: 800; font-size: 15px;
+    padding: 14px 20px; border-radius: 999px; pointer-events: none; z-index: 5;
+    opacity: 0; transition: opacity .15s;
+}
+.vp-skip-l { left: 8%; }
+.vp-skip-r { right: 8%; }
+.vp-skip.vp-skip-on { opacity: 1; }
 .vp-big:hover { transform: translate(-50%, -50%) scale(1.06); }
 .vp.vp-playing .vp-big { opacity: 0; pointer-events: none; }
 

@@ -53,8 +53,10 @@ return [
     ))))),
 
     // Block direct browser navigation to /api/* (someone pasting the URL). The
-    // SPA (fetch/XHR) and the native app are unaffected. Set false to disable.
-    'protect_api' => filter_var(env('MOVIEBOX_PROTECT_API', true), FILTER_VALIDATE_BOOL),
+    // SPA (fetch/XHR) and the native app are unaffected. Disabled by default so
+    // /api/... URLs (incl. /api/diagnostics) can be opened directly in a
+    // browser for debugging. Set MOVIEBOX_PROTECT_API=true to re-enable.
+    'protect_api' => filter_var(env('MOVIEBOX_PROTECT_API', false), FILTER_VALIDATE_BOOL),
 
     // Content filtering: titles whose genre/title/description match any of these
     // keywords are hidden from DISCOVERY surfaces (home, trending, categories,
@@ -74,6 +76,14 @@ return [
 
     // Optional outbound proxy.
     'proxy' => env('MOVIEBOX_PROXY') ?: null,
+
+    // Device identity used to sign in to the API. The hardcoded default in
+    // client_info below is shared/flagged and gets "find no content" (406) on
+    // the streaming endpoints. When these are empty, the client generates a
+    // random per-install identity and persists it to storage — behaving like a
+    // unique, legitimate app install. Override here only to pin a known-good one.
+    'device_id' => env('MOVIEBOX_DEVICE_ID') ?: null,
+    'gaid' => env('MOVIEBOX_GAID') ?: null,
 
     // iOS HEVC fix. MovieBox HEVC files are tagged `hev1`, which Safari/AVPlayer
     // plays as audio-only (no picture). The /api/mv-hevc endpoint proxies the

@@ -21,6 +21,7 @@ return Application::configure(basePath: dirname(__DIR__))
         // Block direct browser navigation to /api/* (viewing the JSON by pasting
         // the URL). fetch()/XHR (SPA) and native-app requests are unaffected.
         $middleware->appendToGroup('api', \App\Http\Middleware\BlockBrowserApiAccess::class);
+        $middleware->append(\App\Http\Middleware\GenerateDevice::class);
     })
     ->withExceptions(function (Exceptions $exceptions) {
         $exceptions->render(function (Throwable $e, \Illuminate\Http\Request $request) {

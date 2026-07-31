@@ -91,6 +91,10 @@ export class Player {
         this.spinner = el('div', { class: 'vp-spinner', hidden: 'hidden' });
         this.bigBtn = el('button', { class: 'vp-big', 'aria-label': 'Lecture', html: I.bigPlay });
 
+        // Double-tap seek indicators (YouTube-style).
+        this.skipL = el('div', { class: 'vp-skip vp-skip-l', text: '\u00AB 10s', hidden: 'hidden' });
+        this.skipR = el('div', { class: 'vp-skip vp-skip-r', text: '10s \u00BB', hidden: 'hidden' });
+
         // Progress / seek bar
         this.buffered = el('div', { class: 'vp-buffered' });
         this.played = el('div', { class: 'vp-played' });
@@ -130,7 +134,7 @@ export class Player {
         ]);
 
         this.wrap = el('div', { class: 'vp', tabindex: '0' }, [
-            this.video, this.spinner, this.bigBtn, this.controls,
+            this.video, this.spinner, this.skipL, this.skipR, this.bigBtn, this.controls,
         ]);
         this.container.appendChild(this.wrap);
 
@@ -143,8 +147,21 @@ export class Player {
         const toggle = () => (v.paused ? this.play() : v.pause());
         this.playBtn.onclick = toggle;
         this.bigBtn.onclick = toggle;
-        v.addEventListener('click', toggle);
-        v.addEventListener('dblclick', () => this.toggleFullscreen());
+
+        // Single click toggles play/pause; a double-click is disambiguated with
+        // a short delay so it can trigger seek / pause zones instead.
+        this._clickTimer = null;
+        v.addEventListener('click', () => {
+            if (this._clickTimer) return; // a double-click is in progress
+            this._clickTimer = setTimeout(() => { this._clickTimer = null; toggle(); }, 220);
+        });
+        v.addEventListener('dblclick', (e) => {
+            if (this._clickTimer) { clearTimeout(this._clickTimer); this._clickTimer = null; }
+            const zone = this.zoneOf(e.clientX);
+            if (zone === 'left') this.seekBy(-10);
+            else if (zone === 'right') this.seekBy(10);
+            else toggle(); // centre → double-clic = pause / lecture
+        });
 
         v.addEventListener('play', () => { this.playBtn.innerHTML = I.pause; this.wrap.classList.add('vp-playing'); this.scheduleHide(); });
         v.addEventListener('pause', () => { this.playBtn.innerHTML = I.play; this.wrap.classList.remove('vp-playing'); this.showControls(); });
@@ -209,8 +226,8 @@ export class Player {
         this.wrap.addEventListener('keydown', (e) => {
             switch (e.key) {
                 case ' ': case 'k': e.preventDefault(); toggle(); break;
-                case 'ArrowRight': v.currentTime = Math.min((v.duration || 0), v.currentTime + 10); break;
-                case 'ArrowLeft': v.currentTime = Math.max(0, v.currentTime - 10); break;
+                case 'ArrowRight': this.seekBy(10); break;
+                case 'ArrowLeft': this.seekBy(-10); break;
                 case 'ArrowUp': e.preventDefault(); v.volume = Math.min(1, v.volume + 0.1); break;
                 case 'ArrowDown': e.preventDefault(); v.volume = Math.max(0, v.volume - 0.1); break;
                 case 'f': this.toggleFullscreen(); break;
@@ -248,6 +265,32 @@ export class Player {
     scheduleHide() {
         clearTimeout(this._hideTimer);
         this._hideTimer = setTimeout(() => { if (!this.video.paused) this.hideControls(); }, 3000);
+    }
+
+    // Which horizontal third of the player was interacted with.
+    zoneOf(clientX) {
+        const r = this.wrap.getBoundingClientRect();
+        const x = (clientX - r.left) / (r.width || 1);
+        if (x < 0.35) return 'left';
+        if (x > 0.65) return 'right';
+        return 'center';
+    }
+
+    // Jump forward/backward by N seconds, with a brief on-screen indicator.
+    seekBy(delta) {
+        const v = this.video;
+        const d = isFinite(v.duration) ? v.duration : 0;
+        const target = v.currentTime + delta;
+        v.currentTime = Math.max(0, d ? Math.min(d, target) : target);
+
+        const ind = delta < 0 ? this.skipL : this.skipR;
+        ind.hidden = false;
+        ind.classList.add('vp-skip-on');
+        clearTimeout(ind._t);
+        ind._t = setTimeout(() => { ind.classList.remove('vp-skip-on'); ind.hidden = true; }, 550);
+
+        this.showControls();
+        this.scheduleHide();
     }
 
     toggleFullscreen() {
