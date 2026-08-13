@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Services\DioStream\DioStreamClient;
 use App\Services\MovieBox\MovieBoxClient;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -10,10 +11,16 @@ use Illuminate\Http\Response;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
+use Symfony\Component\HttpFoundation\StreamedResponse;
 
 class StreamController extends Controller
 {
-    public function __construct(protected MovieBoxClient $client) {}
+    public function __construct(
+        protected MovieBoxClient $client,
+        protected ?DioStreamClient $dio = null
+    ) {
+        $this->dio ??= app(DioStreamClient::class);
+    }
 
     /**
      * Resolve playable sources for a title. For movies pass season=0 & episode=0;
@@ -22,11 +29,54 @@ class StreamController extends Controller
     public function play(Request $request): JsonResponse
     {
         $v = $this->validatePayload($request);
-        $debug = $request->boolean('debug') || config('app.debug');
+        // The debug payload (upstream diagnostics) is only built on an explicit
+        // ?debug=1 request, which also bypasses the endpoint cache below.
+        $debug = $request->boolean('debug');
+
+        // Endpoint-level cache: the resolution below fans out to several
+        // upstream calls; replaying it for the same subject/season/episode is
+        // wasteful. TTL stays well under the 2h proxy-token lifetime.
+        $ttl = min((int) config('moviebox.snapshot_ttl', 900), 3600);
+        $cacheKey = 'stream:play:'.$v['subjectId'].':'.$v['season'].':'.$v['episode'];
+
+        if (! $debug && $ttl > 0 && ($cached = Cache::get($cacheKey)) !== null) {
+            return response()->json(['data' => $cached]);
+        }
+
         $diag = [];
+        $payload = $this->resolvePlayPayload($v, $diag, $debug);
+
+        // Only cache resolvable results, never "no stream" outcomes that may
+        // be transient upstream errors.
+        if (! $debug && $ttl > 0 && $payload['hasResource']) {
+            Cache::put($cacheKey, $payload, $ttl);
+        }
+
+        return response()->json(['data' => $payload]);
+    }
+
+    /**
+     * Resolve every playable source for a title (the work behind /api/play).
+     *
+     * The adaptive `play-info` and the first `resource` page are fetched in a
+     * single concurrent round trip (MovieBoxClient::playBundle), halving the
+     * cold-start latency.
+     *
+     * @param  array{subjectId:string,season:int,episode:int,title:string}  $v
+     * @param  array<string,mixed>  $diag
+     * @return array<string,mixed>
+     */
+    protected function resolvePlayPayload(array $v, array &$diag, bool $debug): array
+    {
+        $bundle = $this->client->playBundle($v['subjectId'], $v['season'], $v['episode']);
+
+        $stream = $this->resolvePlayInfo($v['subjectId'], $v['season'], $v['episode'], $diag, $debug, $bundle['playInfo'] ?? null);
+        $dash = $stream['dash'];
+        $hls = $stream['hls'];
+        $subtitles = $stream['subtitles'];
 
         $meta = null;
-        $files = $this->resolveVideoFiles($v['subjectId'], $v['season'], $v['episode'], $diag, $meta);
+        $files = $this->resolveVideoFiles($v['subjectId'], $v['season'], $v['episode'], $diag, $meta, $bundle['resource1'] ?? null);
         $sourceSubjectId = $v['subjectId'];
 
         // The requested episode isn't in this subject. Many French-dubbed titles
@@ -51,22 +101,58 @@ class StreamController extends Controller
         }
 
         $sources = $this->normalizeSources($files);
-        $hls = [];
-        $subtitles = $this->resolveSubtitles($sourceSubjectId, $files, $diag);
 
-        // No downloadable MP4 for this episode? Fall back to the adaptive
-        // streaming endpoint (play-info). The provider's own web player streams
-        // from here, and it often carries episodes that were never published as
-        // downloadable files (e.g. S4 E1/E2 when only E3 is downloadable).
-        $dash = [];
-        if ($sources === []) {
-            $stream = $this->resolvePlayInfo($sourceSubjectId, $v['season'], $v['episode'], $diag, $debug);
-            $sources = $stream['sources'];
-            $hls = $stream['hls'];
-            $dash = $stream['dash'];
-            if ($subtitles === [] && $stream['subtitles'] !== []) {
-                $subtitles = $stream['subtitles'];
+        // H5 transport: merge its downloadable MP4s (H.264; free tiers cap at
+        // 480p, 1080p stays vipLocked) with the mobile sources. When both
+        // transports have the same resolution the best codec wins; nothing
+        // extra upstream is needed (the H5 API works without a token). The
+        // RAW files are merged and normalized in a single pass so proxying
+        // and HEVC detection see the original CDN URLs.
+        $h5 = $this->resolveH5Download($v['subjectId'], $v['season'], $v['episode'], $diag);
+        if ($h5['sources'] !== []) {
+            $sources = $this->normalizeSources(array_merge($files, $h5['sources']));
+        }
+
+        // A fully-converted Streamtape copy is preferred over the raw CDN
+        // files: it plays in any browser without proxying or codec hacks and
+        // offloads the upstream CDN. It is injected as the first source, but
+        // only while the remote file is confirmed alive (Streamtape purges
+        // files at any time), otherwise the CDN sources stay in front.
+        if (config('moviebox.streamtape_fallback', false)) {
+            $stRow = \App\Models\StreamtapeLink::query()
+                ->where('subject_id', $v['subjectId'])
+                ->where('season', $v['season'])
+                ->where('episode', $v['episode'])
+                ->where('status', 'done')
+                ->whereNotNull('streamtape_url')
+                ->where('streamtape_url', '!=', '')
+                ->latest()
+                ->first();
+            if ($stRow && $this->streamtapeLinkAvailable($stRow)) {
+                array_unshift($sources, [
+                    'url' => $stRow->streamtape_url,
+                    'resolution' => $stRow->resolution,
+                    'quality' => ($stRow->resolution ?: 0).'p',
+                    'size' => $stRow->bytes_total,
+                    'format' => 'streamtape',
+                    'codec' => 'h264',
+                    'source' => 'streamtape',
+                ]);
+
+                // Attach the subtitles captured at upload time (DioStream rows
+                // store the FR/EN subtitle URLs; MovieBox rows have none).
+                if ($subtitles === [] && is_array($stRow->subtitle_urls)) {
+                    $subtitles = $this->normalizeCaptions($stRow->subtitle_urls);
+                }
             }
+        }
+
+        // Prefer the adaptive subtitles when present, else the MP4's captions.
+        if ($subtitles === [] && $files !== []) {
+            $subtitles = $this->resolveSubtitles($sourceSubjectId, $files, $diag);
+        }
+        if ($subtitles === [] && $h5['captions'] !== []) {
+            $subtitles = $this->normalizeCaptions($h5['captions']);
         }
 
         $payload = [
@@ -76,6 +162,24 @@ class StreamController extends Controller
             'subtitles' => $subtitles,
             'hasResource' => $sources !== [] || $hls !== [] || $dash !== [],
         ];
+
+        // When nothing resolved, tell the client WHY so it can distinguish a
+        // genuinely unavailable title from a transient upstream failure (which
+        // deserves a retry) instead of always showing a dead-end message.
+        if (! $payload['hasResource']) {
+            $payload['streamError'] = $this->resolutionError($diag);
+        }
+
+        // DioStream fallback: when the MovieBox transport found nothing, try
+        // the diostream.cc backend (keyed by TMDB id). The subject id is used
+        // directly when it is numeric (MovieBox subject ids are TMDB-based);
+        // otherwise the title is resolved through the DioStream search.
+        if (! $payload['hasResource']) {
+            $dioPayload = $this->resolveDioFallback($v, $diag);
+            if ($dioPayload !== null) {
+                $payload = $dioPayload;
+            }
+        }
 
         if ($debug) {
             $payload['debug'] = [
@@ -87,7 +191,136 @@ class StreamController extends Controller
             ];
         }
 
-        return response()->json(['data' => $payload]);
+        return $payload;
+    }
+
+    /**
+     * Resolve a playable source through the DioStream backend.
+     *
+     * @param  array{subjectId:string,season:int,episode:int,title:string}  $v
+     * @param  array<string,mixed>  $diag
+     * @return array<string,mixed>|null null when nothing resolvable
+     */
+    protected function resolveDioFallback(array $v, array &$diag): ?array
+    {
+        try {
+            $tmdb = $this->dioTmdbId($v, $diag);
+            if ($tmdb === null) {
+                return null;
+            }
+
+            $raw = $v['season'] > 0
+                ? $this->dio->tvStream($tmdb, $v['season'], $v['episode'])
+                : $this->dio->movieStream($tmdb);
+
+            if (empty($raw['providers'])) {
+                $diag['diostream'] = ['tmdb' => $tmdb, 'error' => 'no providers'];
+                return null;
+            }
+
+            $sources = $this->dio->streamSources($raw);
+            if ($sources === []) {
+                $diag['diostream'] = ['tmdb' => $tmdb, 'error' => 'no sources'];
+                return null;
+            }
+
+            $diag['diostream'] = [
+                'tmdb' => $tmdb,
+                'source' => $raw['source'] ?? null,
+                'streams' => count($sources),
+            ];
+
+            return [
+                'sources' => $sources,
+                'hls' => null,
+                'dash' => null,
+                'subtitles' => $this->dio->streamSubtitles($raw),
+                'hasResource' => true,
+                'provider' => 'diostream',
+                'streamError' => null,
+            ];
+        } catch (\Throwable $e) {
+            report($e);
+            $diag['diostream'] = ['error' => $e->getMessage()];
+
+            return null;
+        }
+    }
+
+    /**
+     * Resolve the TMDB id for a play request: the subject id itself when it is
+     * numeric, otherwise the first matching DioStream search result.
+     *
+     * @param  array{subjectId:string,season:int,episode:int,title:string}  $v
+     * @param  array<string,mixed>  $diag
+     */
+    protected function dioTmdbId(array $v, array &$diag): ?string
+    {
+        if (ctype_digit((string) $v['subjectId'])) {
+            return (string) $v['subjectId'];
+        }
+
+        $title = trim((string) ($v['title'] ?? ''));
+        if ($title === '') {
+            return null;
+        }
+
+        $results = $this->dio->search($title)['results'] ?? [];
+        $want = $v['season'] > 0 ? 'tv' : 'movie';
+        foreach ($results as $r) {
+            if (is_array($r) && ($r['media_type'] ?? '') === $want && ! empty($r['tmdb_id'])) {
+                return (string) $r['tmdb_id'];
+            }
+        }
+        foreach ($results as $r) {
+            if (is_array($r) && in_array($r['media_type'] ?? '', ['movie', 'tv'], true) && ! empty($r['tmdb_id'])) {
+                return (string) $r['tmdb_id'];
+            }
+        }
+
+        $diag['diostream'] = ['error' => 'no tmdb match for title', 'title' => $title];
+
+        return null;
+    }
+
+    /**
+     * Extract the first upstream error from the diagnostic log, with a retry
+     * hint. Returns null when the resolution succeeded but simply found no
+     * stream (the title is genuinely unavailable upstream).
+     *
+     * @param  array<string,mixed>  $diag
+     * @return array{message:string,detail:string,retryable:bool}|null
+     */
+    protected function resolutionError(array $diag): ?array
+    {
+        $msg = null;
+        $retryable = false;
+
+        foreach ($diag as $v) {
+            if (! is_array($v) || empty($v['error'])) {
+                continue;
+            }
+            $err = (string) $v['error'];
+            $retryable = $retryable
+                || str_contains($err, '429')
+                || str_contains($err, 'timed out')
+                || str_contains($err, 'Connection')
+                || str_contains($err, 'unreachable')
+                || str_contains($err, 'HTTP 500')
+                || str_contains($err, 'HTTP 502')
+                || str_contains($err, 'HTTP 503');
+            $msg = $msg ?? $err;
+        }
+
+        if ($msg === null) {
+            return null;
+        }
+
+        return [
+            'message' => 'Le fournisseur de flux n\'a pas répondu correctement.',
+            'detail' => $msg,
+            'retryable' => $retryable,
+        ];
     }
 
     /** Downloadable media files + subtitle files. */
@@ -97,93 +330,169 @@ class StreamController extends Controller
         $diag = [];
 
         $files = $this->resolveVideoFiles($v['subjectId'], $v['season'], $v['episode'], $diag);
+        $h5 = $this->resolveH5Download($v['subjectId'], $v['season'], $v['episode'], $diag);
 
         return response()->json([
             'data' => [
-                'downloads' => $this->normalizeSources($files),
-                'subtitles' => $this->resolveSubtitles($v['subjectId'], $files, $diag),
-                'hasResource' => $files !== [],
+                'downloads' => $this->normalizeSources(array_merge($files, $h5['sources'])),
+                'subtitles' => $h5['captions'] !== []
+                    ? $this->normalizeCaptions($h5['captions'])
+                    : $this->resolveSubtitles($v['subjectId'], $files, $diag),
+                'hasResource' => $files !== [] || $h5['sources'] !== [],
             ],
         ]);
+    }
+
+    /**
+     * Downloadable H5 sources (MP4s at every free resolution) plus captions
+     * for a subject/season/episode. The transport is optional: any failure
+     * here is logged in $diag and treated as "no H5 sources" — callers fall
+     * back to the signed mobile API untouched.
+     *
+     * @param  array<string,mixed>  $diag
+     * @return array{sources:array<int,array<string,mixed>>,captions:array<int,mixed>}
+     */
+    protected function resolveH5Download(string $subjectId, int $season, int $episode, array &$diag): array
+    {
+        $out = ['sources' => [], 'captions' => []];
+
+        $data = ['downloads' => [], 'captions' => []];
+        try {
+            $data = $this->client->h5Download($subjectId, $season, $episode);
+        } catch (\Throwable $e) {
+            report($e);
+            $diag['h5Download'] = ['ok' => false, 'error' => class_basename($e).': '.$e->getMessage()];
+        }
+
+        $out['captions'] = is_array($data['captions'] ?? null) ? $data['captions'] : [];
+
+        // `subject/play` complements the download endpoint: same direct MP4s
+        // (H.264), but its free tier is not capped at 480p — 1080p streams
+        // come back unlocked. Merge both and let normalizeSources keep the
+        // best codec per resolution (identical URLs dedupe naturally).
+        try {
+            $play = $this->client->h5Play($subjectId, $season, $episode);
+            $diag['h5Play'] = ['ok' => true, 'sources' => count($play['downloads'])];
+            foreach (is_array($play['downloads'] ?? null) ? $play['downloads'] : [] as $d) {
+                $data['downloads'][] = $d;
+            }
+        } catch (\Throwable $e) {
+            report($e);
+            $diag['h5Play'] = ['ok' => false, 'error' => class_basename($e).': '.$e->getMessage()];
+        }
+
+        foreach (is_array($data['downloads'] ?? null) ? $data['downloads'] : [] as $d) {
+            $resolution = (int) ($d['resolution'] ?? 0);
+            $out['sources'][] = [
+                'url' => (string) $d['url'],
+                'resolution' => $resolution,
+                'quality' => $resolution > 0 ? $resolution.'p' : 'auto',
+                'size' => isset($d['size']) ? (int) $d['size'] : null,
+                'format' => 'mp4',
+                'codecName' => $d['codecName'] ?? null,
+                'durationSeconds' => isset($d['duration']) ? (int) $d['duration'] : null,
+            ];
+        }
+
+        $diag['h5Download'] = [
+            'ok' => true,
+            'sources' => count($out['sources']),
+            'captions' => count($out['captions']),
+        ];
+
+        return $out;
     }
 
     /**
      * Fetch the resource list and return the video files matching the requested
      * season/episode (all resolution variants for a movie).
      *
+     * The first page may be passed in pre-fetched from the concurrent
+     * `playBundle` round trip, avoiding a second sequential upstream call.
+     *
      * @param  array<string,mixed>  $diag
+     * @param  array<string,mixed>|null  $meta
+     * @param  array<string,mixed>|null  $firstPage
      * @return array<int,array<string,mixed>>
      */
-    protected function resolveVideoFiles(string $subjectId, int $season, int $episode, array &$diag, ?array &$meta = null): array
+    protected function resolveVideoFiles(string $subjectId, int $season, int $episode, array &$diag, ?array &$meta = null, ?array $firstPage = null): array
     {
         $isMovie = $season === 0 && $episode === 0;
         // `resource` returns a flat list of every episode across all seasons,
-        // 20 per page (the API caps perPage at 20 — larger values are rejected).
-        // Scan enough pages to reach later seasons, otherwise their episodes
-        // fall past the pagination window and surface as "no stream available".
+        // 20 per page (the API caps perPage at 20 — larger values are rejected),
+        // but only ONE resolution tier per request. Hardcoding a single tier
+        // hides whole seasons whenever that tier is missing (e.g. From S4 VF
+        // has no 1080p except S4E3 — the whole season only exists at 480p),
+        // so every tier is probed and the matches merged.
         $maxPages = $isMovie ? 1 : 40;
         $matched = [];
         $firstPageFiles = [];      // used to detect / play a single-video subject
         $hasEpisodeStructure = false;
-        $page = 1;
 
-        do {
-            try {
-                $res = $this->client->resource($subjectId, 1080, $page, 20);
-            } catch (\Throwable $e) {
-                report($e);
-                $diag["resource_page_$page"] = ['ok' => false, 'error' => class_basename($e).': '.$e->getMessage()];
-                break;
-            }
-
-            $list = is_array($res['list'] ?? null) ? $res['list'] : [];
-
-            // Debug sample: what se/ep does each file carry? ("*" = has a link)
-            $seEpSample = [];
-            foreach ($list as $it) {
-                if (is_array($it)) {
-                    $seEpSample[] = 's'.($it['se'] ?? '?').'e'.($it['ep'] ?? '?')
-                        .(empty($it['resourceLink']) ? '' : '*');
-                }
-            }
-
-            $diag["resource_page_$page"] = [
-                'ok' => true,
-                'listCount' => count($list),
-                'hasMore' => $res['pager']['hasMore'] ?? false,
-                'seEp' => $seEpSample,
-            ];
-
-            if ($isMovie) {
-                $matched = array_values(array_filter(
-                    $list,
-                    fn ($it) => is_array($it) && ! empty($it['resourceLink'])
-                ));
-                break;
-            }
-
-            foreach ($list as $it) {
-                if (! is_array($it) || empty($it['resourceLink'])) {
-                    continue;
+        foreach ([1080, 720, 480, 360] as $tier) {
+            $page = 1;
+            do {
+                if ($page === 1 && $tier === 1080 && $firstPage !== null) {
+                    $res = $firstPage;
+                } else {
+                    try {
+                        $res = $this->client->resource($subjectId, $tier, $page, 20);
+                    } catch (\Throwable $e) {
+                        report($e);
+                        $diag["resource_{$tier}_page_$page"] = ['ok' => false, 'error' => class_basename($e).': '.$e->getMessage()];
+                        break;
+                    }
                 }
 
-                $se = (int) ($it['se'] ?? 0);
-                $ep = (int) ($it['ep'] ?? 0);
+                $list = is_array($res['list'] ?? null) ? $res['list'] : [];
 
-                if ($se > 0 || $ep > 0) {
-                    $hasEpisodeStructure = true;
+                // Debug sample: what se/ep does each file carry? ("*" = has a link)
+                $seEpSample = [];
+                foreach ($list as $it) {
+                    if (is_array($it)) {
+                        $seEpSample[] = 's'.($it['se'] ?? '?').'e'.($it['ep'] ?? '?')
+                            .(empty($it['resourceLink']) ? '' : '*');
+                    }
                 }
-                if ($page === 1) {
-                    $firstPageFiles[] = $it;
-                }
-                if ($se === $season && $ep === $episode) {
-                    $matched[] = $it;
-                }
-            }
 
-            $hasMore = (bool) ($res['pager']['hasMore'] ?? false);
-            $page++;
-        } while ($matched === [] && $hasMore && $page <= $maxPages);
+                $diag["resource_{$tier}_page_$page"] = [
+                    'ok' => true,
+                    'listCount' => count($list),
+                    'hasMore' => $res['pager']['hasMore'] ?? false,
+                    'seEp' => $seEpSample,
+                ];
+
+                if ($isMovie) {
+                    $matched = array_values(array_filter(
+                        $list,
+                        fn ($it) => is_array($it) && ! empty($it['resourceLink'])
+                    ));
+                    break 2;
+                }
+
+                foreach ($list as $it) {
+                    if (! is_array($it) || empty($it['resourceLink'])) {
+                        continue;
+                    }
+
+                    $se = (int) ($it['se'] ?? 0);
+                    $ep = (int) ($it['ep'] ?? 0);
+
+                    if ($se > 0 || $ep > 0) {
+                        $hasEpisodeStructure = true;
+                    }
+                    if ($page === 1 && $tier === 1080) {
+                        $firstPageFiles[] = $it;
+                    }
+                    if ($se === $season && $ep === $episode) {
+                        $matched[] = $it;
+                    }
+                }
+
+                $hasMore = (bool) ($res['pager']['hasMore'] ?? false);
+                $page++;
+            } while ($matched === [] && $hasMore && $page <= $maxPages);
+        }
 
         $meta = ['hasEpisodeStructure' => $hasEpisodeStructure, 'firstPageFiles' => $firstPageFiles];
 
@@ -329,19 +638,24 @@ class StreamController extends Controller
      * cookie issues).
      *
      * @param  array<string,mixed>  $diag
+     * @param  array<string,mixed>|null  $prefetched  play-info data already fetched by playBundle
      * @return array{sources:array<int,array<string,mixed>>,hls:array<int,string>,dash:array<int,string>,subtitles:array<int,array<string,mixed>>}
      */
-    protected function resolvePlayInfo(string $subjectId, int $season, int $episode, array &$diag, bool $debug = false): array
+    protected function resolvePlayInfo(string $subjectId, int $season, int $episode, array &$diag, bool $debug = false, ?array $prefetched = null): array
     {
         $out = ['sources' => [], 'hls' => [], 'dash' => [], 'subtitles' => []];
 
-        try {
-            $data = $this->client->playInfo($subjectId, $season, $episode);
-        } catch (\Throwable $e) {
-            report($e);
-            $diag['playInfo'] = ['ok' => false, 'error' => class_basename($e).': '.$e->getMessage()];
+        if ($prefetched === null) {
+            try {
+                $data = $this->client->playInfo($subjectId, $season, $episode);
+            } catch (\Throwable $e) {
+                report($e);
+                $diag['playInfo'] = ['ok' => false, 'error' => class_basename($e).': '.$e->getMessage()];
 
-            return $out;
+                return $out;
+            }
+        } else {
+            $data = $prefetched;
         }
 
         if (! is_array($data)) {
@@ -447,7 +761,7 @@ class StreamController extends Controller
      * signature stored under $token. Manifests are rewritten so any absolute
      * CDN URLs also flow back through this proxy.
      */
-    public function proxy(Request $request, string $token, string $path): Response
+    public function proxy(Request $request, string $token, string $path): Response|StreamedResponse
     {
         $sig = Cache::get("mvsig:$token");
         abort_unless(is_array($sig), 404, 'Stream link expired — reload the page.');
@@ -467,39 +781,108 @@ class StreamController extends Controller
             $target .= '?'.$sig['query'];
         }
 
-        $upstream = Http::withHeaders(array_filter([
-            'User-Agent' => config('moviebox.user_agent'),
-            'Range' => $request->header('Range'),
-        ]))->timeout((int) config('moviebox.timeout', 30))->get($target);
+        $headers = ['Access-Control-Allow-Origin' => '*'];
+        $isManifest = str_ends_with($path, '.mpd') || str_ends_with($path, '.m3u8');
+
+        // Manifests (MPD / m3u8): tiny and static per title — cache the raw
+        // upstream body so a replay skips the CDN round-trip. The token-specific
+        // URL rewrite and the hev1 -> hvc1 codec patch are applied per request
+        // after cache retrieval.
+        if ($isManifest) {
+            $body = Cache::remember('mvm:'.sha1($target), 600, function () use ($target) {
+                $res = $this->fetchProxy($target, null);
+                abort_if($res->failed(), 502, 'Upstream media fetch failed.');
+
+                return $res->body();
+            });
+
+            $body = str_replace('https://'.$host.'/', url('/api/mv/'.$token).'/', $body);
+            if (str_ends_with($path, '.mpd')) {
+                $body = str_replace('hev1', 'hvc1', $body);
+            }
+
+            return response($body, 200, $headers + [
+                'Content-Type' => str_ends_with($path, '.m3u8')
+                    ? 'application/vnd.apple.mpegurl'
+                    : 'application/dash+xml',
+                'Cache-Control' => 'no-store',
+            ]);
+        }
+
+        // Init segments are tiny and static per rendition — cache them too.
+        // They are binary, so base64-encode before storing (the DB cache store
+        // holds TEXT values only).
+        if (str_contains($path, 'init')) {
+            $body = base64_decode((string) Cache::remember('mvi:'.sha1($target), 300, function () use ($target, $request) {
+                $res = $this->fetchProxy($target, $request->header('Range'));
+                abort_if($res->failed(), 502, 'Upstream media fetch failed.');
+
+                return base64_encode($res->body());
+            }), true);
+
+            return response(str_replace('hev1', 'hvc1', $body), 200, $headers + [
+                'Content-Type' => 'application/octet-stream',
+                'Content-Length' => (string) strlen($body),
+                'Cache-Control' => 'public, max-age=120',
+            ]);
+        }
+
+        // Media chunks / segments: stream them from the CDN to the browser so
+        // the first bytes arrive as soon as the CDN sends them (buffering the
+        // whole segment in PHP delayed the first frame). The sample-entry
+        // fourcc lives in the init segment — patched and cached separately
+        // above — so media chunks are streamed raw. Range requests are passed
+        // through, so seeking still works.
+        $range = $request->header('Range');
+        $upstream = Http::withOptions(['stream' => true])
+            ->withHeaders(array_filter([
+                'User-Agent' => config('moviebox.user_agent'),
+                'Range' => $range,
+            ]))
+            ->timeout((int) config('moviebox.timeout', 30))
+            ->get($target);
 
         abort_if($upstream->failed(), 502, 'Upstream media fetch failed.');
 
-        $body = $upstream->body();
-        $contentType = $upstream->header('Content-Type') ?: 'application/octet-stream';
-        $isManifest = str_ends_with($path, '.mpd') || str_ends_with($path, '.m3u8')
-            || str_contains($contentType, 'dash+xml') || str_contains($contentType, 'mpegurl');
+        $headers['Content-Type'] = $upstream->header('Content-Type') ?: 'application/octet-stream';
+        foreach (['Content-Range', 'Accept-Ranges', 'Content-Length'] as $h) {
+            $val = $upstream->header($h);
+            if ($val !== '') {
+                $headers[$h] = $val;
+            }
+        }
+        $headers['Cache-Control'] = 'public, max-age=120';
 
-        $headers = ['Access-Control-Allow-Origin' => '*'];
+        $body = $upstream->toPsrResponse()->getBody();
 
-        if ($isManifest) {
-            // Make absolute same-CDN URLs relative to this proxy token.
-            $body = str_replace('https://'.$host.'/', url('/api/mv/'.$token).'/', $body);
-            $headers['Content-Type'] = str_ends_with($path, '.m3u8') || str_contains($contentType, 'mpegurl')
-                ? 'application/vnd.apple.mpegurl'
-                : 'application/dash+xml';
-            $headers['Cache-Control'] = 'no-store';
-        } else {
-            $headers['Content-Type'] = $contentType;
-            foreach (['Content-Range', 'Accept-Ranges', 'Content-Length'] as $h) {
-                $val = $upstream->header($h);
-                if ($val !== '') {
-                    $headers[$h] = $val;
+        return response()->stream(function () use ($body) {
+            @set_time_limit(0);
+            while (true) {
+                try {
+                    $chunk = $body->read(65536);
+                } catch (\Throwable $e) {
+                    break;
+                }
+                if ($chunk === '') {
+                    break;
+                }
+                echo $chunk;
+                if (connection_aborted()) {
+                    break;
                 }
             }
-            $headers['Cache-Control'] = 'public, max-age=120';
-        }
+        }, $upstream->status(), $headers);
+    }
 
-        return response($body, $upstream->status(), $headers);
+    /**
+     * Fetch a proxied media resource from the CDN (User-Agent + optional Range).
+     */
+    protected function fetchProxy(string $target, ?string $range): \Illuminate\Http\Client\Response
+    {
+        return Http::withHeaders(array_filter([
+            'User-Agent' => config('moviebox.user_agent'),
+            'Range' => $range,
+        ]))->timeout((int) config('moviebox.timeout', 30))->get($target);
     }
 
     /**
@@ -572,6 +955,71 @@ class StreamController extends Controller
      * @param  array<int,mixed>  $files
      * @return array<int,array<string,mixed>>
      */
+    /**
+     * Whether the remote Streamtape file behind a `done` row is still alive.
+     *
+     * `file/info` is NOT a stable oracle: under heavy Streamtape load it
+     * intermittently answers `404` for perfectly healthy files, and purged
+     * files can alternate between `404` and `200` with a zero size / missing
+     * thumbnail. A link therefore only counts as available when a positive
+     * record (200 + non-zero size + live thumbnail) is observed; a verdict of
+     * death requires the 404 to be confirmed twice, so a transient API blip
+     * never poisons a healthy link. The verdict is cached per file.
+     */
+    protected function streamtapeLinkAvailable(\App\Models\StreamtapeLink $row): bool
+    {
+        $linkId = basename((string) parse_url((string) $row->streamtape_url, PHP_URL_PATH));
+        if ($linkId === '') {
+            return false;
+        }
+
+        return (bool) \Illuminate\Support\Facades\Cache::remember(
+            'streamtape.alive.'.$linkId,
+            600,
+            function () use ($row, $linkId): bool {
+                try {
+                    $service = app(\App\Services\Streamtape\StreamtapeService::class);
+                    $info = $service->fileInfo($linkId);
+                } catch (\Throwable) {
+                    return false;
+                }
+                $status = (int) ($info['status'] ?? 0);
+                $thumb = (string) ($info['thumb'] ?? '');
+                $size = (int) ($info['size'] ?? 0);
+
+                if ($status === 404) {
+                    // Transient API blips return 404 for healthy files; only
+                    // a second consecutive 404 is treated as a real deletion.
+                    usleep(1500000);
+                    try {
+                        $retry = $service->fileInfo($linkId);
+                    } catch (\Throwable) {
+                        return false;
+                    }
+                    if ((int) ($retry['status'] ?? 0) !== 404) {
+                        $thumb = (string) ($retry['thumb'] ?? '');
+                        $status = (int) ($retry['status'] ?? 0);
+                        $size = (int) ($retry['size'] ?? 0);
+                    }
+                }
+                if ($status === 404
+                    || ($status === 200 && $size <= 0)
+                    || ($status === 200 && $thumb === '')) {
+                    if ($row->status === 'done') {
+                        $row->update(['status' => 'failed', 'error' => 'Fichier purgé par Streamtape (lien mort)']);
+                    }
+
+                    return false;
+                }
+                if ($status !== 200) {
+                    return false;
+                }
+
+                return $service->hasThumb($thumb);
+            }
+        );
+    }
+
     protected function normalizeSources(array $files): array
     {
         $sources = [];
@@ -585,7 +1033,7 @@ class StreamController extends Controller
             }
 
             $resolution = (int) ($file['resolution'] ?? 0);
-            $codec = $file['codecName'] ?? null;
+            $codec = $file['codecName'] ?? $file['codec'] ?? null;
             $source = [
                 'url' => $url,
                 'resolution' => $resolution,
@@ -595,43 +1043,76 @@ class StreamController extends Controller
                 'codec' => $codec,
                 'durationSeconds' => isset($file['duration']) ? (int) $file['duration'] : null,
             ];
+            // The media CDN rejects plain browser requests (it requires the
+            // Android app UA — and the H5 download URLs additionally require
+            // the videodownloader.site referer). Every CDN MP4 is therefore
+            // served through the same-origin stream proxy, which attaches the
+            // right upstream headers.
+            if ($this->isCdnUrl($url)) {
+                $source['url'] = $this->streamUrl($url);
+            }
             // iOS-friendly playback URL for HEVC: routed through the remux proxy
             // that retags hev1 -> hvc1 so AVPlayer renders the picture.
-            if ($this->isHevc($codec) && is_string($url) && $this->remuxEnabled()) {
+            if ($this->isHevc($codec, $url) && is_string($url) && $this->remuxEnabled()) {
                 $source['remux'] = $this->remuxUrl($url);
             }
             $sources[] = $source;
         }
 
-        // Deduplicate by resolution, preferring H.264 (avc) over HEVC/H.265 for
-        // device compatibility (many phones only render H.264 — HEVC often plays
-        // audio without video, or nothing on iOS via a DASH fallback).
+        // Deduplicate by resolution, preferring H.264 over an unknown codec
+        // over HEVC/H.265 for device compatibility (many phones only render
+        // H.264 — HEVC often plays audio without video, or nothing on iOS via
+        // a DASH fallback). The mobile resource files usually carry no codec
+        // name at all, while the H5 downloads are explicit `h264`, so the H5
+        // files win at equal resolution.
+        $rank = function (?string $codec): int {
+            if ($this->isHevc($codec)) {
+                return 0;
+            }
+
+            return ($codec !== null && $codec !== '') ? 2 : 1;
+        };
         $byKey = [];
         foreach ($sources as $source) {
             $key = $source['resolution'] ?: $source['url'];
             $existing = $byKey[$key] ?? null;
             if ($existing === null) {
                 $byKey[$key] = $source;
+
                 continue;
             }
-            if ($this->isHevc($existing['codec'] ?? null) && ! $this->isHevc($source['codec'] ?? null)) {
+            if ($rank($source['codec'] ?? null) > $rank($existing['codec'] ?? null)) {
                 $byKey[$key] = $source;
             }
         }
         $out = array_values($byKey);
         // Highest resolution first, but H.264 ahead of HEVC at equal resolution.
-        usort($out, function ($a, $b) {
-            return [$b['resolution'], $this->isHevc($a['codec'] ?? null) ? 0 : 1]
-                <=> [$a['resolution'], $this->isHevc($b['codec'] ?? null) ? 0 : 1];
+        usort($out, function ($a, $b) use ($rank) {
+            return [$b['resolution'], $rank($b['codec'] ?? null)]
+                <=> [$a['resolution'], $rank($a['codec'] ?? null)];
         });
 
         return $out;
     }
 
-    /** True if the codec name looks like HEVC / H.265. */
-    protected function isHevc(?string $codec): bool
+    /** True if the codec name (or the file path) looks like HEVC / H.265. */
+    protected function isHevc(?string $codec, ?string $url = null): bool
     {
-        return (bool) preg_match('/hevc|h\.?265/i', (string) $codec);
+        return (bool) (preg_match('/hevc|h\.?265/i', (string) $codec)
+            || ($url !== null && preg_match('#/h265/|_h265_|/hevc/|\.hevc\.#i', $url)));
+    }
+
+    /** True if the URL points at the media CDN (needs proxying for browsers). */
+    protected function isCdnUrl(string $url): bool
+    {
+        $host = (string) parse_url($url, PHP_URL_HOST);
+        foreach ((array) config('moviebox.cdn_proxy_allow', []) as $suffix) {
+            if ($suffix !== '' && str_ends_with($host, $suffix)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /** Whether the HEVC->hvc1 fix endpoint is available. */
@@ -654,6 +1135,98 @@ class StreamController extends Controller
     }
 
     /**
+     * Same-origin proxy URL for a CDN MP4 (see streamMp4). The signature
+     * prevents the endpoint being abused as an open relay.
+     */
+    protected function streamUrl(string $url): string
+    {
+        $exp = time() + 6 * 3600;
+        $sig = hash_hmac('sha256', $url.'|'.$exp, (string) config('app.key'));
+
+        return url('/api/mv-mp4').'?'.http_build_query(['u' => $url, 'e' => $exp, 's' => $sig]);
+    }
+
+    /**
+     * Headers the CDN expects on the H5 download URLs (bcdnxw…): the same
+     * videodownloader.site browser context used by the H5 API itself.
+     *
+     * @return array<string,string>
+     */
+    protected function h5CdnHeaders(): array
+    {
+        return [
+            'Origin' => 'https://videodownloader.site',
+            'Referer' => 'https://videodownloader.site/',
+            'X-Client-Info' => json_encode(['timezone' => config('moviebox.timezone', 'Europe/Paris')]),
+            'X-Request-Lang' => (string) config('moviebox.language', 'fr'),
+        ];
+    }
+
+    /**
+     * Stream a CDN MP4 to the browser through our origin. The CDN only serves
+     * requests carrying the app headers a browser cannot send (the Android
+     * app UA; the H5 URLs additionally require the videodownloader.site
+     * referer), so the <video> element fetches this same-origin endpoint
+     * instead. Range requests are passed through, so seeking still works.
+     */
+    public function streamMp4(Request $request): StreamedResponse
+    {
+        $url = (string) $request->query('u', '');
+        $exp = (int) $request->query('e', 0);
+        $sig = (string) $request->query('s', '');
+
+        abort_if($url === '' || $exp <= 0 || $sig === '', 404);
+        abort_if(time() > $exp, 410, 'Link expired — reload the page.');
+        $expected = hash_hmac('sha256', $url.'|'.$exp, (string) config('app.key'));
+        abort_unless(hash_equals($expected, $sig), 403, 'Invalid signature.');
+        abort_unless($this->isCdnUrl($url), 403, 'Host not allowed.');
+
+        $headers = ['User-Agent' => (string) config('moviebox.user_agent')];
+        $host = (string) parse_url($url, PHP_URL_HOST);
+        if (str_contains($host, 'bcdnxw')) {
+            $headers = array_merge($headers, $this->h5CdnHeaders());
+        }
+
+        $range = $request->header('Range');
+        $upstream = Http::withOptions(['stream' => true])
+            ->withHeaders(array_filter(array_merge($headers, ['Range' => $range])))
+            ->timeout((int) config('moviebox.timeout', 30))
+            ->get($url);
+
+        abort_if($upstream->failed(), 502, 'Upstream media fetch failed.');
+
+        $outHeaders = ['Access-Control-Allow-Origin' => '*'];
+        $outHeaders['Content-Type'] = $upstream->header('Content-Type') ?: 'video/mp4';
+        foreach (['Content-Range', 'Accept-Ranges', 'Content-Length'] as $h) {
+            $val = $upstream->header($h);
+            if ($val !== '') {
+                $outHeaders[$h] = $val;
+            }
+        }
+        $outHeaders['Cache-Control'] = 'public, max-age=3600';
+
+        $body = $upstream->toPsrResponse()->getBody();
+
+        return response()->stream(function () use ($body) {
+            @set_time_limit(0);
+            while (true) {
+                try {
+                    $chunk = $body->read(65536);
+                } catch (\Throwable $e) {
+                    break;
+                }
+                if ($chunk === '') {
+                    break;
+                }
+                echo $chunk;
+                if (connection_aborted()) {
+                    break;
+                }
+            }
+        }, $upstream->status(), $outHeaders);
+    }
+
+    /**
      * Proxy an HEVC MP4 and rewrite the sample-entry fourcc `hev1` -> `hvc1`
      * on the fly so Safari / iOS AVPlayer renders the picture (they play
      * `hev1` as audio-only). Pure PHP (cURL) — no ffmpeg, so it runs on shared
@@ -663,7 +1236,7 @@ class StreamController extends Controller
      * the patch is applied byte-wise as the stream flows and is safe across
      * chunk / range boundaries.
      */
-    public function remuxHevc(Request $request): \Symfony\Component\HttpFoundation\StreamedResponse
+    public function remuxHevc(Request $request): StreamedResponse
     {
         $url = (string) $request->query('u', '');
         $exp = (int) $request->query('e', 0);

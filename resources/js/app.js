@@ -141,3 +141,10 @@ document.getElementById('bn-search')?.addEventListener('click', () => {
 if (isAuthed()) {
     api.me().then((u) => { if (u) setAuth(getToken(), u); }).catch(() => {});
 }
+
+// Warm up the adaptive-streaming libraries in the background so the first
+// play doesn't pay the download + parse cost of the dash.js / hls.js chunks.
+Promise.all([
+    import('dashjs').catch(() => {}),
+    import('hls.js').catch(() => {}),
+]);

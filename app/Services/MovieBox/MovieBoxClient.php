@@ -3,6 +3,7 @@
 namespace App\Services\MovieBox;
 
 use Illuminate\Http\Client\PendingRequest;
+use Illuminate\Http\Client\Pool;
 use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
@@ -22,6 +23,8 @@ class MovieBoxClient
     protected array $hostPool;
 
     protected string $activeBase;
+
+    protected string $h5Base;
 
     protected int $timeout;
 
@@ -59,6 +62,7 @@ class MovieBoxClient
     protected const SEASON_INFO = '/wefeed-mobile-bff/subject-api/season-info';
 
     protected const RESOURCE = '/wefeed-mobile-bff/subject-api/resource';
+    protected const RESOURCE_POSITION = '/wefeed-mobile-bff/subject-api/resource-position';
 
     protected const PLAY_INFO = '/wefeed-mobile-bff/subject-api/play-info';
 
@@ -73,6 +77,8 @@ class MovieBoxClient
 
         $this->hostPool = $config['host_pool'];
         $this->activeBase = $this->hostPool[0] ?? 'https://api6.aoneroom.com';
+        // h5_host may be the bare domain or already carry the API prefix.
+        $this->h5Base = rtrim(preg_replace('#/wefeed-h5api-bff$#', '', (string) ($config['h5_host'] ?? 'https://h5-api.aoneroom.com')), '/');
         $this->timeout = (int) $config['timeout'];
         $this->proxy = $config['proxy'] ?? null;
         $this->userAgent = $config['user_agent'];
@@ -171,11 +177,210 @@ class MovieBoxClient
         $perPage = max(1, min(20, $perPage));
         $key = 'search:'.md5("$keyword|$subjectType|$page|$perPage");
 
-        return $this->cached($key, fn () => $this->postData(
-            self::SEARCH,
-            ['keyword' => $keyword, 'page' => $page, 'perPage' => $perPage, 'subjectType' => $subjectType],
-            context: 'search'
-        ));
+        return $this->cached($key, function () use ($keyword, $subjectType, $page, $perPage) {
+            try {
+                return $this->h5Search($keyword, $subjectType, $page, $perPage);
+            } catch (Throwable $e) {
+                report($e);
+            }
+
+            return $this->postData(
+                self::SEARCH,
+                ['keyword' => $keyword, 'page' => $page, 'perPage' => $perPage, 'subjectType' => $subjectType],
+                context: 'search'
+            );
+        });
+    }
+
+    // -----------------------------------------------------------------
+    // H5 web API ("wefeed-h5api-bff") — the browser-facing transport.
+    // Works with plain browser-like headers only (no JWT needed). Every
+    // call is optional: any failure here falls back to the signed mobile
+    // API used for playback today.
+    // -----------------------------------------------------------------
+
+    protected const H5_SEARCH = '/wefeed-h5api-bff/subject/search';
+    protected const H5_DETAIL = '/wefeed-h5api-bff/detail';
+    protected const H5_DOWNLOAD = '/wefeed-h5api-bff/subject/download';
+    protected const H5_PLAY = '/wefeed-h5api-bff/subject/play';
+
+    /** Shared browser-like headers for the H5 API (no auth required). */
+    protected function h5Headers(array $extra = []): array
+    {
+        return array_merge([
+            'User-Agent' => 'Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0',
+            'Accept' => 'application/json',
+            'Accept-Language' => $this->language.',en;q=0.9',
+            'Origin' => 'https://videodownloader.site',
+            'Referer' => 'https://videodownloader.site/',
+            'X-Client-Info' => json_encode(['timezone' => config('moviebox.timezone', 'Europe/Paris')]),
+            'X-Request-Lang' => $this->language,
+            'Content-Type' => 'application/json',
+        ], $extra);
+    }
+
+    /**
+     * Search through the H5 web API. Returns a shape compatible with the
+     * mobile search (items, pager, counts) so callers are unchanged.
+     */
+    protected function h5Search(string $keyword, int $subjectType, int $page, int $perPage): array
+    {
+        $response = Http::timeout($this->timeout)
+            ->withHeaders($this->h5Headers())
+            ->post($this->h5Base.self::H5_SEARCH, [
+                'keyword' => $keyword,
+                'page' => $page,
+                'perPage' => $perPage,
+                'subjectType' => $subjectType,
+            ]);
+
+        if ($response->failed()) {
+            throw new \RuntimeException('H5 search failed with HTTP '.$response->status());
+        }
+
+        $json = $response->json();
+        if (! is_array($json) || (($json['code'] ?? 200) !== 0 && isset($json['message']))) {
+            throw new \RuntimeException((string) ($json['message'] ?? 'Invalid H5 search response.'));
+        }
+
+        $data = $json['data'] ?? $json;
+        if (is_array($data) && isset($data['subjects']) && ! isset($data['items'])) {
+            $data['items'] = $data['subjects'];
+        }
+
+        return is_array($data) ? $data : ['items' => []];
+    }
+
+    /** H5 detail (full subject metadata) via the detailPath slug. */
+    public function h5Detail(string $detailPath): array
+    {
+        $response = Http::timeout($this->timeout)
+            ->withHeaders($this->h5Headers())
+            ->get($this->h5Base.self::H5_DETAIL.'?'.http_build_query(['detailPath' => $detailPath]));
+
+        if ($response->failed()) {
+            throw new \RuntimeException('H5 detail failed with HTTP '.$response->status());
+        }
+
+        $json = $response->json();
+        $data = is_array($json) ? ($json['data'] ?? null) : null;
+
+        return is_array($data) ? $data : [];
+    }
+
+    /**
+     * Downloadable sources for a title through the H5 API: MP4s at every
+     * available resolution (free tiers often cap at 480p — 1080p stays
+     * `vipLocked` with an empty URL), plus captions.
+     *
+     * @return array{downloads:array<int,array<string,mixed>>,captions:array<int,array<string,mixed>>}
+     */
+    public function h5Download(string $subjectId, int $season = 0, int $episode = 0, string $detailPath = ''): array
+    {
+        $out = ['downloads' => [], 'captions' => []];
+
+        $response = Http::timeout($this->timeout)
+            ->withHeaders($this->h5Headers())
+            ->get($this->h5Base.self::H5_DOWNLOAD.'?'.http_build_query([
+                'subjectId' => $subjectId,
+                'se' => $season,
+                'ep' => $episode,
+                'detailPath' => $detailPath,
+            ]));
+
+        if ($response->failed()) {
+            throw new \RuntimeException('H5 download failed with HTTP '.$response->status());
+        }
+
+        $json = $response->json();
+        $data = is_array($json) ? ($json['data'] ?? null) : null;
+        if (! is_array($data)) {
+            throw new \RuntimeException('Invalid H5 download response.');
+        }
+
+        foreach (is_array($data['downloads'] ?? null) ? $data['downloads'] : [] as $s) {
+            if (! is_array($s) || empty($s['url'])) {
+                continue; // vipLocked streams carry an empty URL
+            }
+            $out['downloads'][] = [
+                'url' => (string) $s['url'],
+                'resolution' => (int) ($s['resolution'] ?? $s['resolutions'] ?? 0),
+                'codecName' => $s['codecName'] ?? null,
+                'size' => isset($s['size']) ? (int) $s['size'] : null,
+                'duration' => isset($s['duration']) ? (int) $s['duration'] : null,
+            ];
+        }
+
+        $captions = is_array($data['captions'] ?? null) ? $data['captions'] : [];
+        if ($captions !== []) {
+            $out['captions'] = $captions;
+        }
+
+        return $out;
+    }
+
+    /**
+     * Streamable MP4s through the H5 web API (`subject/play`): one direct
+     * URL per resolution (H.264, bcdnxw CDN). Same free-tier semantics as
+     * `h5Download` and the same response shape, so it can be used as a
+     * fallback when the download endpoint reports no files. Works without
+     * any auth (plain browser headers, like the other H5 calls).
+     *
+     * @return array{downloads:array<int,array<string,mixed>>,captions:array<int,array<string,mixed>>}
+     */
+    public function h5Play(string $subjectId, int $season = 0, int $episode = 0): array
+    {
+        $out = ['downloads' => [], 'captions' => []];
+
+        $response = Http::timeout($this->timeout)
+            ->withHeaders($this->h5Headers())
+            ->get($this->h5Base.self::H5_PLAY.'?'.http_build_query([
+                'subjectId' => $subjectId,
+                'se' => $season,
+                'ep' => $episode,
+            ]));
+
+        if ($response->failed()) {
+            throw new \RuntimeException('H5 play failed with HTTP '.$response->status());
+        }
+
+        $json = $response->json();
+        $data = is_array($json) ? ($json['data'] ?? null) : null;
+        if (! is_array($data)) {
+            throw new \RuntimeException('Invalid H5 play response.');
+        }
+
+        foreach (is_array($data['streams'] ?? null) ? $data['streams'] : [] as $s) {
+            if (! is_array($s) || empty($s['url'])) {
+                continue; // vipLocked streams carry an empty URL
+            }
+            $out['downloads'][] = [
+                'url' => (string) $s['url'],
+                'resolution' => $this->maxResolution((string) ($s['resolutions'] ?? '')),
+                'codecName' => $s['codecName'] ?? null,
+                'size' => isset($s['size']) ? (int) $s['size'] : null,
+                'duration' => isset($s['duration']) ? (int) $s['duration'] : null,
+                'vipLocked' => (bool) ($s['vipLocked'] ?? false),
+            ];
+        }
+
+        return $out;
+    }
+
+    /**
+     * Largest resolution from a `resolutions` field: "1080", a comma list
+     * "1080,720,480" or a range "720-1080". 0 when unparseable.
+     */
+    protected function maxResolution(string $resolutions): int
+    {
+        $max = 0;
+        foreach (preg_split('/[,\s\-]+/', $resolutions) ?: [] as $part) {
+            if (is_numeric($part)) {
+                $max = max($max, (int) $part);
+            }
+        }
+
+        return $max;
     }
 
     /** Full item metadata (cast, dubs, resource detectors …). */
@@ -208,32 +413,188 @@ class MovieBoxClient
      */
     public function resource(string $subjectId, int $resolution = 1080, int $page = 1, int $perPage = 20): array
     {
-        return $this->getData(
+        $perPage = max(1, min(20, $perPage));
+
+        return $this->cached("resource:$subjectId:$resolution:$page:$perPage", fn () => $this->getData(
             self::RESOURCE,
-            ['subjectId' => $subjectId, 'resolution' => $resolution, 'page' => $page, 'perPage' => max(1, min(20, $perPage))],
+            ['subjectId' => $subjectId, 'resolution' => $resolution, 'page' => $page, 'perPage' => $perPage],
             context: 'resource'
-        );
+        ));
     }
 
     /** External subtitle files for a specific resource (video file). */
     public function extCaptions(string $subjectId, string $resourceId): array
     {
-        return $this->getData(
+        return $this->cached("captions:$subjectId:$resourceId", fn () => $this->getData(
             self::EXT_CAPTIONS,
             ['subjectId' => $subjectId, 'resourceId' => $resourceId],
             context: 'ext-captions'
-        );
+        ));
+    }
+
+    /**
+     * Position of a specific downloadable resource within its subject —
+     * the API-side companion to `resource`. `resourceNum` is the 1-based
+     * index of the resource in the subject's file list, and `resolution`
+     * picks the quality tier (the APK requests it explicitly for downloads).
+     */
+    public function resourcePosition(string $subjectId, string $resourceId, int $resourceNum = 1, ?int $resolution = null): array
+    {
+        return $this->cached("resource-position:$subjectId:$resourceId:$resourceNum:$resolution", fn () => $this->getData(
+            self::RESOURCE_POSITION,
+            array_filter([
+                'subjectId' => $subjectId,
+                'resourceId' => $resourceId,
+                'resourceNum' => $resourceNum,
+                'resolution' => $resolution,
+            ], fn ($v) => $v !== null),
+            context: 'resource-position'
+        ));
     }
 
     /** Adaptive (DASH/MPD) play info for a movie/episode. */
     public function playInfo(string $subjectId, int $season = 0, int $episode = 0): array
     {
-        return $this->getData(
+        return $this->cached("play-info:$subjectId:$season:$episode", fn () => $this->getData(
             self::PLAY_INFO,
             ['subjectId' => $subjectId, 'se' => $season, 'ep' => $episode],
             context: 'play-info',
             playMode: true
-        );
+        ));
+    }
+
+    /**
+     * Resolve the two independent calls the play endpoint needs — adaptive
+     * `play-info` and the first `resource` page (downloadable MP4s) — in a
+     * single round trip. Each key is cached with the exact same cache keys as
+     * the individual methods, so warm entries skip the network entirely.
+     *
+     * @return array{playInfo:array|null,resource1:array|null}
+     */
+    public function playBundle(string $subjectId, int $season = 0, int $episode = 0): array
+    {
+        return $this->parallelGet([
+            'playInfo' => [
+                'path' => self::PLAY_INFO,
+                'params' => ['subjectId' => $subjectId, 'se' => $season, 'ep' => $episode],
+                'cacheKey' => "play-info:$subjectId:$season:$episode",
+                'playMode' => true,
+            ],
+            'resource1' => [
+                'path' => self::RESOURCE,
+                'params' => ['subjectId' => $subjectId, 'resolution' => 1080, 'page' => 1, 'perPage' => 20],
+                'cacheKey' => "resource:$subjectId:1080:1:20",
+            ],
+        ]);
+    }
+
+    /**
+     * Issue several signed GET requests concurrently (HTTP pool / curl multi).
+     *
+     * Each entry is independently cached under its own `cacheKey` (namespaced
+     * `moviebox:v3:` like the rest of the client), and keys already in cache
+     * skip the network. Failures fall back to the sequential, failover-capable
+     * `getData` path so a slow host doesn't take down the batch; a result that
+     * ultimately fails is reported and returned as null.
+     *
+     * @param  array<string,array{path:string,params?:array<string,mixed>,cacheKey?:string,playMode?:bool}>  $calls
+     * @return array<string,mixed|null>
+     */
+    public function parallelGet(array $calls): array
+    {
+        $this->ensureBootstrapped();
+
+        $results = [];
+        $network = [];
+
+        foreach ($calls as $key => $call) {
+            $cacheKey = $call['cacheKey'] ?? $call['path'].':'.md5(http_build_query($call['params'] ?? []));
+            $cached = $this->cacheTtl > 0 ? Cache::get("moviebox:v3:$cacheKey") : null;
+
+            if (is_array($cached)) {
+                $results[$key] = $cached;
+            } else {
+                $network[$key] = $call + ['cacheKey' => $cacheKey];
+            }
+        }
+
+        if ($network === []) {
+            return $results;
+        }
+
+        $responses = $this->poolGet($network);
+
+        foreach ($network as $key => $call) {
+            $response = $responses[$key] ?? null;
+
+            if ($response instanceof Response && ! $response->failed()) {
+                $this->absorbToken($response);
+
+                try {
+                    $data = $this->unwrap($response, $call['cacheKey']);
+                } catch (Throwable $e) {
+                    report($e);
+                    $data = null;
+                }
+
+                if ($data !== null) {
+                    if ($this->cacheTtl > 0) {
+                        Cache::put("moviebox:v3:{$call['cacheKey']}", $data, $this->cacheTtl);
+                    }
+                    $results[$key] = $data;
+
+                    continue;
+                }
+            }
+
+            // Pool failure (network error or retryable status): retry through
+            // the sequential path which iterates the host pool with failover.
+            try {
+                $results[$key] = $this->getData(
+                    $call['path'],
+                    $call['params'] ?? [],
+                    $call['cacheKey'],
+                    $call['playMode'] ?? false
+                );
+            } catch (Throwable $e) {
+                report($e);
+                $results[$key] = null;
+            }
+        }
+
+        return $results;
+    }
+
+    /**
+     * Run the given signed GET calls concurrently against the active host.
+     *
+     * @param  array<string,array{path:string,params?:array<string,mixed>,playMode?:bool}>  $calls
+     * @return array<string,Response|Throwable>
+     */
+    protected function poolGet(array $calls): array
+    {
+        $base = $this->activeBase;
+        $ts = (int) round(microtime(true) * 1000);
+
+        return Http::pool(function (Pool $pool) use ($calls, $base, $ts) {
+            foreach ($calls as $key => $call) {
+                $path = $call['path'];
+                $params = $call['params'] ?? [];
+                $query = $params === [] ? '' : http_build_query($params, '', '&', PHP_QUERY_RFC3986);
+                $pathWithQuery = $query === '' ? $path : $path.'?'.$query;
+
+                $request = $pool->as($key)
+                    ->withHeaders($this->requestHeaders('GET', $path, $params, null, $ts, $call['playMode'] ?? false))
+                    ->connectTimeout(min(10, $this->timeout))
+                    ->timeout($this->timeout);
+
+                if ($this->proxy) {
+                    $request->withOptions(['proxy' => $this->proxy]);
+                }
+
+                $request->get($base.$pathWithQuery);
+            }
+        });
     }
 
     // -----------------------------------------------------------------
@@ -551,6 +912,25 @@ class MovieBoxClient
     protected function buildClient(string $method, string $path, array $params, ?string $body, bool $playMode): PendingRequest
     {
         $ts = (int) round(microtime(true) * 1000);
+
+        $request = Http::withHeaders($this->requestHeaders($method, $path, $params, $body, $ts, $playMode))
+            ->connectTimeout(min(10, $this->timeout))
+            ->timeout($this->timeout);
+
+        if ($this->proxy) {
+            $request->withOptions(['proxy' => $this->proxy]);
+        }
+
+        return $request;
+    }
+
+    /**
+     * Build the signed headers shared by the sequential and pooled transports.
+     *
+     * @return array<string,string>
+     */
+    protected function requestHeaders(string $method, string $path, array $params, ?string $body, int $ts, bool $playMode): array
+    {
         $accept = 'application/json';
         $contentType = $method === 'GET' ? 'application/json' : 'application/json; charset=utf-8';
 
@@ -574,15 +954,7 @@ class MovieBoxClient
             $headers['X-Play-Mode'] = '2';
         }
 
-        $request = Http::withHeaders($headers)
-            ->connectTimeout(min(10, $this->timeout))
-            ->timeout($this->timeout);
-
-        if ($this->proxy) {
-            $request->withOptions(['proxy' => $this->proxy]);
-        }
-
-        return $request;
+        return $headers;
     }
 
     /** Absorb a fresh bearer token from the x-user response header. */

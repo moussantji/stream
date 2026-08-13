@@ -20,6 +20,10 @@ return [
         'https://api6.aoneroom.com,https://api5.aoneroom.com,https://api4.aoneroom.com,https://api4sg.aoneroom.com,https://api3.aoneroom.com,https://api6sg.aoneroom.com,https://api.inmoviebox.com'
     ))))),
 
+    // H5 web API is a separate transport: it uses plain browser-like headers
+    // (no JWT) and cannot use the signed mobile endpoints above.
+    'h5_host' => rtrim((string) env('MOVIEBOX_H5_HOST', 'https://h5-api.aoneroom.com'), '/'),
+
     // Seconds to cache the bootstrapped bearer token.
     'token_ttl' => (int) env('MOVIEBOX_TOKEN_TTL', 1800),
 
@@ -91,6 +95,10 @@ return [
     // pure PHP (no ffmpeg — works on shared/cPanel hosting). Range requests are
     // honoured so seeking still works. Set false to disable.
     'hevc_fix' => filter_var(env('MOVIEBOX_HEVC_FIX', true), FILTER_VALIDATE_BOOL),
+
+    // Prefer a fully-converted Streamtape copy as the first `/api/play` source
+    // when one exists for the requested title (see StreamController::play).
+    'streamtape_fallback' => filter_var(env('MOVIEBOX_STREAMTAPE_FALLBACK', true), FILTER_VALIDATE_BOOL),
 
     // HMAC signing secret (base64). Override only if the upstream rotates it.
     'secret_key' => env('MOVIEBOX_SECRET_KEY', '76iRl07s0xSN9jqmEWAt79EBJZulIQIsV64FZr2O'),

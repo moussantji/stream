@@ -4,17 +4,26 @@
 import { api } from './api.js';
 import { el } from './ui.js';
 
-const isHevcSource = (s) => !!s && /hevc|265/i.test(String(s.codec || ''));
+const isHevcSource = (s) => !!s && (/hevc|265/i.test(String(s.codec || ''))
+    || /\/h265\/|_h265_|\.hevc\./i.test(String(s.url || '')));
 
-// Apple's AVFoundation (Safari on iOS/macOS) only renders HEVC tagged `hvc1`;
-// MovieBox ships `hev1` (audio plays, no picture). Firefox/Chrome/Android
-// tolerate `hev1`, so only Safari needs the server-side hvc1 remux.
-function appleNeedsRemux() {
-    const ua = navigator.userAgent;
-    const isiOS = /iP(hone|od|ad)/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
-    const isSafari = /Safari/.test(ua) && !/(Chrome|Chromium|Android|Edg|OPR|Firefox|CriOS|FxiOS)/.test(ua);
-    return isiOS || isSafari;
+// HEVC decode support varies wildly: Chrome needs a hardware decoder or the
+// proprietary codec, Firefox desktop usually has none, Safari/Apple have it.
+// dash.js cannot play HEVC DASH on a device that can't decode it — the video
+// just loops on `waiting` forever. Detect support up front so we can skip the
+// adaptive HEVC stream and play the (H.264) MP4 instead.
+function hevcSupported() {
+    if (typeof MediaSource === 'undefined' || !MediaSource.isTypeSupported) return false;
+    return ['hvc1.1.6.L93.B0', 'hvc1.1.6.L120.90', 'hvc1.1.6.L150.90',
+        'hev1.1.6.L93.B0', 'hev1.1.6.L120.90', 'hev1.1.6.L150.90']
+        .some((codec) => MediaSource.isTypeSupported(`video/mp4; codecs="${codec}"`));
 }
+
+// MovieBox ships HEVC tagged `hev1`. A large share of decoders — including
+// Apple's AVFoundation (Safari on iOS/macOS) and several Android/Chrome
+// hardware decoders — only render `hvc1` and play `hev1` as audio-only. The
+// server-side remux rewrites the sample-entry fourcc to `hvc1`, so every HEVC
+// source is routed through it for reliable playback on all devices.
 
 let hlsModule = null;
 async function loadHls() {
@@ -80,6 +89,7 @@ export class Player {
         this._progressTimer = null;
         this._hideTimer = null;
         this._seeking = false;
+        this._waitT = null;
         this.build();
     }
 
@@ -136,6 +146,8 @@ export class Player {
         this.wrap = el('div', { class: 'vp', tabindex: '0' }, [
             this.video, this.spinner, this.skipL, this.skipR, this.bigBtn, this.controls,
         ]);
+        this.errorEl = el('div', { class: 'vp-error', hidden: 'hidden' });
+        this.wrap.appendChild(this.errorEl);
         this.container.appendChild(this.wrap);
 
         this.bind();
@@ -165,12 +177,22 @@ export class Player {
 
         v.addEventListener('play', () => { this.playBtn.innerHTML = I.pause; this.wrap.classList.add('vp-playing'); this.scheduleHide(); });
         v.addEventListener('pause', () => { this.playBtn.innerHTML = I.play; this.wrap.classList.remove('vp-playing'); this.showControls(); });
-        v.addEventListener('waiting', () => { this.spinner.hidden = false; });
-        v.addEventListener('playing', () => { this.spinner.hidden = true; });
-        v.addEventListener('canplay', () => { this.spinner.hidden = true; });
+        // The proxy streams in 64KB chunks, so short network stalls fire a
+        // `waiting` between every chunk burst. Debounce the spinner: only show
+        // it when the buffer is genuinely starved for a sustained moment, and
+        // clear it on any sign of playback progress — otherwise it flickers or
+        // stays stuck over a playing video.
+        v.addEventListener('waiting', () => {
+            clearTimeout(this._waitT);
+            this._waitT = setTimeout(() => { this.spinner.hidden = false; }, 500);
+        });
+        v.addEventListener('playing', () => { this._started = true; clearTimeout(this._watchdog); this.hideSpinner(); });
+        v.addEventListener('canplay', () => this.hideSpinner());
+        v.addEventListener('timeupdate', () => this.hideSpinner());
         v.addEventListener('error', () => this.onVideoError());
-        // Playing HEVC on Safari can succeed for audio while the picture never
-        // decodes (videoWidth stays 0) -> retry through the hvc1 remux.
+        // Some devices report an audio-only decode as success while the video
+        // track never materialises (videoWidth stays 0) -> retry through the
+        // hvc1 remux when one exists.
         v.addEventListener('loadeddata', () => {
             if (v.videoWidth === 0 && v.videoHeight === 0) this.onVideoError();
         });
@@ -262,6 +284,7 @@ export class Player {
 
     showControls() { this.wrap.classList.add('vp-active'); }
     hideControls() { if (!this.menu.hidden) return; this.wrap.classList.remove('vp-active'); }
+    hideSpinner() { clearTimeout(this._waitT); this.spinner.hidden = true; }
     scheduleHide() {
         clearTimeout(this._hideTimer);
         this._hideTimer = setTimeout(() => { if (!this.video.paused) this.hideControls(); }, 3000);
@@ -315,25 +338,31 @@ export class Player {
         const menu = this.qualityMenu;
         menu.innerHTML = '';
         menu.appendChild(el('div', { class: 'vp-menu-title', text: 'Qualité de l\u2019image' }));
-        this.currentSources.forEach((s) => {
-            const active = this._activeSource && this._activeSource.url === s.url;
-            menu.appendChild(el('button', {
-                class: `vp-menu-item ${active ? 'active' : ''}`,
-                text: s.quality || (s.resolution ? s.resolution + 'p' : 'auto'),
-                onclick: () => { this.setMp4(s); this.qualityMenu.hidden = true; },
-            }));
-        });
+        if (this.currentSources.length === 0) {
+            // Adaptive-only stream (DASH/HLS): quality is picked automatically.
+            menu.appendChild(el('div', { class: 'vp-menu-item', text: 'Auto (adaptatif)' }));
+        } else {
+            this.currentSources.forEach((s) => {
+                const active = this._activeSource && this._activeSource.url === s.url;
+                menu.appendChild(el('button', {
+                    class: `vp-menu-item ${active ? 'active' : ''}`,
+                    text: s.quality || (s.resolution ? s.resolution + 'p' : 'auto'),
+                    onclick: () => { this.setMp4(s); this.qualityMenu.hidden = true; },
+                }));
+            });
+        }
         this.menu.hidden = true;
         menu.hidden = false;
     }
 
-    // Reflect the active source on the quality button; hide it when there is
-    // nothing to switch (single source, or adaptive HLS/DASH).
+    // Reflect the active source on the quality button. Always visible as a
+    // dedicated control (separate from the settings gear); with a single
+    // source or an adaptive stream it just shows the current pick.
     updateQualityUi() {
         const s = this._activeSource;
         const label = s ? (s.quality || (s.resolution ? s.resolution + 'p' : 'Auto')) : 'Auto';
         this.qualityBtn.textContent = label;
-        this.qualityBtn.hidden = !(this.currentSources && this.currentSources.length > 1);
+        this.qualityBtn.hidden = false;
     }
 
     openMenu() {
@@ -358,16 +387,41 @@ export class Player {
     async load(data) {
         this.destroyHls();
         this.destroyDash();
+        this._triedAdaptiveFallback = false;
+        this._triedSources = new Set();
+        this._started = false;
+        clearTimeout(this._watchdog);
         const { sources = [], hls = [], dash = [], subtitles = [], startTime = 0, onProgress } = data;
         this.currentSources = sources;
         this._activeSource = null;
 
-        if (sources.length) {
+        // Source selection: keep the highest available resolution instead of
+        // always choosing H.264. A catalogue may only offer H.264 at 480p and
+        // HEVC at 1080p; supported browsers should use the higher-quality file.
+        const hevc = hevcSupported();
+        const h264 = sources.filter((s) => !isHevcSource(s));
+        const ordered = [...sources].sort((a, b) =>
+            Number(b.resolution || 0) - Number(a.resolution || 0)
+        );
+        const best = hevc ? ordered[0] : h264[0];
+        if (best) {
+            this.setMp4(best);
+        } else if (dash.length && hevc) {
+            await this.setDash(dash[0]);
+            this.startWatchdog();
+        } else if (hls.length && hevc) {
+            await this.setHls(hls[0]);
+            this.startWatchdog();
+        } else if (sources.length) {
             this.setMp4(sources[0]);
+        } else if (dash.length) {
+            // No MP4 fallback on this device — try the adaptive stream anyway;
+            // the watchdog + error handlers bail if it cannot start.
+            await this.setDash(dash[0]);
+            this.startWatchdog();
         } else if (hls.length) {
             await this.setHls(hls[0]);
-        } else if (dash.length) {
-            await this.setDash(dash[0]);
+            this.startWatchdog();
         } else {
             throw new Error('No playable source found for this title.');
         }
@@ -391,10 +445,11 @@ export class Player {
         }
     }
 
-    // Resolve the best URL for an MP4 source: on Safari, HEVC is routed through
-    // the hvc1 remux so the picture renders (audio-only otherwise).
+    // Resolve the best URL for an MP4 source: HEVC is always routed through the
+    // server-side hvc1 remux — `hev1` plays audio-only on too many devices to
+    // ever serve it raw (H.264 sources stay on the fast direct CDN URL).
     mp4UrlFor(source) {
-        if (source && source.remux && isHevcSource(source) && appleNeedsRemux()) {
+        if (source && source.remux && isHevcSource(source)) {
             return source.remux;
         }
         return source ? source.url : null;
@@ -404,6 +459,7 @@ export class Player {
         // Accept either a source object or a bare URL string (back-compat).
         if (typeof source === 'string') source = { url: source };
         this.destroyHls();
+        clearTimeout(this._watchdog);
         this._activeSource = source;
         const url = this.mp4UrlFor(source);
         this._triedRemux = !!(source && source.remux && url === source.remux);
@@ -421,20 +477,70 @@ export class Player {
         }, { once: true });
     }
 
-    // If a direct HEVC source fails to render (error, or metadata loaded but no
-    // video track), fall back once to the server-side hvc1 remux.
+    // If playback fails (error, or metadata loaded but no video track), retry
+    // through the hvc1 remux when the source is HEVC, else try the next
+    // lower-quality source; if an adaptive (DASH/HLS) stream was playing, fall
+    // back to a downloadable MP4. When no fallback remains, surface a visible
+    // error instead of spinning forever.
     onVideoError() {
         const s = this._activeSource;
         if (s && s.remux && !this._triedRemux) {
             this._triedRemux = true;
             this._setSrc(s.remux);
+            return;
         }
+        if (s && s.url) this._triedSources.add(s.url);
+        // currentSources is already sorted by resolution desc (H.264 ahead of
+        // HEVC at equal resolution), so the first untried one is the best
+        // quality we haven't attempted yet.
+        const next = this.currentSources.find((c) => c.url && !this._triedSources.has(c.url));
+        if (next) {
+            this.setMp4(next);
+            return;
+        }
+        if ((this.dash || this.hls) && this.currentSources.length && !this._triedAdaptiveFallback) {
+            this._triedAdaptiveFallback = true;
+            this.destroyDash();
+            this.destroyHls();
+            // Prefer an H.264 MP4 when falling back from adaptive HEVC (a device
+            // that couldn't decode the HEVC stream usually can't decode HEVC MP4).
+            const mp4 = this.currentSources.find((s) => !isHevcSource(s)) || this.currentSources[0];
+            this.setMp4(mp4);
+            return;
+        }
+        this.showError('La lecture a échoué. Rechargez la page ou essayez un autre titre.');
+    }
+
+    // Display a visible error overlay in place of the endless spinner.
+    showError(message) {
+        this.hideSpinner();
+        clearTimeout(this._watchdog);
+        this.errorEl.textContent = message;
+        this.errorEl.hidden = false;
+        this.bigBtn.style.display = 'none';
+    }
+
+    // If an adaptive stream is selected but the video hasn't started within the
+    // grace period, it's stuck (missing HEVC decoder, bad manifest, …) — fall
+    // back to a downloadable MP4 instead of looping on the spinner forever.
+    startWatchdog() {
+        clearTimeout(this._watchdog);
+        this._watchdog = setTimeout(() => {
+            if (!this._started && this.video.currentTime === 0) {
+                this.onVideoError();
+            }
+        }, 8000);
     }
 
     async setHls(url) {
         const Hls = await loadHls();
         if (Hls && Hls.isSupported()) {
-            this.hls = new Hls({ maxBufferLength: 30 });
+            this.hls = new Hls({ maxBufferLength: 30, abrEwmaDefaultEstimate: 500000 });
+            this.hls.on(Hls.Events.ERROR, (_, data) => {
+                if (data && (data.fatal || (data.type === Hls.ErrorTypes.MEDIA_ERROR && data.details === Hls.ErrorDetails.BUFFER_APPEND_ERROR))) {
+                    this.onVideoError();
+                }
+            });
             this.hls.loadSource(url);
             this.hls.attachMedia(this.video);
         } else {
@@ -446,7 +552,31 @@ export class Player {
         const dashjs = await loadDash();
         if (dashjs && dashjs.MediaPlayer) {
             this.dash = dashjs.MediaPlayer().create();
-            this.dash.updateSettings({ streaming: { buffer: { bufferTimeAtTopQuality: 30 } } });
+            this.dash.updateSettings({
+                streaming: {
+                    // Start fast: begin at ~480p (small first segments) instead of
+                    // letting ABR pick the 1080p rendition (a 5s 1080p chunk is
+                    // ~3.8MB and delays the first frame by seconds). dash.js then
+                    // adapts up as bandwidth allows.
+                    buffer: {
+                        bufferTimeAtTopQuality: 30,
+                        fastSwitchEnabled: true,
+                        minBufferTime: 2,
+                    },
+                    abr: {
+                        autoSwitchBitrate: { video: true, audio: true },
+                        initialBitrate: { video: 500000, audio: 48000 },
+                    },
+                },
+            });
+            this.dash.on(dashjs.MediaPlayer.events.ERROR, (event) => {
+                // The main "can't play at all" cases: no codec support or an
+                // unparsable manifest — fall back to an MP4 source.
+                const code = event && event.error && event.error.code;
+                if (code === 'capabilityError' || code === 'manifestError') {
+                    this.onVideoError();
+                }
+            });
             this.dash.initialize(this.video, url, false);
         } else {
             this.video.src = url;
@@ -495,6 +625,7 @@ export class Player {
     destroy() {
         clearInterval(this._progressTimer);
         clearTimeout(this._hideTimer);
+        clearTimeout(this._watchdog);
         document.removeEventListener('click', this._docClick);
         document.removeEventListener('fullscreenchange', this._fsChange);
         this.destroyHls();

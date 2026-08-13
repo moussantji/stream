@@ -54,6 +54,12 @@ Route::get('mv/{token}/{path}', [StreamController::class, 'proxy'])
 // HEVC -> hvc1 remux (stream-copy) so iOS renders HEVC-only titles.
 Route::get('mv-hevc', [StreamController::class, 'remuxHevc'])->middleware('throttle:1000,1');
 
+// Same-origin MP4 stream proxy. The media CDN rejects plain browser requests
+// (it requires the Android app UA — and the H5 download URLs additionally
+// require the videodownloader.site referer) so every CDN MP4 is served
+// through here with the right upstream headers attached.
+Route::get('mv-mp4', [StreamController::class, 'streamMp4'])->middleware('throttle:1000,1');
+
 // ---- Personal library (Sanctum-protected) ---------------------------------
 Route::middleware('auth:sanctum')->group(function () {
     Route::get('favorites', [LibraryController::class, 'favorites']);
@@ -74,4 +80,17 @@ Route::middleware('auth:sanctum')->prefix('admin')->group(function () {
     Route::get('blocked-titles', [AdminController::class, 'blockedTitles']);
     Route::post('blocked-titles', [AdminController::class, 'addBlockedTitle']);
     Route::delete('blocked-titles/{id}', [AdminController::class, 'deleteBlockedTitle']);
+
+    Route::get('streamtape/search', [AdminController::class, 'streamtapeSearch']);
+    Route::get('streamtape/sources', [AdminController::class, 'streamtapeSources']);
+    Route::get('streamtape/links', [AdminController::class, 'streamtapeLinks']);
+    Route::post('streamtape/upload', [AdminController::class, 'streamtapeUpload']);
+    Route::post('streamtape/upload-series', [AdminController::class, 'streamtapeUploadSeries']);
+    Route::get('streamtape/status/{id}', [AdminController::class, 'streamtapeStatus']);
+    Route::post('streamtape/move/{id}', [AdminController::class, 'streamtapeMove']);
+    Route::post('streamtape/retry/{id}', [AdminController::class, 'streamtapeRetry']);
+    Route::get('streamtape/folders', [AdminController::class, 'streamtapeFolders']);
+    Route::get('streamtape/usage', [AdminController::class, 'streamtapeUsage']);
+    Route::delete('streamtape/folders/{id}', [AdminController::class, 'streamtapeDeleteFolder']);
+    Route::delete('streamtape/{id}', [AdminController::class, 'streamtapeDelete']);
 });

@@ -506,6 +506,16 @@ export async function detailPage(app, params) {
         ? watchHref(currentItem(), firstSeason.season, 1)
         : watchHref(currentItem()));
 
+    // Warm the streaming cache in the background so the player starts instantly
+    // when "Lecture" is clicked — /api/play is cached server-side, so this turns
+    // a multi-second cold resolution into a cache hit on the watch page.
+    setTimeout(() => {
+        const target = isSeries && firstSeason
+            ? { season: firstSeason.season, episode: 1 }
+            : { season: 0, episode: 0 };
+        api.play({ ...currentItem(), ...target }).catch(() => {});
+    }, 100);
+
     let versionRow = null;
     if (dubs.length > 1) {
         const buttons = dubs.map((d) => el('button', {
@@ -674,17 +684,20 @@ export async function watchPage(app, params) {
     ]));
 
     let startTime = 0;
-    if (isAuthed()) {
-        try {
-            const hist = await api.history();
+    const playP = api.play({ subjectId: item.subjectId, detailPath: item.detailPath, season, episode, title: item.title });
+
+    // Resume position is looked up in parallel with the stream resolution so it
+    // never delays the player start (play is the slow part, not the DB).
+    const histP = isAuthed()
+        ? api.history().then((hist) => {
             const match = hist.find((h) => h.subject_id === item.subjectId && h.season === season && h.episode === episode);
             if (match) startTime = match.position_seconds || 0;
-        } catch { /* ignore */ }
-    }
+        }).catch(() => {})
+        : Promise.resolve();
 
     let data;
     try {
-        data = await api.play({ subjectId: item.subjectId, detailPath: item.detailPath, season, episode, title: item.title });
+        [data] = await Promise.all([playP, histP]);
     } catch (e) {
         clear(shell);
         shell.appendChild(el('div', { class: 'player-message' }, [errorState(e.message, () => watchPage(app, params))]));
@@ -693,9 +706,28 @@ export async function watchPage(app, params) {
 
     if (!data.sources.length && !data.hls.length && !(data.dash && data.dash.length)) {
         clear(shell);
-        shell.appendChild(el('div', { class: 'player-message' }, [
-            emptyState('No stream available', 'This title may be restricted by the provider or only available in the app.'),
-        ]));
+        if (data.streamError) {
+            // The upstream provider errored (timeout / rate-limit / 5xx) — offer a retry.
+            const retryBtn = el('button', {
+                class: 'btn btn-primary',
+                text: 'Réessayer',
+                style: 'display:flex;gap:8px;align-items:center;margin-top:12px',
+                onclick: () => watchPage(app, params),
+            });
+            shell.appendChild(el('div', { class: 'player-message' }, [
+                emptyState(
+                    data.streamError.retryable ? 'Le fournisseur n\'a pas répondu' : 'Flux indisponible',
+                    data.streamError.retryable
+                        ? 'Le service de streaming est temporairement indisponible. Réessayez dans un instant.'
+                        : 'Ce titre est indisponible chez le fournisseur pour le moment.',
+                ),
+                retryBtn,
+            ]));
+        } else {
+            shell.appendChild(el('div', { class: 'player-message' }, [
+                emptyState('No stream available', 'This title may be restricted by the provider or only available in the app.'),
+            ]));
+        }
         return;
     }
 
@@ -949,6 +981,499 @@ export async function adminPage(app) {
         blockedStatus,
         blockedListWrap,
     ]));
+
+    // --- Envoi vers Streamtape ---
+    const stStatus = el('p', { class: 'admin-status' });
+    const stSearchInput = el('input', { class: 'select', type: 'text', placeholder: 'Recherche en direct : nom du film / série…', style: 'flex:1;min-width:260px' });
+    const stSearchHint = el('p', { class: 'admin-hint', style: 'margin-top:8px', text: '' });
+    const stResults = el('div', { class: 'st-results' });
+    const stSendWrap = el('div', { class: 'st-send-wrap' });
+    const stHistory = el('div', { class: 'st-history' });
+
+    const ST_BADGE_LABELS = {
+        done: 'Terminé', failed: 'Échec', new: 'Nouveau', converting: 'Conversion',
+        downloading: 'Téléchargement', running: 'Téléchargement', queued: 'En file',
+        error: 'Erreur', unknown: 'Inconnu',
+    };
+    const stBadge = (status) => el('span', { class: `st-badge st-${status}`, text: ST_BADGE_LABELS[status] || status });
+    const fmtBytes = (n) => {
+        if (!n && n !== 0) return '';
+        if (n >= 1073741824) return `${(n / 1073741824).toFixed(2)} Go`;
+        if (n >= 1048576) return `${(n / 1048576).toFixed(0)} Mo`;
+        return `${(n / 1024).toFixed(0)} Ko`;
+    };
+
+    const stFolderControls = () => {
+        const select = el('select', { class: 'select', style: 'max-width:210px' }, [
+            el('option', { value: 'auto', text: 'Dossier automatique (nom du film / Séries)' }),
+            el('option', { value: '', text: 'Dossier par défaut' }),
+            el('option', { value: '__custom', text: '+ Dossier personnalisé…' }),
+        ]);
+        const input = el('input', { class: 'select', type: 'text', placeholder: 'Nom du dossier (ex. : Action, VF…)', style: 'display:none;min-width:200px' });
+        select.addEventListener('change', () => { input.style.display = select.value === '__custom' ? '' : 'none'; });
+        return { select, input, value: () => (select.value === '__custom' ? input.value.trim() : select.value) };
+    };
+
+    const stRenderHistory = (link) => {
+        let sub = link.resolution ? `${link.resolution}p` : 'auto';
+        if (link.season || link.episode) sub += ` · S${String(link.season).padStart(2, '0')}E${String(link.episode).padStart(2, '0')}`;
+        if (link.folder) sub += ` · 📁 ${link.folder}`;
+        const pending = link.status !== 'done' && link.status !== 'failed';
+        const pct = link.bytesTotal > 0 ? Math.round((link.bytesLoaded / link.bytesTotal) * 100) : 0;
+        const langBadge = link.language ? el('span', { class: 'st-lang-badge', style: 'display:inline-block;padding:2px 6px;border-radius:4px;font-size:11px;font-weight:600;text-transform:uppercase;background:var(--accent);color:#fff;margin-left:6px', text: link.language }) : null;
+        const item = el('div', { class: 'st-item' }, [
+            el('div', { class: 'st-item-main' }, [
+                el('span', { class: 'st-item-title', text: link.title }),
+                langBadge,
+                el('span', { class: 'st-item-sub', text: sub }),
+            ]),
+            stBadge(link.status),
+            pending
+                ? el('div', { class: 'st-progress' }, [
+                    el('span', { class: 'st-progress-bar', style: `width:${link.status === 'converting' ? 100 : Math.min(100, pct)}%` }),
+                    el('span', {
+                        class: 'st-progress-label',
+                        text: link.status === 'converting'
+                            ? 'Conversion Streamtape en cours… (peut prendre plusieurs minutes)'
+                            : (link.bytesLoaded > 0 ? `${fmtBytes(link.bytesLoaded)} / ${fmtBytes(link.bytesTotal)} (${pct}%)` : 'En attente…'),
+                    }),
+                ])
+                : null,
+            el('div', { class: 'st-item-actions' }, [
+                el('button', {
+                    class: 'btn btn-ghost', text: 'Actualiser',
+                    onclick: async () => {
+                        try { stReplaceItem(link.id, await api.adminStreamtapeStatus(link.id)); }
+                        catch (e) { stStatus.textContent = e.message; }
+                    },
+                }),
+                !link.streamtapeUrl
+                    ? el('button', {
+                        class: 'btn btn-ghost', text: 'Réessayer', title: 'Re-résout l\'URL source et relance le téléchargement distant',
+                        onclick: async () => {
+                            try {
+                                const next = await api.adminStreamtapeRetry(link.id);
+                                stReplaceItem(link.id, next);
+                                toast('Téléchargement relancé ✓');
+                                stPoll(link.id);
+                            } catch (e) { stStatus.textContent = e.message; }
+                        },
+                    })
+                    : null,
+                link.streamtapeUrl
+                    ? el('a', { class: 'btn btn-primary', href: link.streamtapeUrl, target: '_blank', rel: 'noopener', text: 'Ouvrir' })
+                    : null,
+                link.streamtapeUrl
+                    ? el('button', {
+                        class: 'btn btn-ghost', text: 'Copier',
+                        onclick: async () => {
+                            try { await navigator.clipboard.writeText(link.streamtapeUrl); toast('Lien Streamtape copié ✓'); }
+                            catch { stStatus.textContent = link.streamtapeUrl; }
+                        },
+                    })
+                    : null,
+                el('button', {
+                    class: 'btn btn-danger', text: 'Supprimer', title: 'Supprime le fichier de Streamtape et de l\'historique',
+                    onclick: async () => {
+                        if (!window.confirm(`Supprimer « ${link.title} » de Streamtape et de l'historique ?`)) return;
+                        try {
+                            const r = await api.adminStreamtapeDelete(link.id);
+                            const cur = stItems.get(link.id);
+                            if (cur) cur.remove();
+                            stItems.delete(link.id);
+                            toast(r.removedRemote ? 'Fichier supprimé de Streamtape ✓' : 'Entrée supprimée de l\'historique');
+                        } catch (e) { stStatus.textContent = e.message; }
+                    },
+                }),
+                link.streamtapeUrl
+                    ? el('button', {
+                        class: 'btn btn-ghost', text: 'Déplacer', title: 'Déplacer le fichier dans un autre dossier',
+                        onclick: () => {
+                            const fc = stFolderControls();
+                            const okBtn = el('button', {
+                                class: 'btn btn-primary', text: 'OK',
+                                onclick: async () => {
+                                    okBtn.disabled = true;
+                                    try {
+                                        stReplaceItem(link.id, await api.adminStreamtapeMove(link.id, fc.value() || 'auto'));
+                                        toast('Fichier déplacé ✓');
+                                        moveRow.remove();
+                                    } catch (e) {
+                                        stStatus.textContent = e.message;
+                                        okBtn.disabled = false;
+                                    }
+                                },
+                            });
+                            const moveRow = el('div', { class: 'st-move' }, [fc.select, fc.input, okBtn]);
+                            item.appendChild(moveRow);
+                            fc.select.focus();
+                        },
+                    })
+                    : null,
+            ]),
+            link.status === 'failed' && link.error ? el('p', { class: 'st-error', text: link.error }) : null,
+            link.status === 'done' && link.streamtapeUrl ? el('p', { class: 'st-done', text: link.streamtapeUrl }) : null,
+        ]);
+        item.dataset.final = link.status === 'done' || link.status === 'failed' ? '1' : '0';
+
+        return item;
+    };
+
+    const stItems = new Map(); // id -> element
+    const stReplaceItem = (id, link) => {
+        const next = stRenderHistory(link);
+        const old = stItems.get(id);
+        if (old) old.replaceWith(next);
+        stItems.set(id, next);
+    };
+
+    const stPoll = (id) => {
+        const timer = setInterval(async () => {
+            const cur = stItems.get(id);
+            if (!cur) { clearInterval(timer); return; }
+            if (cur.dataset.final === '1') { clearInterval(timer); return; }
+            const link = await api.adminStreamtapeStatus(id).catch(() => null);
+            if (link) {
+                stReplaceItem(id, link);
+                if (link.status === 'done' || link.status === 'failed') clearInterval(timer);
+            }
+        }, 10000);
+    };
+
+    // ---- recherche en direct (debounce) ----
+    let stSearchSeq = 0;
+    let stSearchTimer = null;
+    const stDoSearch = async () => {
+        const q = stSearchInput.value.trim();
+        const seq = ++stSearchSeq;
+        clear(stSendWrap);
+        if (q.length < 2) {
+            clear(stResults);
+            stSearchHint.textContent = q.length === 1 ? 'Tape au moins 2 lettres…' : '';
+            stStatus.textContent = '';
+            return;
+        }
+        stSearchHint.textContent = 'Recherche « ' + q + ' »…';
+        stStatus.textContent = '';
+        try {
+            const items = await api.adminStreamtapeSearch(q);
+            if (seq !== stSearchSeq) return;
+            stRenderResults(items);
+            stSearchHint.textContent = items.length
+                ? `${items.length} résultat(s) — clique sur une affiche pour l'envoyer.`
+                : 'Aucun résultat en base pour « ' + q + ' ».';
+        } catch (e) {
+            if (seq !== stSearchSeq) return;
+            stSearchHint.textContent = 'Échec : ' + e.message;
+        }
+    };
+    stSearchInput.addEventListener('input', () => {
+        clearTimeout(stSearchTimer);
+        stSearchTimer = setTimeout(stDoSearch, 300);
+    });
+
+    const stRenderResults = (items) => {
+        clear(stResults);
+        items.forEach((it) => {
+            const doneLink = it.links.find((l) => l.status === 'done' && l.streamtapeUrl);
+            const pendingLink = it.links.find((l) => l.status !== 'done' && l.status !== 'failed');
+            const poster = it.cover
+                ? el('img', { src: it.cover, alt: it.title, loading: 'lazy', onerror: (e) => { e.target.style.display = 'none'; } })
+                : null;
+            stResults.appendChild(el('button', {
+                class: 'st-card',
+                title: it.title,
+                onclick: () => stOpenSend(it),
+            }, [
+                el('span', { class: 'st-card-poster' }, [
+                    poster || el('span', { class: 'st-ph', text: '🎬' }),
+                    el('span', {
+                        class: `st-dot ${it.hasResource ? 'on' : 'off'}`,
+                        title: it.hasResource ? 'Vidéo disponible' : 'Flux indisponible en amont',
+                    }),
+                ]),
+                el('span', { class: 'st-card-title', text: it.title }),
+                el('span', { class: 'st-card-meta' }, [
+                    it.year ? el('span', { class: 'st-year', text: String(it.year) }) : null,
+                    it.french ? el('span', { class: 'st-vf', text: 'VF' }) : null,
+                ]),
+                el('span', { class: 'st-card-foot' }, [
+                    el('span', { class: `st-badge st-${it.subjectType === 2 ? 'serie' : 'film'}`, text: it.typeLabel || (it.subjectType === 2 ? 'Série' : 'Film') }),
+                    doneLink
+                        ? el('a', { class: 'st-sent', href: doneLink.streamtapeUrl, target: '_blank', rel: 'noopener', text: '✓ Envoyé', onclick: (e) => e.stopPropagation() })
+                        : (pendingLink ? el('span', { class: 'st-sent pending', text: '… Envoi en cours' }) : null),
+                ]),
+            ]));
+        });
+    };
+
+    const stOpenSend = (it) => {
+        clear(stSendWrap);
+        const status = el('p', { class: 'admin-status' });
+        const isSeries = it.subjectType === 2;
+        const seasonInput = el('input', { class: 'select', type: 'number', min: '1', value: '1', style: 'width:80px' });
+        const episodeInput = el('input', { class: 'select', type: 'number', min: '1', value: '1', style: 'width:80px' });
+        const resSelect = el('select', { class: 'select', style: 'max-width:220px' }, [
+            el('option', { value: '0', text: 'Meilleure qualité (auto)' }),
+        ]);
+        resSelect.disabled = true;
+
+        const onSeEpChange = async () => {
+            resSelect.disabled = true;
+            clear(resSelect);
+            resSelect.appendChild(el('option', { value: '0', text: 'Meilleure qualité (auto)' }));
+            try {
+                const sources = await api.adminStreamtapeSources({
+                    subjectId: it.subjectId,
+                    season: isSeries ? parseInt(seasonInput.value, 10) || 1 : 0,
+                    episode: isSeries ? parseInt(episodeInput.value, 10) || 1 : 0,
+                });
+                sources.forEach((s) => {
+                    const label = s.resolution ? `${s.resolution}p` : 'auto'
+                        + (s.size ? ` · ${fmtBytes(s.size)}` : '');
+                    resSelect.appendChild(el('option', { value: String(s.resolution || 0), text: label }));
+                });
+                resSelect.disabled = sources.length === 0;
+            } catch { /* keep auto-only */ }
+        };
+        seasonInput.addEventListener('change', onSeEpChange);
+        episodeInput.addEventListener('change', onSeEpChange);
+
+        const sendBtn = el('button', { class: 'btn btn-primary', text: 'Envoyer sur Streamtape' });
+        const fc = stFolderControls();
+        sendBtn.onclick = async () => {
+            sendBtn.disabled = true;
+            sendBtn.textContent = 'Envoi…';
+            status.textContent = '';
+            const folder = fc.value();
+            if (fc.select.value === '__custom' && folder === '') {
+                status.textContent = 'Saisis un nom de dossier.';
+                sendBtn.disabled = false;
+                sendBtn.textContent = 'Envoyer sur Streamtape';
+                return;
+            }
+            try {
+                const link = await api.adminStreamtapeUpload({
+                    subjectId: it.subjectId,
+                    title: it.title,
+                    subjectType: it.subjectType,
+                    season: isSeries ? parseInt(seasonInput.value, 10) || 1 : 0,
+                    episode: isSeries ? parseInt(episodeInput.value, 10) || 1 : 0,
+                    resolution: parseInt(resSelect.value, 10) || 0,
+                    folder,
+                });
+                const sel = link.resolution ? `${link.resolution}p` : 'auto';
+                status.textContent = `Upload remote lancé ✓ — ${sel}${link.bytesTotal ? ' · ' + fmtBytes(link.bytesTotal) : ''}${link.folder ? ' → dossier « ' + link.folder + ' »' : ''} (le suivi est en bas, sous « Envois récents »).`;
+                stPoll(link.id);
+                loadStHistory();
+                sendBtn.textContent = 'Envoyer à nouveau';
+            } catch (e) {
+                status.textContent = e.message || 'Échec de l’envoi.';
+                sendBtn.textContent = 'Envoyer sur Streamtape';
+            } finally {
+                sendBtn.disabled = false;
+            }
+        };
+
+        const poster = it.cover
+            ? el('img', { src: it.cover, alt: it.title, loading: 'lazy', style: 'width:64px;height:96px;object-fit:cover;border-radius:8px', onerror: (e) => { e.target.style.display = 'none'; } })
+            : null;
+
+        const seriesBtn = isSeries ? el('button', {
+            class: 'btn btn-ghost', text: '📁 Envoyer toute la série',
+            title: 'Crée un dossier au nom de la série, un sous-dossier par saison, et envoie tous les épisodes',
+            onclick: async () => {
+                if (!window.confirm(`Envoyer TOUTE la série « ${it.title} » sur Streamtape ?\nDossier « Séries/${it.title.split(' [')[0]} » → sous-dossiers S1, S2…\nChaque épisode part en meilleure qualité disponible (1080p).`)) return;
+                seriesBtn.disabled = true;
+                seriesBtn.textContent = 'Lancement…';
+                status.textContent = '';
+                try {
+                    const r = await api.adminStreamtapeUploadSeries({
+                        subjectId: it.subjectId,
+                        title: it.title,
+                        subjectType: it.subjectType,
+                        quality: parseInt(resSelect.value, 10) || 0,
+                    });
+                    status.textContent = `Batch lancé ✓ (${r.total} épisodes) — création des dossiers puis envoi, ça peut prendre plusieurs minutes.`;
+                    let seen = new Set(stItems.keys());
+                    let timer = setInterval(async () => {
+                        try {
+                            const links = await api.adminStreamtapeBatch(r.batch);
+                            let newItems = links.filter((l) => !seen.has(l.id));
+                            newItems.forEach((l) => { stPoll(l.id); seen.add(l.id); });
+                            loadStHistory();
+                            const done = links.length;
+                            const total = (links.find((l) => l.total) || {}).total || r.total;
+                            status.textContent = `Série « ${it.title} » : ${done}/${total} épisodes envoyés${done >= total ? ' ✓' : '…'}`;
+                            if (done >= total) {
+                                clearInterval(timer);
+                                seriesBtn.textContent = '📁 Envoyer toute la série';
+                                seriesBtn.disabled = false;
+                                toast('Série envoyée ✓');
+                            }
+                        } catch { /* retry next tick */ }
+                    }, 4000);
+                } catch (e) {
+                    status.textContent = e.message || 'Échec du lancement.';
+                    seriesBtn.textContent = '📁 Envoyer toute la série';
+                    seriesBtn.disabled = false;
+                }
+            },
+        }) : null;
+
+        stSendWrap.appendChild(el('div', { class: 'st-send' }, [
+            poster,
+            el('div', { class: 'st-send-info' }, [
+                el('strong', { text: it.title }),
+                el('div', { class: 'st-send-controls' }, [
+                    isSeries ? el('label', { class: 'filter' }, [el('span', { text: 'Saison' }), seasonInput]) : null,
+                    isSeries ? el('label', { class: 'filter' }, [el('span', { text: 'Épisode' }), episodeInput]) : null,
+                    el('label', { class: 'filter' }, [el('span', { text: 'Qualité' }), resSelect]),
+                    el('label', { class: 'filter' }, [el('span', { text: 'Dossier' }), fc.select]),
+                    fc.input,
+                    sendBtn,
+                    seriesBtn,
+                ]),
+            ]),
+            status,
+        ]));
+
+        onSeEpChange();
+    };
+
+    const loadStHistory = async () => {
+        try {
+            const links = await api.adminStreamtapeLinks();
+            clear(stHistory);
+            if (!links.length) {
+                stHistory.appendChild(el('p', { class: 'admin-hint', text: 'Aucun envoi pour l\'instant.' }));
+                return;
+            }
+
+            // Group by folder → render each group with its header.
+            const byFolder = {};
+            links.forEach((link) => {
+                const key = link.folder || '(sans dossier)';
+                if (!byFolder[key]) byFolder[key] = [];
+                byFolder[key].push(link);
+            });
+
+            Object.keys(byFolder).sort((a, b) => a.localeCompare(b)).forEach((folder) => {
+                const group = byFolder[folder];
+                const header = el('div', { class: 'st-folder-header', style: 'margin:16px 0 6px;font-weight:600;color:var(--text-dim);font-size:13px' }, [
+                    el('span', { text: '📁 ' + folder }),
+                    el('span', { class: 'st-item-sub', text: ` · ${group.length} fichier${group.length > 1 ? 's' : ''}` }),
+                ]);
+                stHistory.appendChild(header);
+                group.forEach((link) => {
+                    stItems.set(link.id, stRenderHistory(link));
+                    stHistory.appendChild(stItems.get(link.id));
+                });
+            });
+        } catch (e) {
+            stHistory.appendChild(el('p', { class: 'admin-status', text: e.message }));
+        }
+    };
+
+    const stFoldersWrap = el('div', { class: 'st-folders' });
+    const stUsageWrap = el('div', { class: 'st-usage' });
+    const loadStUsage = async (refresh = false) => {
+        try {
+            const u = await api.adminStreamtapeUsage(refresh);
+            clear(stUsageWrap);
+            const badge = el('span', { class: 'st-usage-value', text: fmtBytes(u.used_bytes) });
+            const meta = el('span', { class: 'st-item-sub', text: ` · ${u.files} fichier${u.files > 1 ? 's' : ''} · ${u.folders} dossier${u.folders > 1 ? 's' : ''}` });
+            const refreshBtn = el('button', {
+                class: 'btn btn-ghost', text: 'Actualiser',
+                onclick: async () => {
+                    refreshBtn.disabled = true;
+                    refreshBtn.textContent = '…';
+                    try { await loadStUsage(true); toast('Espace Streamtape actualisé ✓'); }
+                    catch (e) { stStatus.textContent = e.message; }
+                    refreshBtn.disabled = false;
+                    refreshBtn.textContent = 'Actualiser';
+                },
+            });
+            stUsageWrap.appendChild(el('span', { class: 'st-usage-label', text: '💾 Espace utilisé : ' }));
+            stUsageWrap.appendChild(badge);
+            stUsageWrap.appendChild(meta);
+            stUsageWrap.appendChild(refreshBtn);
+        } catch (e) {
+            stUsageWrap.appendChild(el('p', { class: 'admin-status', text: 'Espace Streamtape indisponible : ' + e.message }));
+        }
+    };
+    const stRenderFolderNode = (f) => {
+        return el('div', { class: 'st-folder-item' }, [
+            el('span', { class: 'st-folder-name', text: '📁 ' + f.name }),
+            el('span', { class: 'st-item-sub', text: f.folderId }),
+            el('button', {
+                class: 'btn btn-danger', text: 'Supprimer', title: 'Supprime le dossier ET tout son contenu sur Streamtape',
+                onclick: async () => {
+                    if (!window.confirm(`Supprimer le dossier « ${f.name} » et TOUT son contenu sur Streamtape ?`)) return;
+                    try {
+                        const r = await api.adminStreamtapeDeleteFolder(f.id);
+                        if (r && r.deleted) toast('Dossier supprimé ✓');
+                        loadStFolders();
+                    } catch (e) { stStatus.textContent = e.message; }
+                },
+            }),
+        ]);
+    };
+
+    const loadStFolders = async () => {
+        try {
+            const folders = await api.adminStreamtapeFolders();
+            clear(stFoldersWrap);
+            if (!folders.length) {
+                stFoldersWrap.appendChild(el('p', { class: 'admin-hint', text: 'Aucun dossier créé via l\'app pour l\'instant (les dossiers « Films » et « Séries » apparaîtront dès le premier envoi automatique).' }));
+                return;
+            }
+
+            // Build a tree: parent (empty string) → children → grandchildren.
+            const childrenOf = {};
+            const roots = [];
+            folders.forEach((f) => {
+                const pid = f.parent ?? '';
+                if (!childrenOf[pid]) childrenOf[pid] = [];
+                childrenOf[pid].push(f);
+            });
+            roots.push(...(childrenOf[''] || []));
+
+            const renderTree = (nodes, depth) => {
+                nodes.forEach((f) => {
+                    const wrap = el('div', { class: 'st-folder-branch', style: `padding-left:${depth * 20}px` }, [
+                        stRenderFolderNode(f),
+                    ]);
+                    stFoldersWrap.appendChild(wrap);
+                    const kids = childrenOf[f.folderId] || [];
+                    if (kids.length) renderTree(kids, depth + 1);
+                });
+            };
+            renderTree(roots, 0);
+        } catch (e) {
+            stFoldersWrap.appendChild(el('p', { class: 'admin-status', text: e.message }));
+        }
+    };
+
+    body.appendChild(el('div', { class: 'admin-panel' }, [
+        el('h3', { text: 'Envoyer sur Streamtape' }),
+        el('p', { class: 'admin-hint', text: "Les résultats s'affichent pendant que tu tapes. Clique sur une affiche pour l'envoyer sur ton lecteur Streamtape (upload remote, headers navigateur inclus). Point vert = vidéo disponible, point rouge = flux indisponible en amont." }),
+        stUsageWrap,
+        stSearchInput,
+        stSearchHint,
+        stResults,
+        stSendWrap,
+        el('h4', { class: 'st-history-title', text: 'Envois récents' }),
+        stHistory,
+        el('h4', { class: 'st-history-title', text: 'Dossiers sur Streamtape' }),
+        stFoldersWrap,
+    ]));
+
+    loadStFolders();
+
+    loadStUsage();
+
+    loadStHistory();
 
     loadBlocked();
 }

@@ -144,6 +144,21 @@ export const api = {
     adminAddBlockedTitle: (term) => unwrap(request('admin/blocked-titles', { method: 'POST', body: { term } })),
     adminDeleteBlockedTitle: (id) => request(`admin/blocked-titles/${id}`, { method: 'DELETE' }),
 
+    // ---- Admin Streamtape ----
+    adminStreamtapeSearch: (q) => unwrap(request('admin/streamtape/search', { params: { q } })),
+    adminStreamtapeSources: (params) => unwrap(request('admin/streamtape/sources', { params })),
+    adminStreamtapeLinks: () => unwrap(request('admin/streamtape/links')),
+    adminStreamtapeUpload: (payload) => unwrap(request('admin/streamtape/upload', { method: 'POST', body: payload })),
+    adminStreamtapeUploadSeries: (payload) => unwrap(request('admin/streamtape/upload-series', { method: 'POST', body: payload })),
+    adminStreamtapeStatus: (id) => unwrap(request(`admin/streamtape/status/${id}`)),
+    adminStreamtapeMove: (id, folder) => unwrap(request(`admin/streamtape/move/${id}`, { method: 'POST', body: { folder } })),
+    adminStreamtapeRetry: (id) => unwrap(request(`admin/streamtape/retry/${id}`, { method: 'POST' })),
+    adminStreamtapeUsage: (refresh = false) => unwrap(request('admin/streamtape/usage', { params: { refresh } })),
+    adminStreamtapeFolders: () => unwrap(request('admin/streamtape/folders')),
+    adminStreamtapeDeleteFolder: (id) => unwrap(request(`admin/streamtape/folders/${id}`, { method: 'DELETE' })),
+    adminStreamtapeDelete: (id) => unwrap(request(`admin/streamtape/${id}`, { method: 'DELETE' })),
+    adminStreamtapeBatch: (batch) => unwrap(request('admin/streamtape/links', { params: { batch } })),
+
     // ---- Library ----
     favorites: () => unwrap(request('favorites')),
     addFavorite: (payload) => unwrap(request('favorites', { method: 'POST', body: payload })),

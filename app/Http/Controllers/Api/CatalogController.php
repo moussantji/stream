@@ -6,10 +6,12 @@ use App\Http\Controllers\Controller;
 use App\Models\CatalogItem;
 use App\Models\CatalogSnapshot;
 use App\Services\Catalog\CatalogRepository;
+use App\Services\DioStream\DioStreamClient;
 use App\Services\MovieBox\MovieBoxClient;
 use App\Services\MovieBox\SubjectType;
 use App\Support\ContentFilter;
 use App\Support\ItemNormalizer;
+use App\Support\VersionFilter;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
@@ -27,7 +29,10 @@ class CatalogController extends Controller
     public function __construct(
         protected MovieBoxClient $client,
         protected CatalogRepository $repo,
-    ) {}
+        protected ?DioStreamClient $dio = null,
+    ) {
+        $this->dio ??= app(DioStreamClient::class);
+    }
 
     // -----------------------------------------------------------------
     // Discovery
@@ -193,12 +198,15 @@ class CatalogController extends Controller
                 return [
                     'query' => $q,
                     'type' => $type->name,
-                    // NOTE: search is intentionally NOT content-filtered.
+                    // NOTE: search is intentionally NOT content-blocklist-filtered,
+                    // but only French / English / VOSTFR / VO versions are shown.
                     'items' => ItemNormalizer::many($res['items'] ?? []),
                     'pager' => $this->pager($res, $page, $perPage),
                 ];
             },
         );
+
+        $data['items'] = VersionFilter::apply($data['items'] ?? []);
 
         return response()->json(['data' => $data]);
     }
@@ -223,6 +231,10 @@ class CatalogController extends Controller
                 }
                 // Keep hentai/adult (blocked keywords) out of autocomplete.
                 if (ContentFilter::isBlocked($normalized)) {
+                    continue;
+                }
+                // Only French / English / VOSTFR / VO versions.
+                if (! VersionFilter::accepts($normalized['title'] ?? '', (int) ($normalized['subjectType'] ?? 0))) {
                     continue;
                 }
                 $suggestions[] = ['word' => $normalized['title'], 'type' => (int) ($normalized['subjectType'] ?? 0)];
@@ -632,6 +644,12 @@ class CatalogController extends Controller
         }
 
         $item = is_array($detail) ? ItemNormalizer::one($detail) : null;
+
+        // DioStream fallback: when the MovieBox transport has no detail for the
+        // subject, rebuild it from the diostream.cc metadata (TMDB-shaped).
+        $dioDetail = $item === null ? $this->dioDetail($validated) : null;
+        $item ??= $dioDetail['item'] ?? null;
+
         $item ??= [
             'subjectId' => $subjectId,
             'subjectType' => (int) ($validated['subjectType'] ?? 0),
@@ -659,19 +677,29 @@ class CatalogController extends Controller
             // own web player): some episodes are only available as adaptive
             // streams (play-info), not as downloadable files (resource), so the
             // list must not be limited to the downloadable ones.
-            try {
-                $seasonData = $this->client->seasonInfo($subjectId);
-                $seasons = $this->normalizeSeasons($seasonData['seasons'] ?? []);
-            } catch (\Throwable $e) {
-                report($e);
+            if ($dioDetail !== null) {
+                $seasons = $dioDetail['seasons'];
+            } else {
+                try {
+                    $seasonData = $this->client->seasonInfo($subjectId);
+                    $seasons = $this->normalizeSeasons($seasonData['seasons'] ?? []);
+                } catch (\Throwable $e) {
+                    report($e);
+                }
             }
         }
 
-        $cast = is_array($detail) ? $this->normalizeCast($detail['staffList'] ?? []) : [];
+        $cast = is_array($detail)
+            ? $this->normalizeCast($detail['staffList'] ?? [])
+            : ($dioDetail['cast'] ?? []);
         $dubs = $this->ensureFrenchVersion(
             is_array($detail) ? $this->normalizeDubs($detail['dubs'] ?? []) : [],
             $item
         );
+        // Version / Langue selector: only French / English / VOSTFR / VO dubs.
+        $dubs = array_values(array_filter($dubs, fn ($dub) => VersionFilter::accepts(
+            '['.trim((string) ($dub['label'] ?? '')).']'
+        )));
 
         $recommendations = [];
         if (! empty($item['genres'][0])) {
@@ -689,7 +717,7 @@ class CatalogController extends Controller
             'dubs' => $dubs,
             'trailer' => is_array($detail) ? $this->extractTrailer($detail) : null,
             'recommendations' => $recommendations,
-            'detailAvailable' => is_array($detail),
+            'detailAvailable' => is_array($detail) || $dioDetail !== null,
         ];
 
         if ($debug && is_array($detail)) {
@@ -704,6 +732,59 @@ class CatalogController extends Controller
         }
 
         return $result;
+    }
+
+    /**
+     * DioStream fallback for a detail request: resolves the TMDB id (numeric
+     * subject id, else a title search) and rebuilds the item, seasons and cast
+     * from the DioStream metadata.
+     *
+     * @param  array<string,mixed>  $validated
+     * @return array{item:array<string,mixed>,seasons:array<int,mixed>,cast:array<int,mixed>}|null
+     */
+    protected function dioDetail(array $validated): ?array
+    {
+        try {
+            $subjectId = (string) ($validated['subjectId'] ?? '');
+            $tmdb = ctype_digit($subjectId) ? $subjectId : null;
+
+            if ($tmdb === null && ! empty($validated['title'])) {
+                $results = $this->dio->search((string) $validated['title'])['results'] ?? [];
+                foreach ($results as $r) {
+                    if (is_array($r) && ! empty($r['tmdb_id'])) {
+                        $tmdb = (string) $r['tmdb_id'];
+                        break;
+                    }
+                }
+            }
+            if ($tmdb === null) {
+                return null;
+            }
+
+            $kind = (int) ($validated['subjectType'] ?? 0) === SubjectType::TV_SERIES->value ? 'tv' : 'auto';
+            $item = $this->dio->itemDetail($tmdb, $kind);
+
+            $seasons = [];
+            $cast = [];
+            if ($item['subjectType'] === SubjectType::TV_SERIES->value) {
+                $seasons = $this->dio->seasons($tmdb);
+                $meta = $this->dio->tv($tmdb, false);
+                $cast = array_values(array_filter(array_map(
+                    fn ($c) => is_array($c) ? [
+                        'name' => $c['name'] ?? null,
+                        'character' => $c['character'] ?? null,
+                        'avatar' => $c['profile'] ?? null,
+                    ] : null,
+                    $meta['cast'] ?? []
+                )));
+            }
+
+            return ['item' => $item, 'seasons' => $seasons, 'cast' => $cast];
+        } catch (\Throwable $e) {
+            report($e);
+
+            return null;
+        }
     }
 
     /**

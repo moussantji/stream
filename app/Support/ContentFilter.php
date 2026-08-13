@@ -28,13 +28,17 @@ class ContentFilter
     public const BLOCKED_CACHE_KEY = 'content:blocked_titles';
 
     /**
-     * Remove blocked items from a normalized item list.
+     * Remove blocked items from a normalized item list. Version filtering
+     * (French / English / VOSTFR / VO only) is applied first, then the
+     * admin-managed blocklist.
      *
      * @param  array<int,array<string,mixed>>  $items
      * @return array<int,array<string,mixed>>
      */
     public static function apply(array $items): array
     {
+        $items = VersionFilter::apply($items);
+
         if (! self::enabled()) {
             return $items;
         }
