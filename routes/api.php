@@ -37,6 +37,7 @@ Route::middleware('throttle:120,1')->group(function () {
     Route::get('channels', [CatalogController::class, 'channels']);
     Route::get('local', [CatalogController::class, 'local']);
     Route::get('detail', [CatalogController::class, 'detail']);
+    Route::get('suggestions', [CatalogController::class, 'suggestions']);
     Route::get('diagnostics', [CatalogController::class, 'diagnostics']);
 
     // ---- Streaming (public) -----------------------------------------------

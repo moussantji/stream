@@ -4,6 +4,7 @@ namespace App\Services\Catalog;
 
 use App\Models\CatalogItem;
 use App\Models\CatalogSnapshot;
+use App\Support\ContentFilter;
 use Closure;
 use Throwable;
 
@@ -56,6 +57,22 @@ class CatalogRepository
 
             throw $e;
         }
+    }
+
+    /**
+     * Whether a fresh snapshot exists for the key (used to skip rebuilding).
+     */
+    public function hasFresh(string $key, int $ttl): bool
+    {
+        $snapshot = $this->find($key);
+
+        return $snapshot !== null && $this->isFresh($snapshot, $ttl);
+    }
+
+    /** Write a snapshot directly (no freshness semantics of its own). */
+    public function storeRaw(string $key, mixed $data, int $ttl = 0): void
+    {
+        $this->store($key, $data);
     }
 
     protected function find(string $key): ?CatalogSnapshot
@@ -120,6 +137,13 @@ class CatalogRepository
         $now = now();
         $rows = [];
         foreach ($items as $item) {
+            // Never persist adult/porn content, mirroring moviebox.ph whose own
+            // surfaces are already clean upstream: blocked titles can no longer
+            // appear on any page, search or recommendation.
+            if (ContentFilter::isBlocked($item)) {
+                continue;
+            }
+
             $rows[] = [
                 'subject_id' => (string) $item['subjectId'],
                 'subject_type' => (int) ($item['subjectType'] ?? 0),

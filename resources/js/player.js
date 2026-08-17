@@ -68,6 +68,8 @@ const I = {
     enterFs: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M4 9V4h5v2H6v3H4zm11-5h5v5h-2V6h-3V4zM6 15v3h3v2H4v-5h2zm12 0h2v5h-5v-2h3v-3z"/></svg>',
     exitFs: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 7V4H5v5h5V7H7zm10 0h-3v2h5V4h-2v3zM7 17h3v-2H5v5h2v-3zm10 0v3h2v-5h-5v2h3z"/></svg>',
     bigPlay: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>',
+    back10: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 5V1L7 6l5 5V7a6 6 0 1 1-6 6H4a8 8 0 1 0 8-8z"/></svg>',
+    fwd10: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 5V1l5 5-5 5V7a6 6 0 1 0 6 6h2a8 8 0 1 1-8-8z"/></svg>',
 };
 
 const fmt = (s) => {
@@ -95,8 +97,10 @@ export class Player {
 
     build() {
         // No `crossorigin`: the media CDN doesn't send CORS headers; subtitles
-        // are proxied same-origin so they work regardless.
-        this.video = el('video', { playsinline: 'playsinline', preload: 'metadata' });
+        // are proxied same-origin so they work regardless. `preload="auto"`
+        // lets the browser pivot immediately, fetching the stream index + first
+        // frames as soon as the source is set (before the user hits play).
+        this.video = el('video', { playsinline: 'playsinline', preload: 'auto' });
 
         this.spinner = el('div', { class: 'vp-spinner', hidden: 'hidden' });
         this.bigBtn = el('button', { class: 'vp-big', 'aria-label': 'Lecture', html: I.bigPlay });
@@ -113,6 +117,8 @@ export class Player {
             el('div', { class: 'vp-track' }, [this.buffered, this.played, this.handle]),
         ]);
 
+        this.seekBackBtn = el('button', { class: 'vp-btn', 'aria-label': 'Reculer de 10 s', html: I.back10, onclick: () => this.seekBy(-10) });
+        this.seekFwdBtn = el('button', { class: 'vp-btn', 'aria-label': 'Avancer de 10 s', html: I.fwd10, onclick: () => this.seekBy(10) });
         this.playBtn = el('button', { class: 'vp-btn', 'aria-label': 'Lecture/Pause', html: I.play });
         this.muteBtn = el('button', { class: 'vp-btn', 'aria-label': 'Muet', html: I.volume });
         this.volume = el('input', { class: 'vp-volume', type: 'range', min: '0', max: '1', step: '0.05', value: '1' });
@@ -132,7 +138,7 @@ export class Player {
         this.controls = el('div', { class: 'vp-controls' }, [
             this.progress,
             el('div', { class: 'vp-row' }, [
-                this.playBtn,
+                this.seekBackBtn, this.playBtn, this.seekFwdBtn,
                 el('div', { class: 'vp-vol' }, [this.muteBtn, this.volume]),
                 this.time,
                 el('div', { class: 'vp-spacer' }),
@@ -160,15 +166,12 @@ export class Player {
         this.playBtn.onclick = toggle;
         this.bigBtn.onclick = toggle;
 
-        // Single click toggles play/pause; a double-click is disambiguated with
-        // a short delay so it can trigger seek / pause zones instead.
-        this._clickTimer = null;
-        v.addEventListener('click', () => {
-            if (this._clickTimer) return; // a double-click is in progress
-            this._clickTimer = setTimeout(() => { this._clickTimer = null; toggle(); }, 220);
-        });
+        // Single tap only opens/closes the control bar (never touches playback);
+        // a double tap pauses/resumes, and on the left/right thirds it seeks ±10s
+        // (YouTube-style). The two component clicks of a double tap just toggle
+        // the control bar twice, leaving playback untouched.
+        v.addEventListener('click', () => this.toggleControls());
         v.addEventListener('dblclick', (e) => {
-            if (this._clickTimer) { clearTimeout(this._clickTimer); this._clickTimer = null; }
             const zone = this.zoneOf(e.clientX);
             if (zone === 'left') this.seekBy(-10);
             else if (zone === 'right') this.seekBy(10);
@@ -177,8 +180,8 @@ export class Player {
 
         v.addEventListener('play', () => { this.playBtn.innerHTML = I.pause; this.wrap.classList.add('vp-playing'); this.scheduleHide(); });
         v.addEventListener('pause', () => { this.playBtn.innerHTML = I.play; this.wrap.classList.remove('vp-playing'); this.showControls(); });
-        // The proxy streams in 64KB chunks, so short network stalls fire a
-        // `waiting` between every chunk burst. Debounce the spinner: only show
+        // The proxy streams in ~256KB chunks, so short network stalls may still
+        // fire a `waiting` between chunk bursts. Debounce the spinner: only show
         // it when the buffer is genuinely starved for a sustained moment, and
         // clear it on any sign of playback progress — otherwise it flickers or
         // stays stuck over a playing video.
@@ -284,6 +287,14 @@ export class Player {
 
     showControls() { this.wrap.classList.add('vp-active'); }
     hideControls() { if (!this.menu.hidden) return; this.wrap.classList.remove('vp-active'); }
+    toggleControls() {
+        if (this.wrap.classList.contains('vp-active')) {
+            this.hideControls();
+        } else {
+            this.showControls();
+            this.scheduleHide();
+        }
+    }
     hideSpinner() { clearTimeout(this._waitT); this.spinner.hidden = true; }
     scheduleHide() {
         clearTimeout(this._hideTimer);
@@ -299,7 +310,7 @@ export class Player {
         return 'center';
     }
 
-    // Jump forward/backward by N seconds, with a brief on-screen indicator.
+        // Jump forward/backward by N seconds, with a brief on-screen indicator.
     seekBy(delta) {
         const v = this.video;
         const d = isFinite(v.duration) ? v.duration : 0;
@@ -399,29 +410,36 @@ export class Player {
         // always choosing H.264. A catalogue may only offer H.264 at 480p and
         // HEVC at 1080p; supported browsers should use the higher-quality file.
         const hevc = hevcSupported();
-        const h264 = sources.filter((s) => !isHevcSource(s));
+        const h264 = [...sources.filter((s) => !isHevcSource(s))].sort((a, b) =>
+            Number(b.resolution || 0) - Number(a.resolution || 0)
+        );
         const ordered = [...sources].sort((a, b) =>
             Number(b.resolution || 0) - Number(a.resolution || 0)
         );
-        const best = hevc ? ordered[0] : h264[0];
-        if (best) {
-            this.setMp4(best);
-        } else if (dash.length && hevc) {
-            await this.setDash(dash[0]);
-            this.startWatchdog();
-        } else if (hls.length && hevc) {
-            await this.setHls(hls[0]);
-            this.startWatchdog();
-        } else if (sources.length) {
-            this.setMp4(sources[0]);
-        } else if (dash.length) {
-            // No MP4 fallback on this device — try the adaptive stream anyway;
-            // the watchdog + error handlers bail if it cannot start.
+        // Prefer H.264 for smoothness: it decodes lighter and plays direct from
+        // the CDN, while HEVC always goes through the PHP remux proxy. Only when
+        // no H.264 exists do we pick the top (HEVC) rendition.
+        // Prefer the adaptive stream (DASH/HLS) whenever possible: it starts
+        // almost instantly (low-bitrate first segments, then ABR climbs to the
+        // best quality) and never stalls on a single heavy MP4 piped through
+        // the PHP proxy. DASH here is HEVC (needs a decoder); HLS is H.264 and
+        // plays everywhere via hls.js. If an adaptive stream fails to start,
+        // the watchdog falls back to the H.264 MP4.
+        if (dash.length && hevc) {
             await this.setDash(dash[0]);
             this.startWatchdog();
         } else if (hls.length) {
             await this.setHls(hls[0]);
             this.startWatchdog();
+        } else if (best) {
+            this.setMp4(best);
+        } else if (dash.length) {
+            // No MP4 fallback on this device — try the adaptive stream anyway;
+            // the watchdog + error handlers bail if it cannot start.
+            await this.setDash(dash[0]);
+            this.startWatchdog();
+        } else if (sources.length) {
+            this.setMp4(sources[0]);
         } else {
             throw new Error('No playable source found for this title.');
         }
@@ -434,6 +452,11 @@ export class Player {
                 if (startTime < (this.video.duration || Infinity) - 10) this.video.currentTime = startTime;
             }, { once: true });
         }
+
+        // Best-effort auto-start: the user just navigated here (often without a
+        // fresh gesture, so the browser may reject it) — but when allowed, the
+        // film begins as soon as the stream is buffered, with no extra click.
+        this.play().then(() => { this._autoPlayed = true; }).catch(() => { /* gesture required */ });
 
         if (onProgress) {
             clearInterval(this._progressTimer);
@@ -467,8 +490,8 @@ export class Player {
         this.updateQualityUi();
     }
 
-    _setSrc(url) {
-        const t = this.video.currentTime;
+    _setSrc(url, position) {
+        const t = (typeof position === 'number' && isFinite(position)) ? position : this.video.currentTime;
         const wasPlaying = !this.video.paused;
         this.video.src = url;
         this.video.addEventListener('loadedmetadata', () => {
@@ -617,7 +640,7 @@ export class Player {
         }
     }
 
-    play() { this.video.play().catch(() => {}); }
+    play() { return this.video.play().catch(() => {}); }
 
     destroyHls() { if (this.hls) { this.hls.destroy(); this.hls = null; } }
     destroyDash() { if (this.dash) { try { this.dash.reset(); } catch { /* */ } this.dash = null; } }

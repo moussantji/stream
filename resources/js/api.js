@@ -121,7 +121,7 @@ export const api = {
     me: () => unwrap(request('auth/me')),
 
     // ---- Catalog ----
-    home: () => unwrap(request('home')),
+    home: (page = 1) => unwrap(request('home', { params: { page } })),
     trending: (page = 1, type = 'all') => unwrap(request('trending', { params: { page, type } })),
     search: (q, type = 'all', page = 1) => unwrap(request('search', { params: { q, type, page } })),
     suggest: (q) => unwrap(request('suggest', { params: { q } })),
@@ -130,6 +130,7 @@ export const api = {
     channels: () => unwrap(request('channels')),
     local: (params) => unwrap(request('local', { params })),
     detail: (params) => unwrap(request('detail', { params })),
+    suggestions: (params) => unwrap(request('suggestions', { params })),
 
     // ---- Streaming ----
     play: (params) => unwrap(request('play', { params })),

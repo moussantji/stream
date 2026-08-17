@@ -15,6 +15,53 @@ namespace App\Support;
  */
 class TextSanitizer
 {
+    /**
+     * French display names for the language tags the provider appends to
+     * titles (e.g. "Reacher [Hindi]" → "Reacher [Hindi]"), indexed by the
+     * lowercase token(s) found inside the square brackets.
+     *
+     * @var array<string,string>
+     */
+    protected const LANG_TAGS = [
+        'hindi' => 'Hindi', 'telugu' => 'Télougou', 'telugu org' => 'Télougou', 'tamil' => 'Tamoul',
+        'tamil org' => 'Tamoul', 'malayalam' => 'Malayalam', 'kannada' => 'Kannada', 'bengali' => 'Bengali',
+        'punjabi' => 'Pendjabi', 'marathi' => 'Marathi', 'gujarati' => 'Gujarati', 'urdu' => 'Ourdou',
+        'nepali' => 'Népalais', 'sinhala' => 'Singhalais', 'oriental' => 'Oriental',
+        'korean' => 'Coréen', 'korean org' => 'Coréen', 'chinese' => 'Chinois', 'mandarin' => 'Mandarin',
+        'cantonese' => 'Cantonais', 'japanese' => 'Japonais', 'japanese org' => 'Japonais',
+        'thai' => 'Thaï', 'vietnamese' => 'Vietnamien', 'indonesian' => 'Indonésien', 'malay' => 'Malais',
+        'filipino' => 'Philippin', 'burmese' => 'Birman', 'khmer' => 'Khmer', 'laotian' => 'Laotien',
+        'mongolian' => 'Mongol', 'persian' => 'Persan', 'farsi' => 'Persan', 'arabic' => 'Arabe',
+        'hebrew' => 'Hébreu', 'turkish' => 'Turc', 'russian' => 'Russe', 'ukrainian' => 'Ukrainien',
+        'kazakh' => 'Kazakh', 'uzbek' => 'Ouzbek', 'azerbaijani' => 'Azéri', 'georgian' => 'Géorgien',
+        'armenian' => 'Arménien', 'greek' => 'Grec', 'italian' => 'Italien', 'spanish' => 'Espagnol',
+        'portuguese' => 'Portugais', 'french' => 'Français', 'français' => 'Français', 'francais' => 'Français',
+        'english' => 'Anglais', 'english org' => 'Anglais', 'german' => 'Allemand', 'dutch' => 'Néerlandais',
+        'swedish' => 'Suédois', 'norwegian' => 'Norvégien', 'danish' => 'Danois', 'finnish' => 'Finnois',
+        'polish' => 'Polonais', 'czech' => 'Tchèque', 'hungarian' => 'Hongrois', 'romanian' => 'Roumain',
+        'bulgarian' => 'Bulgare', 'serbian' => 'Serbe', 'croatian' => 'Croate', 'swahili' => 'Swahili',
+        'haitian' => 'Haïtien', 'creole' => 'Créole', 'amharic' => 'Amharique', 'tigrinya' => 'Tigrinya',
+        'mauritian' => 'Mauricien', 'malagasy' => 'Malgache',
+    ];
+
+    /**
+     * Title safe for display: the square-bracket language tags are translated
+     * to their French names (any non-language tag — CAM, TS, WEB-DL… — is left
+     * untouched). The raw title stays unchanged for filtering/version logic.
+     */
+    public static function displayTitle(string $title): string
+    {
+        return preg_replace_callback('/\[([^\]]+)\]/u', function (array $m): string {
+            $tokens = array_values(array_filter(array_map('trim', preg_split('/[\-–—+|,\/\s]+/u', $m[1] ?? ''))));
+            if ($tokens === []) {
+                return $m[0];
+            }
+            $mapped = array_map(fn ($t) => self::LANG_TAGS[mb_strtolower($t)] ?? $t, $tokens);
+
+            return '['.implode('-', $mapped).']';
+        }, $title);
+    }
+
     /** Clean a title: keep the meaningful part, drop SEO tails & hashtags. */
     public static function title(?string $raw): string
     {
@@ -53,6 +100,10 @@ class TextSanitizer
         // Normalise newlines, strip hashtags / URLs.
         $text = str_replace(["\r\n", "\r"], "\n", $raw);
         $text = self::stripHashtagsAndUrls($text);
+        // Cut the blurb at promo boilerplate: everything after a marker like
+        // "Subscribe Here", "Related Movies :", "New Movies :", "Watch Full
+        // Movie", "Best Actors" is channel advertising, never a synopsis.
+        $text = self::cutPromoTail($text);
 
         // Bail out early if the whole thing reads like keyword stuffing.
         if (self::looksLikeKeywordSpam($text)) {
@@ -72,6 +123,11 @@ class TextSanitizer
             return null;
         }
 
+        // A leftover "@channel" handle or a copied title is not a synopsis.
+        if (mb_strlen($text) < 25 && ! preg_match('/[.!?]/u', $text)) {
+            return null;
+        }
+
         // Reasonable upper bound so an overly long blurb stays readable.
         if (mb_strlen($text) > 1200) {
             $text = rtrim(mb_substr($text, 0, 1200)).'…';
@@ -80,10 +136,61 @@ class TextSanitizer
         return $text;
     }
 
+    /**
+     * Drop everything from the first channel-promotion marker onward, plus any
+     * stray actor-list / arrow lines right after the real synopsis.
+     */
+    protected static function cutPromoTail(string $text): string
+    {
+        $lines = preg_split('/\R/u', $text);
+        $out = [];
+        $cut = false;
+
+        foreach ($lines as $line) {
+            if ($cut) {
+                continue;
+            }
+
+            $lower = mb_strtolower(trim($line));
+
+            // A "→ Name" line is promo filler even when no marker fired yet.
+            if (preg_match('/^(→|>|\*)\s*\p{L}{2,20}(\s+\p{L}{2,25}){0,3}\s*$/u', trim($line))) {
+                continue;
+            }
+
+            foreach (self::PROMO_MARKERS as $marker) {
+                if (str_contains($lower, $marker)) {
+                    $cut = true;
+                    break;
+                }
+            }
+            if ($cut) {
+                continue;
+            }
+
+            $out[] = $line;
+        }
+
+        return implode("\n", $out);
+    }
+
+    /** @var array<int,string> */
+    protected const PROMO_MARKERS = [
+        'subscribe here', 'subscribe now', 'please subscribe', 'don\'t forget to subscribe', 'dont forget to subscribe',
+        'related movies', 'related :', 'new movies', 'best movies', 'best actors', 'more movies', 'watch full movie',
+        'full movies', 'full movie', 'english movie', 'hollywood movie', 'watch online', 'watch free', 'download free',
+        'follow me', 'follow us', 'click here', 'like and share', 'like, share', 'thanks for watching', 'thank you for watching',
+        'share this video', 'reupload', 'all rights reserved', 'copyright', 'visit our', 'check out our', 'featured movies',
+        'top movies', 'upcoming movies', 'movie in hindi', 'dual audio', 'hindi dubbed', 'tamil dubbed',
+    ];
+
     protected static function stripHashtagsAndUrls(string $text): string
     {
         $text = preg_replace('~https?://\S+~i', '', $text);
         $text = preg_replace('/#[^\s#]+/u', '', $text);
+        // Channel handles (@Name) and invisible Unicode formatting chars.
+        $text = preg_replace('/@\S+/u', '', $text);
+        $text = preg_replace('/[\x{200b}\x{200c}\x{200d}\x{2060}\x{feff}\x{00ad}]/u', '', $text);
 
         return $text;
     }

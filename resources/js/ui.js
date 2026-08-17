@@ -1,6 +1,15 @@
 // DOM helpers + reusable UI pieces (cards, rows, skeletons, toasts, modals).
 import { api, ApiError, setAuth, clearAuth, isAuthed, currentUser } from './api.js';
 
+// Neutral gray placeholder painted behind a cover while it loads.
+export function blurPlaceholder(hash, title = '', w = 64, h = 96) {
+    return el('div', {
+        class: 'cover-hash cover-hash-gray',
+        role: 'img',
+        'aria-label': title ? `Aperçu de ${title}` : '',
+    });
+}
+
 // ---- tiny DOM helper ----
 export function el(tag, attrs = {}, children = []) {
     const node = document.createElement(tag);
@@ -26,6 +35,41 @@ export function clear(node) { while (node.firstChild) node.removeChild(node.firs
 export function navigate(path) {
     window.history.pushState({}, '', path);
     window.dispatchEvent(new PopStateEvent('popstate'));
+}
+
+// French names for the [Lang] tags appended to titles — mirrors the server map
+// (app/Support/TextSanitizer) so raw titles (history rows, suggestions, etc.)
+// are shown in French even when the API didn't pre-compute displayTitle.
+const LANG_TAGS_FR = {
+    hindi: 'Hindi', telugu: 'Télougou', tamil: 'Tamoul', malayalam: 'Malayalam',
+    kannada: 'Kannada', bengali: 'Bengali', punjabi: 'Pendjabi', marathi: 'Marathi',
+    gujarati: 'Gujarati', urdu: 'Ourdou', nepali: 'Népalais', sinhala: 'Singhalais',
+    korean: 'Coréen', chinese: 'Chinois', mandarin: 'Mandarin', cantonese: 'Cantonais',
+    japanese: 'Japonais', thai: 'Thaï', vietnamese: 'Vietnamien', indonesian: 'Indonésien',
+    malay: 'Malais', filipino: 'Philippin', burmese: 'Birman', khmer: 'Khmer',
+    persian: 'Persan', farsi: 'Persan', arabic: 'Arabe', hebrew: 'Hébreu', turkish: 'Turc',
+    russian: 'Russe', ukrainian: 'Ukrainien', greek: 'Grec', italian: 'Italien',
+    spanish: 'Espagnol', portuguese: 'Portugais', french: 'Français', français: 'Français',
+    english: 'Anglais', german: 'Allemand', dutch: 'Néerlandais', swedish: 'Suédois',
+    norwegian: 'Norvégien', danish: 'Danois', finnish: 'Finnois', polish: 'Polonais',
+    czech: 'Tchèque', hungarian: 'Hongrois', romanian: 'Roumain', bulgarian: 'Bulgare',
+    serbian: 'Serbe', croatian: 'Croate', swahili: 'Swahili', haitian: 'Haïtien',
+};
+
+function translateTitleTags(title) {
+    return String(title || '').replace(/\[([^\]]+)\]/g, (m, inner) => {
+        const tokens = inner.split(/[\-–—+|,\/\s]+/).map((t) => t.trim()).filter(Boolean);
+        if (!tokens.length) return m;
+        return `[${tokens.map((t) => LANG_TAGS_FR[t.toLowerCase()] || t).join('-')}]`;
+    });
+}
+
+// Display title: prefers the server-computed French translation of the
+// [Lang] tag, falls back to a client-side translation of the raw title.
+export function displayTitle(item) {
+    if (!item) return 'Untitled';
+    if (item.displayTitle) return item.displayTitle;
+    return translateTitleTags(item.title) || 'Untitled';
 }
 
 export function detailHref(item) {
@@ -56,11 +100,15 @@ const PLAY_ICON = '<svg viewBox="0 0 24 24" width="22" height="22" fill="#fff"><
 
 // ---- content card ----
 export function card(item, opts = {}) {
-    const poster = item.cover
-        ? el('img', { src: item.cover, alt: item.title, loading: 'lazy', onerror: (e) => { e.target.replaceWith(el('div', { class: 'ph', text: item.title || 'No image' })); } })
-        : el('div', { class: 'ph', text: item.title || 'No image' });
+    const title = displayTitle(item);
+    const src = item.coverSmall || item.cover;
+    const placeholder = item.coverHash ? blurPlaceholder(item.coverHash, title) : null;
+    const poster = src
+        ? el('img', { src, alt: title, loading: 'lazy', decoding: 'async', class: 'cover-fade', onload: (e) => e.target.classList.add('loaded'), onerror: (e) => { e.target.remove(); } })
+        : el('div', { class: 'ph', text: title });
 
     const posterWrap = el('div', { class: 'card-poster' }, [
+        placeholder,
         poster,
         el('div', { class: 'card-type', text: item.typeLabel || '' }),
         item.french ? el('div', { class: 'card-fr', title: 'Audio français disponible' }, [el('span', { text: 'VF' })]) : null,
@@ -86,7 +134,7 @@ export function card(item, opts = {}) {
     }, [
         posterWrap,
         el('div', { class: 'card-body' }, [
-            el('div', { class: 'card-title', text: item.title || 'Untitled' }),
+            el('div', { class: 'card-title', text: title }),
             el('div', { class: 'card-sub' }, sub),
         ]),
     ]);

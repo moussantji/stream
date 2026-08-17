@@ -3,7 +3,6 @@
 namespace App\Providers;
 
 use App\Services\MovieBox\MovieBoxClient;
-use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\ServiceProvider;
 use Throwable;
@@ -51,9 +50,27 @@ class AppServiceProvider extends ServiceProvider
         }
 
         $this->app->terminating(function () {
+            // The built-in `artisan serve` worker is single-threaded: running
+            // the import inline would freeze the whole site for minutes. Launch
+            // it in a detached background process instead.
+            $run = fn (string $cmd) => @shell_exec(sprintf(
+                'nohup %s %s > %s 2>&1 &',
+                escapeshellarg(PHP_BINARY),
+                $cmd,
+                escapeshellarg(base_path('storage/logs/background.log'))
+            ));
+
             try {
                 // Keep startup light; the admin "deep import" fetches more pages.
-                Artisan::call('catalog:import', ['--pages' => 3]);
+                $run('artisan catalog:import --pages=3');
+            } catch (Throwable $e) {
+                report($e);
+            }
+            // Pre-resolve play payloads for the freshly imported titles so the
+            // first click on "Lecture" is a cache hit instead of an 11s cold
+            // upstream fan-out.
+            try {
+                $run('artisan stream:warm --limit=12');
             } catch (Throwable $e) {
                 report($e);
             }

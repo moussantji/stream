@@ -3,17 +3,23 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\BlockedTitle;
 use App\Models\CatalogItem;
 use App\Models\CatalogSnapshot;
 use App\Services\Catalog\CatalogRepository;
+use App\Services\AniList\AniListClient;
 use App\Services\DioStream\DioStreamClient;
+use App\Services\Itunes\ItunesClient;
+use App\Services\Jikan\JikanClient;
 use App\Services\MovieBox\MovieBoxClient;
 use App\Services\MovieBox\SubjectType;
 use App\Support\ContentFilter;
 use App\Support\ItemNormalizer;
+use App\Support\TextSanitizer;
 use App\Support\VersionFilter;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 
 class CatalogController extends Controller
 {
@@ -34,17 +40,43 @@ class CatalogController extends Controller
         $this->dio ??= app(DioStreamClient::class);
     }
 
+    /** @var AniListClient|null */
+    protected ?AniListClient $anilist = null;
+
+    /** @var JikanClient|null */
+    protected ?JikanClient $jikan = null;
+
+    /** @var ItunesClient|null */
+    protected ?ItunesClient $itunes = null;
+
+    protected function anilist(): AniListClient
+    {
+        return $this->anilist ??= app(AniListClient::class);
+    }
+
+    protected function jikan(): JikanClient
+    {
+        return $this->jikan ??= app(JikanClient::class);
+    }
+
+    protected function itunes(): ItunesClient
+    {
+        return $this->itunes ??= app(ItunesClient::class);
+    }
+
     // -----------------------------------------------------------------
     // Discovery
     // -----------------------------------------------------------------
 
     /** French-oriented home rows (persisted to MySQL, stale-if-error). */
-    public function home(): JsonResponse
+    public function home(Request $request): JsonResponse
     {
+        $page = max(1, (int) $request->input('page', 1));
+
         $data = $this->repo->remember(
-            'catalog:home',
+            'catalog:home:'.$page,
             $this->ttl(),
-            fn () => ['sections' => $this->buildHomeSections()],
+            fn () => $this->buildHomeSectionsWithPager($page),
         );
 
         // Filter at serve time (cache stores unfiltered data) so admin blocklist
@@ -58,8 +90,224 @@ class CatalogController extends Controller
             }
         }
         $data['sections'] = $sections;
+        $data['pager'] = ['page' => $page, 'hasMore' => $sections !== [] && ($data['pager']['hasMore'] ?? false)];
 
         return response()->json(['data' => $data]);
+    }
+
+    /**
+     * @return array{sections:array<int,array<string,mixed>>,pager:array{page:int,hasMore:bool}}
+     */
+    protected function buildHomeSectionsWithPager(int $page): array
+    {
+        $sections = [];
+        $hasMore = false;
+
+        if ($page === 1) {
+            // Page 1 mirrors the movieboxhd.net home: the provider's own
+            // editorial rows from the localized H5 web feed (operatingList),
+            // in their order, with "[Version française]" titles (Moana[CAM]
+            // [Version française], Toy Story 5…) instead of the mobile API's
+            // "[Hindi]" tags. Falls back to the curated rows below when the
+            // web feed is unreachable.
+            $editorial = $this->h5EditorialSections();
+            if ($editorial !== []) {
+                $sections = $editorial;
+                $hasMore = true;
+            } else {
+                $sections = $this->legacyHomeRows();
+                $hasMore = $sections !== [];
+            }
+        } else {
+            // Page N shifts each query's window so scrolling the home page
+            // keeps discovering new titles instead of repeating page 1.
+            foreach ((array) config('moviebox.home_queries', []) as $q) {
+                $items = $this->searchItems($q['query'], 0, 20, $page);
+                if ($items !== []) {
+                    $sections[] = ['title' => $q['label'], 'items' => $items];
+                }
+                if (count($items) >= 20) {
+                    $hasMore = true;
+                }
+            }
+        }
+
+        if ($sections === []) {
+            return ['sections' => $this->landingPageSections(), 'pager' => ['page' => $page, 'hasMore' => false]];
+        }
+
+        return ['sections' => $sections, 'pager' => ['page' => $page, 'hasMore' => $hasMore]];
+    }
+
+    /**
+     * The provider's own editorial home rows, in feed order (mirrors the
+     * movieboxhd.net home). Only subject sections are kept — banners, custom
+     * blocks (channels, shorts, music), categories and sports are skipped.
+     *
+     * @return array<int,array{title:string,items:array<int,array<string,mixed>>}>
+     */
+    protected function h5EditorialSections(): array
+    {
+        try {
+            $data = $this->client->h5Home();
+        } catch (\Throwable $e) {
+            report($e);
+
+            return [];
+        }
+
+        $sections = [];
+        foreach (($data['operatingList'] ?? []) as $section) {
+            if (! is_array($section) || ($section['type'] ?? '') !== 'SUBJECTS_MOVIE') {
+                continue;
+            }
+            $title = trim((string) ($section['title'] ?? ''));
+            if ($title === '') {
+                continue;
+            }
+
+            $seen = [];
+            $items = [];
+            foreach (ItemNormalizer::many($section['subjects'] ?? []) as $item) {
+                if (isset($seen[$item['subjectId']])) {
+                    continue;
+                }
+                // Adult/porn keywords are never shown on home rows.
+                if (ContentFilter::isBlocked($item)) {
+                    continue;
+                }
+                // Keep French/English/VO/VOSTFR titles (quality tags such as
+                // [CAM] tolerated, like the provider's own home); drop titles
+                // carrying only foreign dubs (Hindi, Tamil…).
+                if (! VersionFilter::acceptsForRow((string) ($item['title'] ?? ''))) {
+                    continue;
+                }
+                // Precise adult/hentai gate via public metadata sources
+                // (AniList/Jikan for anime rows, iTunes for films/series,
+                // DioStream/TMDB as final fallback).
+                if (! $this->metadataGuard($item, preg_match('/anim/i', $title) === 1)) {
+                    continue;
+                }
+                $seen[$item['subjectId']] = true;
+                $items[] = $item;
+            }
+
+            if ($items !== []) {
+                $sections[] = ['title' => $title, 'items' => $items];
+            }
+        }
+
+        return $sections;
+    }
+
+    /**
+     * Anime items from the H5 feed's curated sections (titles matching
+     * "anim*" plus the kids-animation rows), deduplicated, with the same
+     * title-level gates as the editorial home rows.
+     *
+     * @return array<int,array<string,mixed>>
+     */
+    protected function h5AnimeItems(): array
+    {
+        try {
+            $data = $this->client->h5Home();
+        } catch (\Throwable $e) {
+            report($e);
+
+            return [];
+        }
+
+        $seen = [];
+        $items = [];
+        foreach (($data['operatingList'] ?? []) as $section) {
+            if (! is_array($section) || ($section['type'] ?? '') !== 'SUBJECTS_MOVIE') {
+                continue;
+            }
+            $title = trim((string) ($section['title'] ?? ''));
+            if ($title === '' || (preg_match('/anim/i', $title) !== 1 && ! in_array($title, ['Pour les Enfants', 'Films et dessins animés pour enfants'], true))) {
+                continue;
+            }
+
+            foreach (ItemNormalizer::many($section['subjects'] ?? []) as $item) {
+                if (isset($seen[$item['subjectId']])) {
+                    continue;
+                }
+                if (ContentFilter::isBlocked($item) || ! VersionFilter::acceptsForRow((string) ($item['title'] ?? ''))) {
+                    continue;
+                }
+                $seen[$item['subjectId']] = true;
+                $items[] = $item;
+            }
+        }
+
+        return $items;
+    }
+
+    /**
+     * Fallback home rows used when the H5 web feed is unreachable: popular
+     * films / anime / animation / series from the upstream tabs.
+     *
+     * @return array<int,array{title:string,items:array<int,array<string,mixed>>}>
+     */
+    protected function legacyHomeRows(): array
+    {
+        $sections = [];
+
+        $popFilms = $this->preciseFilter(
+            $this->h5Row(['Films Tendance', 'Trending Movies']) ?: $this->tabPage(2, 1)['items'],
+            requireType: 1
+        );
+        if ($popFilms !== []) {
+            $sections[] = ['title' => 'Films populaires', 'items' => $popFilms];
+        }
+
+        $anime = $this->preciseFilter(
+            $this->h5Row(['Animés populaires', 'Animes']) ?: array_map(
+                fn ($i) => $this->stripVersionTag($i),
+                $this->tabPage(8, 1)['items']
+            ),
+            requireGenre: 'animation'
+        );
+        if ($anime !== []) {
+            $sections[] = ['title' => 'Animés & Anime', 'items' => $anime];
+        }
+
+        $animFilms = $this->preciseFilter(
+            $this->h5Row(['Pour les Enfants', 'Animation']),
+            requireGenre: 'animation',
+            requireType: 1
+        );
+        if ($animFilms !== []) {
+            $sections[] = ['title' => "Films d'animation", 'items' => $animFilms];
+        }
+
+        $popSeries = $this->preciseFilter(
+            $this->h5Row(['Séries Tendance', 'Trending Series']) ?: $this->tabPage(5, 1)['items'],
+            requireType: 2
+        );
+        if ($popSeries !== []) {
+            $sections[] = ['title' => 'Séries populaires', 'items' => $popSeries];
+        }
+
+        return $sections;
+    }
+
+    /**
+     * Remove a single "[Tag]" version suffix from a normalized item's title.
+     * Only applied to the anime home row where the upstream tab is polluted
+     * with "[Hindi]" labels on titles that have an original + subtitled track.
+     *
+     * @param  array<string,mixed>  $item
+     * @return array<string,mixed>
+     */
+    protected function stripVersionTag(array $item): array
+    {
+        $title = (string) ($item['title'] ?? '');
+        if ($title !== '') {
+            $item['title'] = trim((string) preg_replace('/\s*\[[^\]]*\]\s*$/u', '', $title));
+        }
+
+        return $item;
     }
 
     /** Trending / "les plus regardés" row + page (paginated). */
@@ -93,24 +341,226 @@ class CatalogController extends Controller
         return response()->json(['data' => $data]);
     }
 
+    /**
+     * Paginated "similar titles" for a film/series detail page (genre-based,
+     * local-first, deduped against the source subject).
+     *
+     * @return array<string,mixed>
+     */
+    public function suggestions(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'subjectId' => ['required', 'string'],
+            'subjectType' => ['sometimes', 'integer'],
+            'genres' => ['sometimes', 'string'],
+        ]);
+
+        $page = max(1, (int) $request->input('page', 1));
+        $perPage = 20;
+        $excluded = (string) $validated['subjectId'];
+
+        $genres = array_values(array_filter(array_map(
+            fn ($g) => mb_strtolower(trim((string) $g)),
+            explode('|', (string) ($validated['genres'] ?? ''))
+        )));
+
+        // Genre hints may be missing from the URL — fall back to the local row.
+        if ($genres === []) {
+            $row = CatalogItem::query()->where('subject_id', $excluded)->first();
+            $genres = array_map(fn ($g) => mb_strtolower(trim((string) $g)), (array) ($row->genres ?? []));
+        }
+
+        try {
+            $rows = CatalogItem::query()
+                ->where('subject_id', '!=', $excluded)
+                ->orderByDesc('seen_count')
+                ->limit(600)
+                ->get();
+        } catch (\Throwable $e) {
+            report($e);
+
+            return response()->json(['data' => ['items' => [], 'pager' => ['page' => $page, 'hasMore' => false]]]);
+        }
+
+        $matches = [];
+        foreach ($rows as $row) {
+            if ($genres === []) {
+                $matches[] = $row;
+                continue;
+            }
+            $rowGenres = array_map(fn ($g) => mb_strtolower(trim((string) $g)), (array) $row->genres);
+            if (count(array_intersect($genres, $rowGenres)) > 0) {
+                $matches[] = $row;
+            }
+        }
+
+        $slice = array_slice($matches, ($page - 1) * $perPage, $perPage);
+        $items = array_values(array_filter(array_map(
+            fn ($row) => ItemNormalizer::one([
+                'subjectId' => (string) $row->subject_id,
+                'subjectType' => (int) $row->subject_type,
+                'title' => $row->title,
+                'cover' => $row->cover,
+                'description' => $row->description,
+                'releaseDate' => $row->release_date,
+                'genres' => (array) $row->genres,
+                'imdbRating' => $row->imdb_rating,
+                'year' => $row->year,
+                'durationSeconds' => $row->duration_seconds,
+                'seasonCount' => $row->season_count,
+                'detailPath' => $row->detail_path,
+            ]),
+            $slice
+        )));
+
+        $items = ContentFilter::apply($items);
+
+        return response()->json([
+            'data' => [
+                'items' => $items,
+                'pager' => ['page' => $page, 'hasMore' => $page * $perPage < count($matches)],
+            ],
+        ]);
+    }
+
     /** Category browse (films / séries / animation) from tab-operating (paginated). */
     public function category(Request $request): JsonResponse
     {
         $slug = strtolower((string) $request->input('tab', 'films'));
         $config = self::CATEGORIES[$slug] ?? self::CATEGORIES['films'];
         $page = max(1, (int) $request->input('page', 1));
+        $perPage = max(10, min(40, (int) config('moviebox.category_page_size', 20)));
 
-        $data = $this->repo->remember(
-            "catalog:category:{$config['tab']}:$page",
-            $this->ttl(),
-            fn () => ['title' => $config['title']] + $this->tabPage($config['tab'], $page),
-        );
+        // The raw upstream tab is a fixed 5-tile panel that ignores pagination.
+        // A category page is instead backed by an ever-growing pool of French
+        // search results: when the requested page goes past the pool, it is
+        // extended with the next search pages on the fly, so infinite scroll
+        // genuinely keeps going until the upstream results run out.
+        $pool = $this->ensureCategoryPool($config['tab'], $slug, $page * $perPage);
 
-        // Title is static; ensure it is present even when served from an old snapshot.
-        $data['title'] = $config['title'];
-        $data['items'] = ContentFilter::apply($data['items'] ?? []);
+        // Serve-time guard: drops adult/hentai items (verdicts are cached, so
+        // this also purges pools built before the guard existed). The
+        // animation/anime categories additionally require the metadata to
+        // confirm the title really is animation, so search junk (Nollywood
+        // videos, songs, wrestling clips…) never pollutes the category.
+        $animeHint = in_array($slug, ['animation', 'anime'], true);
+        $items = ContentFilter::apply(array_slice($pool['items'], ($page - 1) * $perPage, $perPage));
+        $items = array_values(array_filter(
+            $items,
+            fn (array $item) => $animeHint ? $this->animationGate($item) : $this->metadataGuard($item, false)
+        ));
+        $hasMore = count($pool['items']) > $page * $perPage || ! $pool['exhausted'];
 
-        return response()->json(['data' => $data]);
+        return response()->json(['data' => [
+            'title' => $config['title'],
+            'items' => $items,
+            'pager' => ['page' => $page, 'hasMore' => $hasMore],
+        ]]);
+    }
+
+    /**
+     * Return the category pool, extending it with deeper search pages until it
+     * holds at least $needed items (or the upstream results are exhausted).
+     *
+     * @return array{items:array<int,array<string,mixed>>,exhausted:bool}
+     */
+    protected function ensureCategoryPool(int $tabId, string $slug, int $needed): array
+    {
+        $key = "catalog:category-pool:{$tabId}";
+        $maxDepth = max(1, (int) config('moviebox.category_search_depth', 5));
+
+        $data = Cache::get($key);
+        if (! is_array($data)) {
+            $data = [
+                'items' => [],
+                'depth' => 0,
+                'type' => in_array($tabId, [2, 5], true) ? SubjectType::TV_SERIES->value : SubjectType::MOVIES->value,
+                'queries' => array_values(array_filter((array) config("moviebox.category_queries.$slug", []))),
+                'exhausted' => false,
+            ];
+
+            // Animation/anime pools are seeded with the provider's curated
+            // French-dubbed anime rows from the H5 feed, so the category
+            // opens on real animation instead of search leftovers.
+            if (in_array($slug, ['animation', 'anime'], true)) {
+                foreach ($this->h5AnimeItems() as $item) {
+                    $sid = $item['subjectId'] ?? null;
+                    if ($sid === null || isset($data['seen'][$sid])) {
+                        continue;
+                    }
+                    $data['seen'][$sid] = true;
+                    $data['items'][] = $item;
+                }
+            }
+        }
+
+        while (count($data['items']) < $needed && ! $data['exhausted'] && $data['depth'] < $maxDepth) {
+            $page = $data['depth'] + 1;
+
+            // All queries of this depth run in ONE concurrent H5 batch (the
+            // per-query results double as the pool's caching layer), so the
+            // slowest query bounds the wait instead of the sum of all six.
+            $batch = $this->client->searchMany($data['queries'], (int) $data['type'], $page, 20);
+
+            $extended = false;
+            foreach ($batch as $items) {
+                foreach ($items['items'] ?? [] as $item) {
+                    $sid = $item['subjectId'] ?? null;
+                    if ($sid === null) {
+                        continue;
+                    }
+                    if (! isset($data['seen'][$sid])) {
+                        $data['seen'][$sid] = true;
+                        $data['items'][] = $item;
+                        $extended = true;
+                    }
+                }
+            }
+            $data['depth'] += 1;
+            if (! $extended) {
+                // The H5 French-queryable pool is bounded (~150 titles); extend
+                // with the persisted local catalog so scrolling keeps going.
+                if (empty($data['local_loaded'])) {
+                    $data['local_loaded'] = true;
+                    $local = CatalogItem::query()
+                        ->orderByDesc('seen_count')
+                        ->limit(600)
+                        ->get();
+                    foreach ($local as $row) {
+                        $normalized = ItemNormalizer::one([
+                            'subjectId' => (string) $row->subject_id,
+                            'subjectType' => (int) $row->subject_type,
+                            'title' => $row->title,
+                            'cover' => $row->cover,
+                            'description' => $row->description,
+                            'genres' => $row->genres,
+                            'imdbRating' => $row->imdb_rating,
+                            'releaseDate' => $row->release_date,
+                            'year' => $row->year,
+                            'durationSeconds' => $row->duration_seconds,
+                            'country' => $row->country,
+                            'detailPath' => $row->detail_path,
+                            'hasResource' => true,
+                        ]);
+                        if ($normalized === null) {
+                            continue;
+                        }
+                        $sid = $normalized['subjectId'];
+                        if (! isset($data['seen'][$sid])) {
+                            $data['seen'][$sid] = true;
+                            $data['items'][] = $normalized;
+                            $extended = true;
+                        }
+                    }
+                }
+                if (! $extended) {
+                    $data['exhausted'] = true;
+                }
+            }
+            Cache::put($key, $data, $this->ttl());
+        }
+
+        return $data;
     }
 
     /** Live TV channels, extracted from the landing page's liveList (best-effort). */
@@ -195,18 +645,21 @@ class CatalogController extends Controller
             function () use ($q, $type, $page, $perPage) {
                 $res = $this->client->search($q, $type->value, $page, $perPage);
 
+                $items = ContentFilter::apply(ItemNormalizer::many($res['items'] ?? []));
+
                 return [
                     'query' => $q,
                     'type' => $type->name,
-                    // NOTE: search is intentionally NOT content-blocklist-filtered,
-                    // but only French / English / VOSTFR / VO versions are shown.
-                    'items' => ItemNormalizer::many($res['items'] ?? []),
+                    'items' => $items,
                     'pager' => $this->pager($res, $page, $perPage),
                 ];
             },
         );
 
         $data['items'] = VersionFilter::apply($data['items'] ?? []);
+        // Metadata gate at serve time: titles like "XXX: The Animation"
+        // (mostly hentai) must be confirmed as real animation or are dropped.
+        $data['items'] = array_values(array_filter($data['items'], fn (array $item) => $this->searchGate($item)));
 
         return response()->json(['data' => $data]);
     }
@@ -237,7 +690,7 @@ class CatalogController extends Controller
                 if (! VersionFilter::accepts($normalized['title'] ?? '', (int) ($normalized['subjectType'] ?? 0))) {
                     continue;
                 }
-                $suggestions[] = ['word' => $normalized['title'], 'type' => (int) ($normalized['subjectType'] ?? 0)];
+                $suggestions[] = ['word' => $normalized['title'], 'displayTitle' => $normalized['displayTitle'] ?? $normalized['title'], 'type' => (int) ($normalized['subjectType'] ?? 0)];
                 if (count($suggestions) >= 8) {
                     break;
                 }
@@ -276,21 +729,50 @@ class CatalogController extends Controller
             'cover' => ['sometimes', 'string'],
         ]);
 
+        if (BlockedTitle::query()->where('term', $validated['subjectId'])->exists()) {
+            abort(404, 'Content unavailable.');
+        }
+
         // Debug bypasses the cache and includes a probe of the raw detail keys
         // so the real trailer field can be identified.
         if ($request->boolean('debug')) {
             return response()->json(['data' => $this->buildDetail($validated, true)]);
         }
 
-        $data = $this->repo->remember(
-            'catalog:detail:'.$validated['subjectId'],
-            $this->ttl(),
-            fn () => $this->buildDetail($validated),
-            isEmpty: fn ($d) => empty($d['item']),
-        );
+        $cacheKey = 'catalog:detail:'.$validated['subjectId'];
+
+        if (! $request->boolean('debug')) {
+            if ($this->repo->hasFresh($cacheKey, $this->ttl())) {
+                $data = $this->repo->remember(
+                    $cacheKey,
+                    $this->ttl(),
+                    fn () => $this->buildDetail($validated),
+                    isEmpty: fn ($d) => empty($d['item']) || ($d['detailAvailable'] ?? false) === false,
+                );
+            } else {
+                // Direct build: a complete payload (seasons/cast/dubs) is
+                // returned synchronously. It is fast for any pre-warmed title
+                // and correct for the rest; the warm only refills cache.
+                $data = $this->repo->remember(
+                    $cacheKey,
+                    $this->ttl(),
+                    fn () => $this->buildDetail($validated),
+                    isEmpty: fn ($d) => empty($d['item']) || ($d['detailAvailable'] ?? false) === false,
+                );
+                $this->spawnDetailWarm($validated['subjectId'], (int) ($validated['subjectType'] ?? 0));
+            }
+        } else {
+            $data = $this->buildDetail($validated, true);
+        }
 
         if (! empty($data['recommendations'])) {
             $data['recommendations'] = ContentFilter::apply($data['recommendations']);
+        }
+
+        // Adult/porn titles are never displayed (same as moviebox.ph, whose own
+        // surfaces are clean): a deep link to one is treated as unavailable.
+        if (isset($data['item']) && ContentFilter::isBlocked($data['item'])) {
+            abort(404, 'Content unavailable.');
         }
 
         return response()->json(['data' => $data]);
@@ -423,31 +905,25 @@ class CatalogController extends Controller
     /**
      * @return array<int,array<string,mixed>>
      */
-    protected function buildHomeSections(): array
-    {
-        $queries = (array) config('moviebox.home_queries', []);
-        $sections = [];
-
-        foreach ($queries as $q) {
-            $items = $this->searchItems($q['query'], 0, 20);
-            if ($items !== []) {
-                $sections[] = ['title' => $q['label'], 'items' => $items];
-            }
-        }
-
-        return $sections !== [] ? $sections : $this->landingPageSections();
-    }
-
     /**
      * @return array<int,array<string,mixed>>
      */
-    protected function searchItems(string $query, int $subjectType, int $perPage): array
+    protected function searchItems(string $query, int $subjectType, int $perPage, int $page = 1): array
     {
         try {
-            $data = $this->client->search($query, $subjectType, 1, $perPage);
+            $data = $this->client->search($query, $subjectType, $page, $perPage);
 
-            // Unfiltered here; discovery surfaces apply ContentFilter at serve time.
-            return ItemNormalizer::many($data['items'] ?? []);
+            $items = [];
+            foreach (ItemNormalizer::many($data['items'] ?? []) as $item) {
+                // Titles containing "anim" must be confirmed as real animation
+                // ("XXX: The Animation" hentai never reach discovery pages).
+                if (! $this->searchGate($item)) {
+                    continue;
+                }
+                $items[] = $item;
+            }
+
+            return $items;
         } catch (\Throwable $e) {
             report($e);
 
@@ -471,6 +947,520 @@ class CatalogController extends Controller
      *
      * @return array{items:array<int,array<string,mixed>>,pager:array{page:int,hasMore:bool}}
      */
+    /**
+     * One named section of the H5 web home feed (movieboxhd.net), normalized
+     * as a flat item list. Accepts a title or a list of localized aliases
+     * (the feed title varies with the request locale: "Films Tendance" vs
+     * "Trending Movies"). Returns [] when the feed or the section is missing.
+     *
+     * @param  string|array<int,string>  $sectionTitles
+     */
+    protected function h5Row(string|array $sectionTitles): array
+    {
+        try {
+            $data = $this->client->h5Home();
+        } catch (\Throwable $e) {
+            report($e);
+
+            return [];
+        }
+
+        $aliases = (array) $sectionTitles;
+
+        foreach (($data['operatingList'] ?? []) as $section) {
+            if (! is_array($section) || ! in_array($section['title'] ?? '', $aliases, true)) {
+                continue;
+            }
+
+            $seen = [];
+            $items = [];
+            foreach (ItemNormalizer::many($section['subjects'] ?? []) as $item) {
+                if (isset($seen[$item['subjectId']])) {
+                    continue;
+                }
+                // Adult/porn keywords are never shown on home rows.
+                if (ContentFilter::isBlocked($item)) {
+                    continue;
+                }
+                // Keep French/English/VO/VOSTFR titles (quality tags such as
+                // [CAM] tolerated, like the provider's own home); drop titles
+                // carrying only foreign dubs (Hindi, Tamil…).
+                if (! VersionFilter::acceptsForRow((string) ($item['title'] ?? ''))) {
+                    continue;
+                }
+                $seen[$item['subjectId']] = true;
+                $items[] = $item;
+            }
+
+            return $items;
+        }
+
+        return [];
+    }
+
+    /**
+     * TMDB keywords/genres that mark a title as adult/hentai/erotica. The
+     * bare "adult"/"sex" words are deliberately absent: they false-positive
+     * on legit content ("Adult Swim", sex scenes in dramas).
+     */
+    protected const PORN_MARKERS = [
+        'hentai', 'ecchi', 'yaoi', 'yuri', 'bara', 'shotacon', 'lolicon',
+        'hardcore', 'softcore', 'porn', 'porno', 'pornographic', 'xxx',
+        'x-rated', 'x rated', 'erotica', 'erotic', 'erotique', 'nudity',
+        'nude', 'fetish', 'bondage', 'bdsm', 'milf', 'cougar',
+        'tentacle', 'tentacles', 'ahegao', 'bukkake', 'orgy', 'orgie',
+        'swingers', 'voyeur', 'cuckold', 'sex tape', 'sextape', 'sexshop',
+        'adult film', 'adult movie', 'adult video', 'pink film',
+    ];
+
+    /**
+     * Unambiguous softcore-genre tags (AniList canonical names) that mark a
+     * title as porn/hentai regardless of the media-level isAdult flag.
+     */
+    protected const STRICT_ADULT_TAGS = [
+        'hentai', 'ecchi', 'yaoi', 'yuri', 'bara', 'shotacon', 'lolicon',
+        'tentacle', 'tentacles', 'ahegao', 'bukkake', 'orgy', 'orgie',
+        'hardcore', 'softcore', 'bdsm', 'bondage', 'milf', 'cougar',
+        'netorare', 'ntr', 'cuckold', 'futanari',
+    ];
+
+    /**
+     * Gate for search/discovery results. Titles containing "anim" (mostly
+     * "XXX: The Animation" hentai) must be confirmed as real animation via
+     * animationGate — anything unresolved is dropped. Other titles keep the
+     * lenient metadata guard (unresolved items are kept).
+     *
+     * @param  array<string,mixed>  $item
+     */
+    protected function searchGate(array $item): bool
+    {
+        if (preg_match('/anim/i', (string) ($item['title'] ?? '')) === 1) {
+            return $this->animationGate($item);
+        }
+
+        return $this->metadataGuard($item, false);
+    }
+
+    /**
+     * Animation-category gate: the item must be dropped when adult/hentai
+     * AND kept only when the metadata confirms it really is animation
+     * (AniList/MAL record, or DioStream genre "Animation"). Anything
+     * unresolvable or non-animation is dropped, so search junk never
+     * pollutes the category.
+     *
+     * @param  array<string,mixed>  $item
+     */
+    protected function animationGate(array $item): bool
+    {
+        $clean = trim(preg_replace('/\s+/u', ' ', (string) preg_replace('/\[[^\]]*\]/u', '', (string) ($item['title'] ?? ''))));
+        if ($clean === '') {
+            return false;
+        }
+
+        $kind = (int) ($item['subjectType'] ?? 0) === 2 ? 'tv' : 'movie';
+        $key = 'guard:v1:animcat:'.$kind.':'.md5(mb_strtolower($clean));
+
+        return Cache::remember($key, 86400, fn () => $this->animationGateUncached($item, $clean));
+    }
+
+    /**
+     * Lookup variants for an anime title: the title as-is, then the title
+     * stripped of its trailing "The Animation" / "The Motion Picture"
+     * suffix, which is how hentai OVAs are typically named.
+     *
+     * @return list<string>
+     */
+    protected function animeTitleVariants(string $clean): array
+    {
+        $variants = [$clean];
+        $short = trim((string) preg_replace(
+            '/\s*[:：\-]?\s*(?:the\s+)?(?:animation|motion\s+picture|movie|ova)\s*$/iu',
+            '',
+            $clean
+        ));
+        if ($short !== '' && $short !== $clean) {
+            $variants[] = $short;
+        }
+
+        return $variants;
+    }
+
+    /**
+     * @param  array<string,mixed>  $item
+     */
+    protected function animationGateUncached(array $item, string $clean): bool
+    {
+        // AniList: found = confirmed anime; adult markers drop it. When the
+        // full title misses, retry without the "The Animation" suffix —
+        // most hentai OVAs are named "XXX: The Animation" and their plain
+        // title resolves reliably.
+        foreach ($this->animeTitleVariants($clean) as $variant) {
+            $media = $this->anilist()->search($variant);
+            if ($media !== null) {
+                if (($media['isAdult'] ?? false) === true) {
+                    return false;
+                }
+                $genres = array_map('mb_strtolower', (array) ($media['genres'] ?? []));
+                if (in_array('hentai', $genres, true)) {
+                    return false;
+                }
+                foreach ((array) ($media['tags'] ?? []) as $tag) {
+                    if (is_array($tag)
+                        && ($tag['isAdult'] ?? false) === true
+                        && in_array(mb_strtolower((string) ($tag['name'] ?? '')), self::STRICT_ADULT_TAGS, true)
+                    ) {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+        }
+
+        // Jikan/MAL: found = confirmed anime; Hentai genre drops it.
+        foreach ($this->animeTitleVariants($clean) as $variant) {
+            $jikan = $this->jikan()->search($variant);
+            if ($jikan !== null) {
+                $genres = array_map('mb_strtolower', (array) ($jikan['genres'] ?? []));
+                $rating = mb_strtolower((string) ($jikan['rating'] ?? ''));
+                if (in_array('hentai', $genres, true) || str_contains($rating, 'hentai') || str_contains($rating, 'rx')) {
+                    return false;
+                }
+
+                return true;
+            }
+        }
+
+        // DioStream/TMDB fallback: adult/porn drops; only the "Animation"
+        // genre confirms the title.
+        $meta = $this->dioResolve($item);
+        if ($meta !== null) {
+            if (($meta['adult'] ?? false) === true || $this->metadataIsPorn($meta)) {
+                return false;
+            }
+            if ($this->metadataHasGenre($meta, 'animation')) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Adult/hentai gate for editorial home rows, resolved against public
+     * metadata sources — no API key required:
+     *
+     *  - anime rows: AniList (isAdult, Hentai/Ecchi genres, adult tags),
+     *    cross-checked with Jikan/MAL when AniList misses;
+     *  - film/series rows: iTunes (contentAdvisoryRating, genres,
+     *    description) when reachable, then DioStream/TMDB;
+     *  - DioStream/TMDB is the final fallback for both kinds.
+     *
+     * Unresolvable items are kept (the title-level gate already ran).
+     *
+     * @param  array<string,mixed>  $item
+     */
+    protected function metadataGuard(array $item, bool $animeHint = false): bool
+    {
+        $clean = trim(preg_replace('/\s+/u', ' ', (string) preg_replace('/\[[^\]]*\]/u', '', (string) ($item['title'] ?? ''))));
+        if ($clean === '') {
+            return true;
+        }
+
+        // The verdict is cached for a day so a snapshot rebuild stays fast
+        // even after the upstream metadata caches (300s) have expired.
+        $kind = (int) ($item['subjectType'] ?? 0) === 2 ? 'tv' : 'movie';
+        $key = 'guard:v1:verdict:'.$kind.':'.($animeHint ? 'anime' : 'film').':'.md5(mb_strtolower($clean));
+
+        return Cache::remember($key, 86400, fn () => $this->metadataGuardUncached($item, $animeHint));
+    }
+
+    /**
+     * @param  array<string,mixed>  $item
+     */
+    protected function metadataGuardUncached(array $item, bool $animeHint): bool
+    {
+        $clean = trim(preg_replace('/\s+/u', ' ', (string) preg_replace('/\[[^\]]*\]/u', '', (string) ($item['title'] ?? ''))));
+
+        if ($animeHint) {
+            $verdict = $this->animeIsAdult($clean);
+            if ($verdict !== null) {
+                return ! $verdict;
+            }
+        } else {
+            if ($this->itunesIsAdult($clean, (int) ($item['subjectType'] ?? 0) === 2 ? 'tv' : 'movie')) {
+                return false;
+            }
+        }
+
+        // Final fallback: DioStream/TMDB metadata (adult flag, genres,
+        // keywords) — reused by the legacy home rows as well.
+        $meta = $this->dioResolve($item);
+        if ($meta === null) {
+            return true;
+        }
+        if (($meta['adult'] ?? false) === true) {
+            return false;
+        }
+        if ($this->metadataIsPorn($meta)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * @return bool|null true = adult/hentai, false = clean, null = unresolved
+     */
+    protected function animeIsAdult(string $clean): ?bool
+    {
+        $media = $this->anilist()->search($clean);
+        if ($media !== null) {
+            if (($media['isAdult'] ?? false) === true) {
+                return true;
+            }
+            $genres = array_map('mb_strtolower', (array) ($media['genres'] ?? []));
+            // Only the "Hentai" genre drops a title — "Ecchi" is too noisy
+            // (mainstream shows like Kill la Kill or Food Wars carry it).
+            if (in_array('hentai', $genres, true)) {
+                return true;
+            }
+            // Only unambiguous softcore-genre tags drop a title — and only
+            // when AniList itself flags the tag as adult. The bare name is
+            // too noisy ("Yuri" appears on mainstream shows like Kill la
+            // Kill) and the bare isAdult flag too ("Rape" on Sword Art
+            // Online); both together isolate real hentai/ecchi markers.
+            foreach ((array) ($media['tags'] ?? []) as $tag) {
+                if (is_array($tag)
+                    && ($tag['isAdult'] ?? false) === true
+                    && in_array(mb_strtolower((string) ($tag['name'] ?? '')), self::STRICT_ADULT_TAGS, true)
+                ) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        $jikan = $this->jikan()->search($clean);
+        if ($jikan !== null) {
+            $genres = array_map('mb_strtolower', (array) ($jikan['genres'] ?? []));
+            $rating = mb_strtolower((string) ($jikan['rating'] ?? ''));
+            if (in_array('hentai', $genres, true) || in_array('ecchi', $genres, true)) {
+                return true;
+            }
+            if (str_contains($rating, 'hentai') || str_contains($rating, 'rx')) {
+                return true;
+            }
+
+            return false;
+        }
+
+        return null;
+    }
+
+    /**
+     * @return true when iTunes marks the title as explicitly adult. The
+     * source is skipped for a while after an HTTP failure (circuit breaker)
+     * so a flaky upstream never slows the home build.
+     */
+    protected function itunesIsAdult(string $clean, string $kind): bool
+    {
+        if (Cache::get('guard:itunes:down')) {
+            return false;
+        }
+
+        $meta = $this->itunes()->search($clean, $kind);
+
+        if ($meta === null) {
+            if (Cache::get('guard:itunes:fail') !== null) {
+                Cache::put('guard:itunes:down', 1, 900);
+            } else {
+                Cache::put('guard:itunes:fail', 1, 300);
+            }
+
+            return false;
+        }
+
+        Cache::forget('guard:itunes:fail');
+
+        $rating = mb_strtoupper((string) ($meta['contentAdvisoryRating'] ?? ''));
+        if (in_array($rating, ['X', 'XXX', 'NC-17', 'AO'], true)) {
+            return true;
+        }
+
+        $hay = mb_strtolower(implode(' ', (array) ($meta['genres'] ?? [])).' '.$meta['description']);
+        $hay = iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $hay) ?: $hay;
+        $hay = ' '.preg_replace('/\s+/', ' ', (string) preg_replace('/[^a-z0-9 ]/', ' ', $hay)).' ';
+
+        foreach (self::PORN_MARKERS as $marker) {
+            if (str_contains($hay, ' '.$marker.' ')) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Precise gate for curated home rows. Instead of trusting title tags,
+     * each item is resolved against the DioStream (TMDB) catalog and dropped
+     * when the real metadata marks it adult / porn / hentai (adult flag,
+     * genres, keywords). The row's kind (movie/tv) and genre ("Animation")
+     * can additionally be enforced so a row never leaks the wrong content.
+     *
+     * @param  array<int,array<string,mixed>>  $items
+     * @return array<int,array<string,mixed>>
+     */
+    protected function preciseFilter(array $items, ?string $requireGenre = null, ?int $requireType = null): array
+    {
+        $out = [];
+        foreach ($items as $item) {
+            $meta = $this->dioResolve($item);
+
+            // Unresolvable items are kept — the title-level gate already ran.
+            if ($meta === null) {
+                $out[] = $item;
+                continue;
+            }
+
+            if (($meta['adult'] ?? false) === true) {
+                continue;
+            }
+
+            if ($this->metadataIsPorn($meta)) {
+                continue;
+            }
+
+            $kind = strtolower((string) ($meta['mediaType'] ?? ''));
+            if ($requireType === 1 && $kind === 'tv') {
+                continue;
+            }
+            if ($requireType === 2 && $kind === 'movie') {
+                continue;
+            }
+
+            if ($requireGenre !== null && ! $this->metadataHasGenre($meta, $requireGenre)) {
+                continue;
+            }
+
+            $out[] = $item;
+        }
+
+        return $out;
+    }
+
+    /**
+     * Resolve a normalized item to its full DioStream/TMDB metadata: title
+     * search (tags stripped), best-match pick, then the full movie/tv record.
+     * Both the search and the record are cached by DioStreamClient itself.
+     *
+     * @param  array<string,mixed>  $item
+     * @return array<string,mixed>|null
+     */
+    protected function dioResolve(array $item): ?array
+    {
+        $clean = trim(preg_replace('/\s+/u', ' ', (string) preg_replace('/\[[^\]]*\]/u', '', (string) ($item['title'] ?? ''))));
+        if ($clean === '') {
+            return null;
+        }
+
+        $isTv = (int) ($item['subjectType'] ?? 0) === 2;
+        $type = $isTv ? 'tv' : 'movie';
+
+        try {
+            $result = $this->dio->search($clean, $type, 'popular');
+            $best = $this->pickBestMatch($result['results'] ?? [], $clean, $item);
+            if ($best === null || empty($best['tmdb_id'])) {
+                return null;
+            }
+
+            $meta = $isTv
+                ? $this->dio->tv((string) $best['tmdb_id'], false)
+                : $this->dio->movie((string) $best['tmdb_id']);
+
+            return is_array($meta) && $meta !== [] ? $meta : null;
+        } catch (\Throwable $e) {
+            report($e);
+
+            return null;
+        }
+    }
+
+    /**
+     * @param  array<int,array<string,mixed>>  $results
+     * @param  array<string,mixed>  $item
+     * @return array<string,mixed>|null
+     */
+    protected function pickBestMatch(array $results, string $clean, array $item): ?array
+    {
+        if ($results === []) {
+            return null;
+        }
+
+        $normalize = fn ($s) => mb_strtolower((string) preg_replace('/[^\p{L}\p{N} ]/u', '', (string) $s));
+        $target = $normalize($clean);
+        $itemYear = (int) ($item['year'] ?? 0);
+
+        $best = null;
+        $bestScore = PHP_INT_MAX;
+        foreach ($results as $r) {
+            if (! is_array($r)) {
+                continue;
+            }
+            $score = levenshtein($target, $normalize($r['title'] ?? ''));
+            if (($r['fuzzy'] ?? false) === true) {
+                $score += 3;
+            }
+            $rYear = (int) ($r['year'] ?? 0);
+            if ($itemYear > 0 && $rYear > 0 && abs($itemYear - $rYear) > 4) {
+                $score += 5;
+            }
+            if ($score < $bestScore) {
+                $bestScore = $score;
+                $best = $r;
+            }
+        }
+
+        return $best;
+    }
+
+    /**
+     * @param  array<string,mixed>  $meta
+     */
+    protected function metadataIsPorn(array $meta): bool
+    {
+        $hay = mb_strtolower(
+            implode(' ', (array) ($meta['genres'] ?? []))
+            .' '
+            .implode(' ', (array) ($meta['keywords'] ?? []))
+        );
+        $hay = iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $hay) ?: $hay;
+        $hay = ' '.preg_replace('/\s+/', ' ', (string) preg_replace('/[^a-z0-9 ]/', ' ', $hay)).' ';
+
+        foreach (self::PORN_MARKERS as $marker) {
+            if (str_contains($hay, ' '.$marker.' ')) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @param  array<string,mixed>  $meta
+     */
+    protected function metadataHasGenre(array $meta, string $genre): bool
+    {
+        foreach ((array) ($meta['genres'] ?? []) as $g) {
+            if (mb_strtolower((string) $g) === mb_strtolower($genre)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     protected function tabPage(int $tabId, int $page): array
     {
         try {
@@ -632,16 +1622,97 @@ class CatalogController extends Controller
      * @param  array<string,mixed>  $validated
      * @return array<string,mixed>
      */
+    /**
+     * Return a list of similar titles from the persisted local catalog, based
+     * on shared genres. Local-only (no upstream call) — used for the detail
+     * page's recommendations.
+     *
+     * @param  array<string,mixed>  $item
+     * @return array<int,array<string,mixed>>
+     */
+    protected function recommendationsFromLocal(array $item, int $limit): array
+    {
+        $genres = array_map(fn ($g) => mb_strtolower(trim((string) $g)), (array) ($item['genres'] ?? []));
+        if ($genres === []) {
+            return [];
+        }
+
+        try {
+            $rows = CatalogItem::query()
+                ->where('subject_id', '!=', (string) ($item['subjectId'] ?? ''))
+                ->orderByDesc('seen_count')
+                ->limit(120)
+                ->get();
+        } catch (\Throwable $e) {
+            report($e);
+
+            return [];
+        }
+
+        $out = [];
+        foreach ($rows as $row) {
+            $rowGenres = array_map(fn ($g) => mb_strtolower(trim((string) $g)), (array) $row->genres);
+            if (count(array_intersect($genres, $rowGenres)) === 0) {
+                continue;
+            }
+            $normalized = ItemNormalizer::one([
+                'subjectId' => (string) $row->subject_id,
+                'subjectType' => (int) $row->subject_type,
+                'title' => $row->title,
+                'cover' => $row->cover,
+                'description' => $row->description,
+                'genres' => $row->genres,
+                'imdbRating' => $row->imdb_rating,
+                'releaseDate' => $row->release_date,
+                'year' => $row->year,
+                'durationSeconds' => $row->duration_seconds,
+                'country' => $row->country,
+                'detailPath' => $row->detail_path,
+                'hasResource' => true,
+            ]);
+            if ($normalized !== null) {
+                $out[] = $normalized;
+                if (count($out) >= $limit) {
+                    break;
+                }
+            }
+        }
+
+        return $out;
+    }
+
+    /** Fire a detached worker that resolves and caches the full detail. */
+    protected function spawnDetailWarm(string $subjectId, int $subjectType): void
+    {
+        if (! Cache::add('catalog:detail-warm:'.$subjectId, true, 30)) {
+            return; // already warming
+        }
+
+        @shell_exec(sprintf(
+            'nohup %s artisan catalog:detail-warm %s %d > /dev/null 2>&1 &',
+            escapeshellarg(PHP_BINARY),
+            escapeshellarg($subjectId),
+            (int) $subjectType
+        ));
+    }
+
     protected function buildDetail(array $validated, bool $debug = false): array
     {
         $subjectId = $validated['subjectId'];
 
-        $detail = null;
+        // Fetch the subject detail and (for series) the season info in one
+        // concurrent round trip — the two upstream calls used to run serially
+        // and doubled the detail-page latency.
+        $isSeriesHint = (int) ($validated['subjectType'] ?? 0) === SubjectType::TV_SERIES->value;
+        $bundle = [];
         try {
-            $detail = $this->client->itemDetails($subjectId);
+            $bundle = $this->client->detailBundle($subjectId, $isSeriesHint);
         } catch (\Throwable $e) {
             report($e);
         }
+
+        $detail = $bundle['item'] ?? null;
+        $bundledSeasons = $bundle['seasons'] ?? null;
 
         $item = is_array($detail) ? ItemNormalizer::one($detail) : null;
 
@@ -655,6 +1726,7 @@ class CatalogController extends Controller
             'subjectType' => (int) ($validated['subjectType'] ?? 0),
             'typeLabel' => SubjectType::resolve($validated['subjectType'] ?? 0)->label(),
             'title' => $validated['title'] ?? 'Untitled',
+            'displayTitle' => TextSanitizer::displayTitle($validated['title'] ?? 'Untitled'),
             'description' => null,
             'cover' => $validated['cover'] ?? null,
             'genres' => [],
@@ -679,6 +1751,8 @@ class CatalogController extends Controller
             // list must not be limited to the downloadable ones.
             if ($dioDetail !== null) {
                 $seasons = $dioDetail['seasons'];
+            } elseif (is_array($bundledSeasons)) {
+                $seasons = $this->normalizeSeasons($bundledSeasons['seasons'] ?? []);
             } else {
                 try {
                     $seasonData = $this->client->seasonInfo($subjectId);
@@ -703,7 +1777,11 @@ class CatalogController extends Controller
 
         $recommendations = [];
         if (! empty($item['genres'][0])) {
-            $recommendations = array_values(array_filter(
+            // Local-first: recommend from the persisted catalog (instant, no
+            // upstream call). Falls back to a live search when the catalog is
+            // empty so recommendations never silently disappear.
+            $local = $this->recommendationsFromLocal($item, 12);
+            $recommendations = $local !== [] ? $local : array_values(array_filter(
                 $this->searchItems($item['genres'][0], $item['subjectType'], 12),
                 fn ($r) => $r['subjectId'] !== $item['subjectId']
             ));

@@ -254,7 +254,10 @@ class DioStreamClient
         }
 
         $data = $this->decrypt($body);
-        if ($this->cacheTtl > 0) {
+        // Error payloads are never cached: a transient upstream failure would
+        // otherwise poison the metadata for minutes (and, downstream, the
+        // 24h guard verdicts built on it).
+        if ($this->cacheTtl > 0 && empty($data['error'])) {
             Cache::put($cacheKey, $data, $this->cacheTtl);
         }
 

@@ -111,7 +111,7 @@ function initSearch() {
                 if (!data.suggestions.length) { suggestBox.hidden = true; return; }
                 data.suggestions.slice(0, 8).forEach((s) => {
                     suggestBox.appendChild(el('button', {
-                        type: 'button', text: s.word,
+                        type: 'button', text: s.displayTitle || s.word,
                         onclick: () => { input.value = s.word; suggestBox.hidden = true; navigate(`/search?q=${encodeURIComponent(s.word)}`); },
                     }));
                 });

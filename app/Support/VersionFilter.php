@@ -47,6 +47,17 @@ class VersionFilter
     ];
 
     /**
+     * Quality / bootleg markers. They disqualify a version for strict
+     * filtering (accepts) but are tolerated on curated home rows
+     * (acceptsForRow) since the provider itself labels titles that way
+     * ("Moana[CAM] [Version française]").
+     */
+    protected const QUALITY_TAGS = [
+        'cam', 'ts', 'tc', 'hdts', 'hdtc', 'r6', 'dvdscr', 'scr', 'screener',
+        'hdcam', 'camrip', 'telesync', 'hdrip', 'webrip', 'predvd',
+    ];
+
+    /**
      * Whether a title's version is acceptable (French / English / VOSTFR /
      * original). $subjectType is kept in the signature for the anime case:
      * anime relies on the same rules, subtitled versions being accepted
@@ -73,6 +84,47 @@ class VersionFilter
         }
 
         return true;
+    }
+
+    /**
+     * Looser rule for curated home rows sourced from the H5 web feed (the
+     * movieboxhd.net home): quality/bootleg markers ([CAM], [TS], [SCR]…)
+     * are ignored — movieboxhd itself shows "Moana[CAM] [Version française]".
+     * A title is kept when it carries an accepted language tag (VF/FR/EN/VO/
+     * VOSTFR/…), or no tag at all (original audio); it is dropped when it
+     * only carries foreign dubs (Hindi, Tamil, Arabic…) so Hindi-heavy
+     * upstream rows never leak into the French browsing experience.
+     */
+    public static function acceptsForRow(string $title): bool
+    {
+        $tags = self::tags($title);
+        if ($tags === []) {
+            return true;
+        }
+
+        $accepted = false;
+        $rejected = false;
+        foreach ($tags as $tag) {
+            if (preg_match('/\p{Arabic}/u', $tag)) {
+                return false;
+            }
+            $norm = self::normalize($tag);
+            if ($norm === '') {
+                continue;
+            }
+            if (in_array($norm, self::QUALITY_TAGS, true)) {
+                continue; // [CAM] / [TS] / [SCR]… do not disqualify a row item
+            }
+            if (in_array($norm, self::ACCEPTED_TAGS, true)) {
+                $accepted = true;
+                continue;
+            }
+            if (in_array($norm, self::REJECTED_TAGS, true)) {
+                $rejected = true; // foreign dub tag — fatal only with no accepted sibling
+            }
+        }
+
+        return $accepted || ! $rejected;
     }
 
     /**

@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\BlockedTitle;
 use App\Services\DioStream\DioStreamClient;
 use App\Services\MovieBox\MovieBoxClient;
 use Illuminate\Http\JsonResponse;
@@ -29,6 +30,10 @@ class StreamController extends Controller
     public function play(Request $request): JsonResponse
     {
         $v = $this->validatePayload($request);
+
+        if (BlockedTitle::query()->where('term', $v['subjectId'])->exists()) {
+            abort(404, 'Content unavailable.');
+        }
         // The debug payload (upstream diagnostics) is only built on an explicit
         // ?debug=1 request, which also bypasses the endpoint cache below.
         $debug = $request->boolean('debug');
@@ -53,6 +58,38 @@ class StreamController extends Controller
         }
 
         return response()->json(['data' => $payload]);
+    }
+
+    /**
+     * Pre-warm the play payload for a subject so the first real request is a
+     * cache hit (the cold resolution fans out to slow upstream calls). Backed
+     * by the same cache key/TTL the play endpoint uses.
+     */
+    public function warmPlay(string $subjectId, int $subjectType): void
+    {
+        $season = $subjectType == 2 ? 1 : 0;
+        $episode = $season > 0 ? 1 : 0;
+
+        foreach ([[$season, $episode], [0, 0]] as [$se, $ep]) {
+            $cacheKey = "stream:play:$subjectId:$se:$ep";
+            if (Cache::has($cacheKey)) {
+                continue;
+            }
+            $diag = [];
+            $validated = ['subjectId' => $subjectId, 'season' => $se, 'episode' => $ep, 'title' => ''];
+            try {
+                $payload = $this->resolvePlayPayload($validated, $diag, false);
+            } catch (\Throwable $e) {
+                report($e);
+                continue;
+            }
+            if ($payload['hasResource']) {
+                Cache::put($cacheKey, $payload, 3600);
+            }
+            if ($se === 0) {
+                break; // movie path done
+            }
+        }
     }
 
     /**
@@ -859,7 +896,7 @@ class StreamController extends Controller
             @set_time_limit(0);
             while (true) {
                 try {
-                    $chunk = $body->read(65536);
+                    $chunk = $body->read(262144);
                 } catch (\Throwable $e) {
                     break;
                 }
@@ -1211,7 +1248,7 @@ class StreamController extends Controller
             @set_time_limit(0);
             while (true) {
                 try {
-                    $chunk = $body->read(65536);
+                    $chunk = $body->read(262144);
                 } catch (\Throwable $e) {
                     break;
                 }

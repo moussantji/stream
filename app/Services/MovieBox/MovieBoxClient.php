@@ -181,15 +181,76 @@ class MovieBoxClient
             try {
                 return $this->h5Search($keyword, $subjectType, $page, $perPage);
             } catch (Throwable $e) {
-                report($e);
+                return $this->postData(
+                    self::SEARCH,
+                    ['keyword' => $keyword, 'page' => $page, 'perPage' => $perPage, 'subjectType' => $subjectType],
+                    context: 'search'
+                );
             }
-
-            return $this->postData(
-                self::SEARCH,
-                ['keyword' => $keyword, 'page' => $page, 'perPage' => $perPage, 'subjectType' => $subjectType],
-                context: 'search'
-            );
         });
+    }
+
+    /**
+     * Run several H5 searches concurrently (HTTP pool) and cache each result
+     * under the same key as search(). One batch is as fast as its slowest query
+     * instead of the sum — this is what makes category-page pagination snappy.
+     *
+     * @param  array<int,string>  $keywords
+     * @return array<string,array<string,mixed>>
+     */
+    public function searchMany(array $keywords, int $subjectType, int $page, int $perPage): array
+    {
+        $perPage = max(1, min(20, $perPage));
+        $results = [];
+        $network = [];
+
+        foreach ($keywords as $keyword) {
+            $key = 'search:'.md5("$keyword|$subjectType|$page|$perPage");
+            $cached = $this->cacheTtl > 0 ? Cache::get("moviebox:v3:$key") : null;
+            if (is_array($cached)) {
+                $results[$keyword] = $cached;
+            } else {
+                $network[$keyword] = $key;
+            }
+        }
+
+        if ($network !== []) {
+            $payloads = [];
+            $responses = Http::pool(function (Pool $pool) use ($network, $subjectType, $page, $perPage, &$payloads) {
+                foreach ($network as $keyword => $key) {
+                    $payloads[$keyword] = ['keyword' => $keyword, 'page' => $page, 'perPage' => $perPage, 'subjectType' => $subjectType];
+                    $pool->as($keyword)
+                        ->withHeaders($this->h5Headers())
+                        ->timeout($this->timeout)
+                        ->post($this->h5Base.self::H5_SEARCH, $payloads[$keyword]);
+                }
+            });
+
+            foreach ($network as $keyword => $key) {
+                $response = $responses[$keyword] ?? null;
+                if ($response instanceof Response && ! $response->failed()) {
+                    try {
+                        $json = $response->json();
+                        $data = $json['data'] ?? $json;
+                        if (is_array($data) && isset($data['subjects']) && ! isset($data['items'])) {
+                            $data['items'] = $data['subjects'];
+                        }
+                        $data = is_array($data) ? $data : ['items' => []];
+                        if ($this->cacheTtl > 0) {
+                            Cache::put("moviebox:v3:$key", $data, $this->cacheTtl);
+                        }
+                        $results[$keyword] = $data;
+
+                        continue;
+                    } catch (Throwable $e) {
+                        report($e);
+                    }
+                }
+                $results[$keyword] = ['items' => []];
+            }
+        }
+
+        return $results;
     }
 
     // -----------------------------------------------------------------
@@ -203,6 +264,7 @@ class MovieBoxClient
     protected const H5_DETAIL = '/wefeed-h5api-bff/detail';
     protected const H5_DOWNLOAD = '/wefeed-h5api-bff/subject/download';
     protected const H5_PLAY = '/wefeed-h5api-bff/subject/play';
+    protected const H5_HOME = '/wefeed-h5api-bff/home';
 
     /** Shared browser-like headers for the H5 API (no auth required). */
     protected function h5Headers(array $extra = []): array
@@ -251,7 +313,38 @@ class MovieBoxClient
         return is_array($data) ? $data : ['items' => []];
     }
 
-    /** H5 detail (full subject metadata) via the detailPath slug. */
+    /**
+     * Landing page of the H5 *web* app (the one movieboxhd.net shows): the
+     * section list ("Trending Movies", "Animes", "Animation"…) with subjects
+     * already localized to the request language — the French feed ships
+     * "[Version française]" titles like "Moana[CAM] [Version française]"
+     * instead of the mobile API's "[Hindi]" tags.
+     *
+     * @return array<string,mixed> the `data` payload (platformList, operatingList)
+     */
+    public function h5Home(): array
+    {
+        return $this->cached('h5home', function () {
+            $response = Http::timeout($this->timeout)
+                ->withHeaders($this->h5Headers([
+                    'Origin' => 'https://movieboxhd.net',
+                    'Referer' => 'https://movieboxhd.net/',
+                ]))
+                ->get($this->h5Base.self::H5_HOME);
+
+            if ($response->failed()) {
+                throw new \RuntimeException('H5 home failed with HTTP '.$response->status());
+            }
+
+            $json = $response->json();
+            $data = is_array($json) ? ($json['data'] ?? null) : null;
+
+            return is_array($data) ? $data : [];
+        });
+    }
+
+    /**
+     * H5 detail (full subject metadata) via the detailPath slug. */
     public function h5Detail(string $detailPath): array
     {
         $response = Http::timeout($this->timeout)
@@ -401,6 +494,32 @@ class MovieBoxClient
             ['subjectId' => $subjectId],
             context: 'season-info'
         ));
+    }
+
+    /**
+     * Fetch the subject detail and (for series) the season info in one
+     * concurrent round trip instead of two serial calls.
+     *
+     * @return array{item:array<string,mixed>|null,seasons:array<string,mixed>|null}
+     */
+    public function detailBundle(string $subjectId, bool $includeSeasons): array
+    {
+        $calls = [
+            'item' => [
+                'path' => self::SUBJECT_GET,
+                'params' => ['subjectId' => $subjectId],
+                'cacheKey' => "detail:$subjectId",
+            ],
+        ];
+        if ($includeSeasons) {
+            $calls['seasons'] = [
+                'path' => self::SEASON_INFO,
+                'params' => ['subjectId' => $subjectId],
+                'cacheKey' => "seasons:$subjectId",
+            ];
+        }
+
+        return $this->parallelGet($calls);
     }
 
     // -----------------------------------------------------------------
@@ -879,6 +998,7 @@ class MovieBoxClient
         $pathWithQuery = $query === '' ? $path : $path.'?'.$query;
 
         $lastResponse = null;
+        $retryableResponses = 0;
 
         foreach ($this->hostPool as $base) {
             try {
@@ -899,6 +1019,14 @@ class MovieBoxClient
                 $this->activeBase = $base;
 
                 return [$base, $response];
+            }
+
+            // A retryable HTTP status (429/5xx) is almost never fixed by
+            // switching hosts and each attempt costs ~1-2s. Bounding the
+            // cascade to two responses keeps a cold stream resolution in the
+            // single-digit seconds instead of walking all seven hosts (~14s).
+            if (++$retryableResponses >= 2) {
+                break;
             }
         }
 

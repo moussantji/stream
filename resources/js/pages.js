@@ -2,7 +2,7 @@
 import { api, isAuthed } from './api.js';
 import {
     el, clear, row, grid, card, carousel, skeletonRow, loadingState, errorState, emptyState,
-    navigate, watchHref, detailHref, toast, openAuthModal,
+    navigate, watchHref, detailHref, toast, openAuthModal, displayTitle, blurPlaceholder,
 } from './ui.js';
 import { Player, attachHls } from './player.js';
 
@@ -58,7 +58,7 @@ export async function homePage(app) {
     app.appendChild(skeletonRow());
 
     const [homeRes, trendingRes, historyRes] = await Promise.allSettled([
-        api.home(),
+        api.home(1),
         api.trending(1),
         isAuthed() ? api.history() : Promise.resolve([]),
     ]);
@@ -89,6 +89,44 @@ export async function homePage(app) {
 
     if (trending.length) app.appendChild(row('Les plus regardés', trending));
     sections.forEach((s) => app.appendChild(row(s.title, s.items)));
+
+    // Infinite scroll: keep fetching the next home page and appending rows.
+    const sentinel = el('div', { class: 'infinite-sentinel' });
+    app.appendChild(sentinel);
+
+    let page = 2;
+    let loading = false;
+    let done = !homeRes.value?.pager?.hasMore;
+    let observer = null;
+    const seen = new Set();
+
+    const loadMore = async () => {
+        if (loading || done) return;
+        loading = true;
+        sentinel.appendChild(el('div', { class: 'infinite-loader' }, [el('div', { class: 'spinner' })]));
+        try {
+            const data = await api.home(page);
+            const next = data.sections || [];
+            if (!next.length || !data.pager?.hasMore) done = true;
+            next.forEach((s) => {
+                const items = (s.items || []).filter((i) => {
+                    const id = i.subjectId ?? i.title;
+                    if (seen.has(id)) return false;
+                    seen.add(id);
+                    return true;
+                });
+                if (items.length) app.insertBefore(row(s.title, items), sentinel);
+            });
+            page += 1;
+        } catch {
+            done = true;
+        } finally {
+            clear(sentinel);
+            loading = false;
+        }
+    };
+
+    observer = onReachBottom(sentinel, loadMore);
 }
 
 function hero(item) {
@@ -98,11 +136,14 @@ function hero(item) {
     if (item.imdbRating) meta.push(el('span', { class: 'rating', text: `★ ${item.imdbRating}` }));
     if (item.genres?.length) meta.push(el('span', { text: item.genres.slice(0, 3).join(' · ') }));
 
-    const bg = item.cover ? el('img', { class: 'hero-bg', src: item.cover, alt: '' }) : el('div', { class: 'hero-bg' });
+    const bg = el('div', { class: 'hero-bg-wrap' }, [
+        item.coverHash ? blurPlaceholder(item.coverHash, displayTitle(item), 160, 240) : null,
+        item.cover ? el('img', { class: 'hero-bg', src: item.cover, alt: '', fetchpriority: 'high', decoding: 'async' }) : null,
+    ]);
     const section = el('section', { class: 'hero' }, [
         bg,
         el('div', { class: 'hero-content' }, [
-            el('h1', { class: 'hero-title', text: item.title }),
+            el('h1', { class: 'hero-title', text: displayTitle(item) }),
             el('div', { class: 'hero-meta' }, meta),
             item.description ? el('p', { class: 'hero-desc', text: item.description }) : null,
             el('div', { class: 'hero-actions' }, [
@@ -145,13 +186,34 @@ function continueRow(history) {
 }
 
 // Observe a sentinel element and invoke cb() when it nears the viewport.
-// Returns the observer so callers can disconnect it.
+// IntersectionObserver is used when available; a scroll/resize fallback keeps
+// infinite scroll working on limited WebKit (SmartTV) browsers.
 function onReachBottom(sentinel, cb) {
-    const observer = new IntersectionObserver((entries) => {
-        if (entries.some((e) => e.isIntersecting)) cb();
-    }, { rootMargin: '600px 0px' });
-    observer.observe(sentinel);
-    return observer;
+    let observer = null;
+    if (typeof IntersectionObserver === 'function') {
+        observer = new IntersectionObserver((entries) => {
+            if (entries.some((e) => e.isIntersecting)) cb();
+        }, { rootMargin: '600px 0px' });
+        observer.observe(sentinel);
+    }
+
+    const check = () => {
+        const r = sentinel.getBoundingClientRect();
+        if (r.top < window.innerHeight + 600) cb();
+    };
+    window.addEventListener('scroll', check, { passive: true });
+    window.addEventListener('resize', check, { passive: true });
+    // FIRES once now so short pages still trigger the first load on browsers
+    // whose IntersectionObserver never fires for an already-visible element.
+    requestAnimationFrame(check);
+
+    return {
+        disconnect() {
+            if (observer) { observer.disconnect(); observer = null; }
+            window.removeEventListener('scroll', check);
+            window.removeEventListener('resize', check);
+        },
+    };
 }
 
 // Paginated grid with ADVANCED client-side filters (genre / year / min rating /
@@ -449,7 +511,26 @@ export async function searchPage(app, params) {
 // ---------- DETAIL ----------
 export async function detailPage(app, params) {
     clear(app);
-    app.appendChild(loadingState());
+
+    // Progressive paint: the title/cover are already in the URL, so show them
+    // immediately while the full detail (metadata, seasons, cast) loads.
+    const hint = {
+        subjectId: params.get('subjectId'),
+        subjectType: params.get('subjectType') || 0,
+        title: params.get('title') || undefined,
+        cover: params.get('cover') || undefined,
+    };
+    if (hint.cover || hint.title) {
+        app.appendChild(el('div', { class: 'detail-progressive' }, [
+            hint.cover ? el('img', { class: 'detail-prog-poster', src: hint.cover, alt: '', decoding: 'async' }) : el('div', { class: 'ph' }),
+            el('div', { class: 'detail-prog-info' }, [
+                hint.title ? el('h1', { class: 'detail-title', text: displayTitle(hint) }) : null,
+                loadingState('Chargement des détails…'),
+            ]),
+        ]));
+    } else {
+        app.appendChild(loadingState());
+    }
 
     const query = {
         subjectId: params.get('subjectId'),
@@ -534,7 +615,7 @@ export async function detailPage(app, params) {
     }
 
     const info = el('div', { class: 'detail-info' }, [
-        el('h1', { class: 'detail-title', text: item.title }),
+        el('h1', { class: 'detail-title', text: displayTitle(item) }),
         el('div', { class: 'detail-meta' }, [el('span', { class: 'badge', text: item.typeLabel }), ...meta]),
         item.description ? el('p', { class: 'detail-desc', text: item.description }) : null,
         versionRow,
@@ -545,12 +626,16 @@ export async function detailPage(app, params) {
     ]);
 
     const poster = el('div', { class: 'detail-poster' }, [
-        item.cover ? el('img', { src: item.cover, alt: item.title }) : el('div', { class: 'ph' }),
+        item.coverHash ? blurPlaceholder(item.coverHash, displayTitle(item), 96, 144) : null,
+        item.cover ? el('img', { src: item.coverSmall || item.cover, alt: displayTitle(item), loading: 'eager', decoding: 'async', class: 'cover-fade', onload: (e) => e.target.classList.add('loaded') }) : el('div', { class: 'ph' }),
     ]);
 
-    const heroBg = trailer
-        ? trailerVideo(trailer, item.cover, 'detail-hero-bg')
-        : (item.cover ? el('img', { class: 'detail-hero-bg', src: item.cover, alt: '' }) : null);
+    const heroBg = el('div', { class: 'detail-hero-bg-wrap' }, [
+        item.coverHash ? blurPlaceholder(item.coverHash, displayTitle(item), 160, 240) : null,
+        trailer
+            ? trailerVideo(trailer, item.cover, 'detail-hero-bg')
+            : (item.cover ? el('img', { class: 'detail-hero-bg', src: item.cover, alt: '' }) : null),
+    ]);
 
     app.appendChild(el('section', { class: 'detail-hero' }, [
         heroBg,
@@ -582,6 +667,50 @@ export async function detailPage(app, params) {
     if (recommendations && recommendations.length) {
         app.appendChild(row('More Like This', recommendations));
     }
+
+    // Infinite suggestions grid: keeps loading similar titles (genre-based)
+    // as the user scrolls the detail page.
+    const genres = (item.genres || []).join('|');
+    const sugWrap = el('section', { class: 'container' }, [
+        el('h2', { class: 'section-title', text: 'Suggestions' }),
+    ]);
+    const sugGrid = el('div', { class: 'grid' });
+    const sugSentinel = el('div', { class: 'infinite-sentinel' });
+    sugWrap.appendChild(sugGrid);
+    sugWrap.appendChild(sugSentinel);
+    app.appendChild(sugWrap);
+
+    let sugPage = 1;
+    let sugLoading = false;
+    let sugDone = false;
+    let sugObserver = null;
+    const sugSeen = new Set((recommendations || []).map((r) => r.subjectId ?? r.title));
+
+    const loadSuggestions = async () => {
+        if (sugLoading || sugDone) return;
+        sugLoading = true;
+        sugSentinel.appendChild(el('div', { class: 'infinite-loader' }, [el('div', { class: 'spinner' })]));
+        try {
+            const data = await api.suggestions({ subjectId: item.subjectId, subjectType: item.subjectType, genres, page: sugPage });
+            const items = (data.items || []).filter((i) => {
+                const id = i.subjectId ?? i.title;
+                if (sugSeen.has(id)) return false;
+                sugSeen.add(id);
+                return true;
+            });
+            if (items.length) items.forEach((i) => sugGrid.appendChild(card(i)));
+            if (!items.length || !data.pager?.hasMore) sugDone = true;
+            sugPage += 1;
+        } catch {
+            sugDone = true;
+        } finally {
+            clear(sugSentinel);
+            sugLoading = false;
+        }
+    };
+
+    sugObserver = onReachBottom(sugSentinel, loadSuggestions);
+    loadSuggestions();
 }
 
 function episodesBlock(getItem, seasons) {
@@ -659,7 +788,8 @@ export async function watchPage(app, params) {
 
     const shell = el('div', { class: 'player-shell' }, [loadingState('Préparation du flux…')]);
     const toolbar = el('div', { class: 'player-toolbar' });
-    const label = season > 0 ? `${item.title} — S${season} E${episode}` : item.title;
+    const shortTitle = displayTitle(item);
+    const label = season > 0 ? `${shortTitle} — S${season} E${episode}` : shortTitle;
 
     // Left column: video player + toolbar.
     const main = el('div', { class: 'watch-main' }, [

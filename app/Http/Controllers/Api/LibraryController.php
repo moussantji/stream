@@ -48,8 +48,11 @@ class LibraryController extends Controller
     {
         $history = $request->user()->watchHistories()
             ->orderByDesc('updated_at')
-            ->limit(60)
-            ->get();
+            ->limit(200)
+            ->get()
+            ->unique('subject_id')
+            ->take(60)
+            ->values();
 
         return response()->json(['data' => $history]);
     }

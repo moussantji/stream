@@ -32,7 +32,28 @@ return [
 
     // Seconds a persisted MySQL snapshot is served as fresh before re-fetching
     // (it is still used as a fallback beyond this when the API fails).
-    'snapshot_ttl' => (int) env('MOVIEBOX_SNAPSHOT_TTL', 900),
+    'snapshot_ttl' => (int) env('MOVIEBOX_SNAPSHOT_TTL', 1800),
+
+    // Items per category API page, and the French search queries used to build
+    // the /films, /series and /animation pools (the raw upstream tabs are a
+    // fixed 5-tile panel that ignores pagination). The pool auto-extends by
+    // fetching deeper search pages (category_search_depth) as the user scrolls.
+    'category_page_size' => max(10, (int) env('MOVIEBOX_CATEGORY_PAGE_SIZE', 20)),
+    'category_search_depth' => max(1, (int) env('MOVIEBOX_CATEGORY_SEARCH_DEPTH', 8)),
+    'category_queries' => [
+        'films' => array_values(array_filter(array_map('trim', explode(',', (string) env(
+            'MOVIEBOX_CATEGORY_FILMS',
+            'film d\'action français,film d\'horreur français,film comédie française,film comédie romantique français,film dramatique français,film science-fiction français,film policier français,film aventure français,film thriller français,film fantasy français'
+        ))))),
+        'series' => array_values(array_filter(array_map('trim', explode(',', (string) env(
+            'MOVIEBOX_CATEGORY_SERIES',
+            'série française,série d\'action française,série dramatique française,série comédie française,série policière française,série fantastique française'
+        ))))),
+        'animation' => array_values(array_filter(array_map('trim', explode(',', (string) env(
+            'MOVIEBOX_CATEGORY_ANIMATION',
+            'animation française,film d\'animation français,série d\'animation française,dessin animé français,film d\'animation aventure'
+        ))))),
+    ],
 
     // Persist every individual movie/series received into the catalog_items
     // table (a growing local library, queryable and API-independent).
@@ -72,9 +93,45 @@ return [
         fn ($w) => mb_strtolower(trim($w)),
         explode(',', (string) env(
             'MOVIEBOX_BLOCKED_KEYWORDS',
-            'hentai,ecchi,yaoi,yuri,hardcore,porn,porno,pornographic,xxx,x-rated,erotic,erotique,erotica,nsfw,adult,18+,'
-            .'sex,sexe,sexuel,sexuelle,sexual,gay,lgbt,lgbtq,lesbian,lesbienne,homosexual,homosexuel,homosexuelle,queer,bara,'
-            .'animation,anime,animated,cartoon,dessin animé,dessin anime'
+            'hentai,ecchi,yaoi,yuri,bara,hardcore,porn,porno,pornographique,pornographic,xxx,x-rated,xrated,erotic,erotique,erotica,'
+            .'nsfw,adult,adulte,18+,18 ,sex,sexy,sexe,sexuel,sexuelle,sexual,sexuelle,sexual,sex tape,sextape,'
+            .'gay,lgbt,lgbtq,lesbian,lesbienne,homosexual,homosexuel,homosexuelle,queer,transgender,transsexuel,transsexuelle,'
+            .'shemale,milf,anal,sexe anal,'
+            .'nude,nudité,nu,eroticisme,érotisme,'
+            .'anime xxx'
+        ))
+    ))),
+
+    // Systemic junk filter for the softcore / padded-upload family: no per-title
+    // blocks needed. A title is filtered when it has a short synopsis AND either
+    // (a) contains any soft_keywords phrase, or (b) has a very low rating with
+    // no "serious" genre. Movies with a full synopsis are never filtered.
+    'junk_rating' => (float) env('MOVIEBOX_JUNK_RATING', 4.8),
+    'junk_min_desc' => (int) env('MOVIEBOX_JUNK_MIN_DESC', 300),
+    'junk_safe_genres' => array_values(array_filter(array_map(
+        fn ($w) => mb_strtolower(trim($w)),
+        explode(',', (string) env('MOVIEBOX_JUNK_SAFE_GENRES', 'documentaire,biographie,guerre,histoire,sport,famille,familial,animation'))
+    ))),
+    'soft_keywords' => array_values(array_filter(array_map(
+        fn ($w) => mb_strtolower(trim($w)),
+        explode(',', (string) env(
+            'MOVIEBOX_SOFT_KEYWORDS',
+            'sex tape,sextape,initiation sexuelle,plan à trois,ménage à trois,ébat amoureux,ébat sexuel,'
+            .'nymphomane,dévergondé,dévergondée,coquin,coquine,libido,voluptueux,voluptueuse,voyeur,'
+            .'jeune étudiante,pension de jeunes,pensionnat,fille de barrio,decouverte de la sexualite,'
+            .'découverte de la sexualité,son premier amant,premier amant,première expérience sexuelle,'
+            .'hot girl,naughty,nympho,horny,babysitter,porn star,pornstar,sneaky,lesh,lezzie'
+        ))
+    ))),
+    'hard_block_keywords' => array_values(array_filter(array_map(
+        fn ($w) => mb_strtolower(trim($w)),
+        explode(',', (string) env(
+            'MOVIEBOX_HARD_BLOCK_KEYWORDS',
+            'porn,hentai,yaoi,yuri,bara,ecchi,x-rated,hardcore,milf,cock,pussy,tits,titties,boobs,boob,'
+            .'cumshot,cumshot,bukkake,gangbang,gang bang,blowjob,fellatio,rimjob,creampie,fisting,masturbat,'
+            .'dildo,vibrator,shemale,penis,fuck,fucked,fucking,fuckin,'
+            .'pornhub,xvideos,redtube,brazzers,youporn,tube8,spankbang,nhentai,caribbeancom,カリビアン,jav,'
+            .'moins 20 ans,moins 18 ans,moins de 18 ans,interdit aux moins,18+'
         ))
     ))),
 

@@ -57,15 +57,21 @@ class ItemNormalizer
 
         $rawTitle = (string) ($get('title') ?? $raw['title'] ?? '');
         $title = TextSanitizer::title($rawTitle !== '' ? $rawTitle : null);
+        $cover = self::cover($raw, $subject);
 
         return [
             'subjectId' => (string) $subjectId,
             'subjectType' => $type,
             'typeLabel' => SubjectType::resolve($type)->label(),
             'title' => $title,
+            'displayTitle' => TextSanitizer::displayTitle($title),
             'french' => self::hasFrenchAudio($raw, $subject, $rawTitle.' '.$title),
             'description' => TextSanitizer::description($get('description')),
-            'cover' => self::cover($raw, $subject),
+            'cover' => $cover,
+            // Small (card) variant of the CDN cover — ~128KB instead of 2.2MB.
+            'coverSmall' => self::cover($raw, $subject, 480),
+            // BlurHash painted as an instant placeholder behind the cover.
+            'coverHash' => self::coverHash($raw, $subject),
             'genres' => self::genres($get('genre')),
             'releaseDate' => $releaseDate ?: null,
             'year' => $year,
@@ -83,18 +89,59 @@ class ItemNormalizer
      * @param  array<string,mixed>  $raw
      * @param  array<string,mixed>  $subject
      */
-    protected static function cover(array $raw, array $subject): ?string
+    protected static function coverHash(array $raw, array $subject): ?string
     {
         foreach ([$raw['cover'] ?? null, $raw['image'] ?? null, $subject['cover'] ?? null] as $candidate) {
-            if (is_array($candidate) && ! empty($candidate['url'])) {
-                return $candidate['url'];
+            $thumb = '';
+            if (is_array($candidate)) {
+                $thumb = (string) ($candidate['thumbnail'] ?? '');
+                if ($thumb === '') {
+                    $thumb = (string) ($candidate['blurHash'] ?? '');
+                }
             }
-            if (is_string($candidate) && $candidate !== '') {
-                return $candidate;
+            if ($thumb !== '' && preg_match('/^[0-9A-Za-z#$%*+,-.:;=?@\[\]^_{|}~]+$/', $thumb) && strlen($thumb) >= 9) {
+                return $thumb;
             }
         }
 
         return null;
+    }
+
+    /**
+     * @param  array<string,mixed>  $raw
+     * @param  array<string,mixed>  $subject
+     */
+    protected static function cover(array $raw, array $subject, int $width = 1200): ?string
+    {
+        foreach ([$raw['cover'] ?? null, $raw['image'] ?? null, $subject['cover'] ?? null] as $candidate) {
+            if (is_array($candidate) && ! empty($candidate['url'])) {
+                return self::optimizeCover($candidate['url'], $width);
+            }
+            if (is_string($candidate) && $candidate !== '') {
+                return self::optimizeCover($candidate, $width);
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Resize CDN covers server-side so cards don't download 2MB posters.
+     * The MovieBox CDN (Aliyun OSS) accepts an image-processing query param;
+     * movieboxhd.net serves the same posters via a resized webp variant.
+     * Only applies to the known pbcdn hosts — foreign URLs stay untouched.
+     */
+    protected static function optimizeCover(string $url, int $width): string
+    {
+        if (! preg_match('#^https?://pbcdn(?:w)?\.aoneroom\.com/#i', $url)) {
+            return $url;
+        }
+
+        if (str_contains($url, '?')) {
+            return $url;
+        }
+
+        return $url.'?x-oss-process=image/resize,w_'.$width;
     }
 
     /**

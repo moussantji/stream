@@ -40,7 +40,7 @@ return [
     'cache_ttl' => (int) env('DIOSTREAM_CACHE_TTL', 300),
 
     // Outbound request timeout, seconds.
-    'timeout' => (int) env('DIOSTREAM_TIMEOUT', 30),
+    'timeout' => (int) env('DIOSTREAM_TIMEOUT', 10),
 
     // Minimum milliseconds between two outbound requests. The upstream rate
     // limits burst traffic (HTTP 429), so consecutive stream lookups are paced.

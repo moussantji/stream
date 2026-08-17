@@ -7,6 +7,12 @@
     <meta name="csrf-token" content="{{ csrf_token() }}">
     <title>{{ config('app.name', 'MovieBox Stream') }}</title>
     <meta name="description" content="Search, browse and stream movies and TV series.">
+    {{-- Warm the image/CDN connections so banners and posters paint sooner. --}}
+    <link rel="preconnect" href="https://pbcdn.aoneroom.com" crossorigin>
+    <link rel="preconnect" href="https://pacdn.aoneroom.com" crossorigin>
+    <link rel="preconnect" href="https://h5-static.aoneroom.com" crossorigin>
+    <link rel="preconnect" href="https://bcdnxw.hakunaymatata.com" crossorigin>
+    <link rel="preconnect" href="https://h5-api.aoneroom.com">
     @vite(['resources/css/app.css', 'resources/js/app.js'])
 </head>
 <body>
