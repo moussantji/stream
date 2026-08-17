@@ -898,10 +898,14 @@ class StreamController extends Controller
         $body = $upstream->toPsrResponse()->getBody();
 
         return response()->stream(function () use ($body) {
-            @set_time_limit(0);
-            while (true) {
+            // Hard wall-clock budget: if the CDN stalls mid-body, close the
+            // stream instead of tying up a worker (or a single-threaded local
+            // `artisan serve`) forever. The browser then sees EOF, surfaces a
+            // media error and falls back to the next source.
+            $deadline = microtime(true) + (int) config('moviebox.timeout', 30);
+            while (microtime(true) < $deadline) {
                 try {
-                    $chunk = $body->read(262144);
+                    $chunk = $body->read(1048576);
                 } catch (\Throwable $e) {
                     break;
                 }
@@ -1250,10 +1254,12 @@ class StreamController extends Controller
         $body = $upstream->toPsrResponse()->getBody();
 
         return response()->stream(function () use ($body) {
-            @set_time_limit(0);
-            while (true) {
+            // Hard wall-clock budget — see proxy(): never wedge a worker when
+            // the CDN stalls mid-body.
+            $deadline = microtime(true) + (int) config('moviebox.timeout', 30);
+            while (microtime(true) < $deadline) {
                 try {
-                    $chunk = $body->read(262144);
+                    $chunk = $body->read(1048576);
                 } catch (\Throwable $e) {
                     break;
                 }

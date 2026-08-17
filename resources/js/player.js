@@ -592,9 +592,12 @@ export class Player {
                     // ~3.8MB and delays the first frame by seconds). dash.js then
                     // adapts up as bandwidth allows.
                     buffer: {
-                        bufferTimeAtTopQuality: 30,
+                        bufferTimeAtTopQuality: 60,
                         fastSwitchEnabled: true,
-                        minBufferTime: 2,
+                        // The upstream CDN is throttled (~50KB/s/connection): keep
+                        // a deep buffer ahead of the playhead so brief stalls in
+                        // the CDN don't pause the video.
+                        minBufferTime: 12,
                     },
                     abr: {
                         autoSwitchBitrate: { video: true, audio: true },
