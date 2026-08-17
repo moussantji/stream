@@ -433,13 +433,19 @@ export class Player {
             this.startWatchdog();
         } else if (h264.length) {
             this.setMp4(h264[0]);
+            this.startWatchdog();
+        } else if (sources.length) {
+            // Only HEVC left and the device can't decode it — trying the
+            // adaptive HEVC stream anyway just loops on `waiting` forever.
+            // Fall back to the MP4 so the error surfaces (or plays when a
+            // hardware decoder or the hvc1 remux makes it work).
+            this.setMp4(sources[0]);
+            this.startWatchdog();
         } else if (dash.length) {
             // No MP4 fallback on this device — try the adaptive stream anyway;
             // the watchdog + error handlers bail if it cannot start.
             await this.setDash(dash[0]);
             this.startWatchdog();
-        } else if (sources.length) {
-            this.setMp4(sources[0]);
         } else {
             throw new Error('No playable source found for this title.');
         }
@@ -487,6 +493,10 @@ export class Player {
         const url = this.mp4UrlFor(source);
         this._triedRemux = !!(source && source.remux && url === source.remux);
         this._setSrc(url);
+        // Silent stalls (e.g. an undecodable HEVC file on a device without a
+        // hardware decoder) never fire a `video error` — surface them instead
+        // of spinning forever.
+        this.startWatchdog();
         this.updateQualityUi();
     }
 

@@ -500,11 +500,16 @@ class StreamController extends Controller
                 ];
 
                 if ($isMovie) {
-                    $matched = array_values(array_filter(
+                    // Movies are a single video, but each tier request returns
+                    // files for ONE resolution only (and often only the codec
+                    // that exists at that tier — e.g. h265 at 1080p, h264 at
+                    // 480p). Merge every tier so devices without HEVC still get
+                    // a playable H.264 file; normalizeSources dedupes later.
+                    array_push($matched, ...array_values(array_filter(
                         $list,
                         fn ($it) => is_array($it) && ! empty($it['resourceLink'])
-                    ));
-                    break 2;
+                    )));
+                    break;
                 }
 
                 foreach ($list as $it) {
