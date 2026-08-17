@@ -431,8 +431,8 @@ export class Player {
         } else if (hls.length) {
             await this.setHls(hls[0]);
             this.startWatchdog();
-        } else if (best) {
-            this.setMp4(best);
+        } else if (h264.length) {
+            this.setMp4(h264[0]);
         } else if (dash.length) {
             // No MP4 fallback on this device — try the adaptive stream anyway;
             // the watchdog + error handlers bail if it cannot start.
