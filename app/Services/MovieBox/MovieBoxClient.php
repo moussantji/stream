@@ -1023,9 +1023,9 @@ class MovieBoxClient
 
             // A retryable HTTP status (429/5xx) is almost never fixed by
             // switching hosts and each attempt costs ~1-2s. Bounding the
-            // cascade to two responses keeps a cold stream resolution in the
-            // single-digit seconds instead of walking all seven hosts (~14s).
-            if (++$retryableResponses >= 2) {
+            // cascade keeps a cold rebuild in the single-digit seconds
+            // instead of walking all seven hosts (~14s+).
+            if (++$retryableResponses >= (int) config('moviebox.api_retries', 1)) {
                 break;
             }
         }

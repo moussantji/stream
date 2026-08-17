@@ -104,7 +104,7 @@ export function card(item, opts = {}) {
     const src = item.coverSmall || item.cover;
     const placeholder = item.coverHash ? blurPlaceholder(item.coverHash, title) : null;
     const poster = src
-        ? el('img', { src, alt: title, loading: 'lazy', decoding: 'async', class: 'cover-fade', onload: (e) => e.target.classList.add('loaded'), onerror: (e) => { e.target.remove(); } })
+        ? el('img', { src, alt: title, loading: 'lazy', decoding: 'async', width: '96', height: '144', class: 'cover-fade', onload: (e) => e.target.classList.add('loaded'), onerror: (e) => { e.target.remove(); } })
         : el('div', { class: 'ph', text: title });
 
     const posterWrap = el('div', { class: 'card-poster' }, [

@@ -893,7 +893,7 @@ class StreamController extends Controller
                 $headers[$h] = $val;
             }
         }
-        $headers['Cache-Control'] = 'public, max-age=120';
+        $headers['Cache-Control'] = 'public, max-age=600';
 
         $body = $upstream->toPsrResponse()->getBody();
 

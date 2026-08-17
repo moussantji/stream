@@ -244,7 +244,7 @@ function filterableGrid(container, fetchPage, { emptyMsg = 'Rien à afficher.' }
         el('label', { class: 'filter' }, [el('span', { text: 'Trier' }), sortSel]),
     ]));
 
-    const gridWrap = el('div', {}, [loadingState()]);
+    const gridWrap = el('div', {}, [skeletonRow()]);
     const sentinel = el('div', { class: 'infinite-sentinel' });
     container.appendChild(gridWrap);
     container.appendChild(sentinel);
@@ -357,7 +357,7 @@ export async function localPage(app, params) {
         }))));
 
     const info = el('p', { style: 'color:var(--text-dim);margin:0 0 12px' });
-    const gridWrap = el('div', {}, [loadingState('Chargement de la base locale…')]);
+    const gridWrap = el('div', {}, [skeletonRow()]);
     const sentinel = el('div', { class: 'infinite-sentinel' });
     container.appendChild(info);
     container.appendChild(gridWrap);
@@ -627,7 +627,7 @@ export async function detailPage(app, params) {
 
     const poster = el('div', { class: 'detail-poster' }, [
         item.coverHash ? blurPlaceholder(item.coverHash, displayTitle(item), 96, 144) : null,
-        item.cover ? el('img', { src: item.coverSmall || item.cover, alt: displayTitle(item), loading: 'eager', decoding: 'async', class: 'cover-fade', onload: (e) => e.target.classList.add('loaded') }) : el('div', { class: 'ph' }),
+        item.cover ? el('img', { src: item.coverSmall || item.cover, alt: displayTitle(item), loading: 'eager', decoding: 'async', width: '96', height: '144', class: 'cover-fade', onload: (e) => e.target.classList.add('loaded') }) : el('div', { class: 'ph' }),
     ]);
 
     const heroBg = el('div', { class: 'detail-hero-bg-wrap' }, [

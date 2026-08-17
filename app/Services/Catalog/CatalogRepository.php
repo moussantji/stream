@@ -2,6 +2,7 @@
 
 namespace App\Services\Catalog;
 
+use App\Jobs\RebuildSnapshot;
 use App\Models\CatalogItem;
 use App\Models\CatalogSnapshot;
 use App\Support\ContentFilter;
@@ -31,6 +32,24 @@ class CatalogRepository
 
         if ($snapshot && $this->isFresh($snapshot, $ttl)) {
             return json_decode($snapshot->payload, true);
+        }
+
+        // Stale snapshot: serve it immediately and rebuild in the background —
+        // the visitor never waits for the slow upstream API. Only rebuildable
+        // keys (home / trending / discover / channels) take this path; when
+        // the queue is unavailable we fall through to the synchronous rebuild.
+        if ($snapshot && app(SnapshotRebuilder::class)->canRebuild($key)) {
+            try {
+                if (Cache::add('snapshot:queued:'.$key, true, 300)) {
+                    RebuildSnapshot::dispatch($key, $ttl);
+                }
+
+                return json_decode($snapshot->payload, true);
+            } catch (\Throwable $e) {
+                // Queue unusable (no jobs table, driver misconfig…) — fall
+                // back to a synchronous refresh so data still renews.
+                report($e);
+            }
         }
 
         // Stampede guard: only one worker rebuilds an expired key. The others
@@ -93,6 +112,12 @@ class CatalogRepository
     public function storeRaw(string $key, mixed $data, int $ttl = 0): void
     {
         $this->store($key, $data);
+    }
+
+    /** Persist every item found in a payload (background rebuilds). */
+    public function persistPayload(mixed $data): void
+    {
+        $this->persistItems($data);
     }
 
     protected function find(string $key): ?CatalogSnapshot

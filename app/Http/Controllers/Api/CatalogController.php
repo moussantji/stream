@@ -73,11 +73,20 @@ class CatalogController extends Controller
     {
         $page = max(1, (int) $request->input('page', 1));
 
-        $data = $this->repo->remember(
-            'catalog:home:'.$page,
-            $this->ttl(),
-            fn () => $this->buildHomeSectionsWithPager($page),
-        );
+        try {
+            $data = $this->repo->remember(
+                'catalog:home:'.$page,
+                $this->ttl(),
+                fn () => $this->buildHomeSectionsWithPager($page),
+            );
+        } catch (\Throwable $e) {
+            // Never an empty page: if no snapshot exists and the upstream
+            // build fails outright, still return a 200 shell so the SPA
+            // renders (and a background job can retry).
+            report($e);
+
+            $data = ['sections' => [], 'pager' => ['page' => $page, 'hasMore' => false]];
+        }
 
         // Filter at serve time (cache stores unfiltered data) so admin blocklist
         // / keyword changes hide titles immediately.
@@ -98,7 +107,7 @@ class CatalogController extends Controller
     /**
      * @return array{sections:array<int,array<string,mixed>>,pager:array{page:int,hasMore:bool}}
      */
-    protected function buildHomeSectionsWithPager(int $page): array
+    public function buildHomeSectionsWithPager(int $page): array
     {
         $sections = [];
         $hasMore = false;
@@ -121,8 +130,19 @@ class CatalogController extends Controller
         } else {
             // Page N shifts each query's window so scrolling the home page
             // keeps discovering new titles instead of repeating page 1.
-            foreach ((array) config('moviebox.home_queries', []) as $q) {
-                $items = $this->searchItems($q['query'], 0, 20, $page);
+            // All queries run in ONE concurrent batch (searchMany), so the
+            // slowest query bounds the wait instead of the sum of all six.
+            $queries = (array) config('moviebox.home_queries', []);
+            $batch = $this->client->searchMany(array_column($queries, 'query'), 0, 20, $page);
+
+            foreach ($queries as $q) {
+                $items = [];
+                foreach (ItemNormalizer::many($batch[$q['query']]['items'] ?? []) as $item) {
+                    if (! $this->searchGate($item)) {
+                        continue;
+                    }
+                    $items[] = $item;
+                }
                 if ($items !== []) {
                     $sections[] = ['title' => $q['label'], 'items' => $items];
                 }
@@ -235,6 +255,11 @@ class CatalogController extends Controller
                 if (ContentFilter::isBlocked($item) || ! VersionFilter::acceptsForRow((string) ($item['title'] ?? ''))) {
                     continue;
                 }
+                // Same metadata gate as the serve-time animation category:
+                // verdicts are cached, so this only costs on first seed.
+                if (! $this->animationGate($item)) {
+                    continue;
+                }
                 $seen[$item['subjectId']] = true;
                 $items[] = $item;
             }
@@ -315,30 +340,44 @@ class CatalogController extends Controller
     {
         $type = SubjectType::resolve($request->input('type', 'all'));
         $page = max(1, (int) $request->input('page', 1));
-        $query = (string) config('moviebox.trending_query', 'français');
 
         $data = $this->repo->remember(
             "catalog:trending:{$type->value}:$page",
             $this->ttl(),
-            function () use ($query, $type, $page) {
-                try {
-                    $res = $this->client->search($query, $type->value, $page, 20);
-
-                    return [
-                        'items' => ItemNormalizer::many($res['items'] ?? []),
-                        'pager' => $this->pager($res, $page, 20),
-                    ];
-                } catch (\Throwable $e) {
-                    report($e);
-
-                    return ['items' => [], 'pager' => ['page' => $page, 'hasMore' => false]];
-                }
-            },
+            fn () => $this->buildTrending($type->value, $page),
         );
 
         $data['items'] = ContentFilter::apply($data['items'] ?? []);
 
         return response()->json(['data' => $data]);
+    }
+
+    /**
+     * Trending snapshot payload (shared by the controller and the background
+     * snapshot rebuilder). Items are passed through the metadata gate so
+     * hentai/porn with clean titles never reach the "plus regardés" row.
+     *
+     * @return array{items:array<int,array<string,mixed>>,pager:array{page:int,hasMore:bool}}
+     */
+    public function buildTrending(int $typeValue, int $page): array
+    {
+        $query = (string) config('moviebox.trending_query', 'français');
+
+        try {
+            $res = $this->client->search($query, $typeValue, $page, 20);
+
+            return [
+                'items' => array_values(array_filter(
+                    ItemNormalizer::many($res['items'] ?? []),
+                    fn (array $item) => $this->searchGate($item)
+                )),
+                'pager' => $this->pager($res, $page, 20),
+            ];
+        } catch (\Throwable $e) {
+            report($e);
+
+            return ['items' => [], 'pager' => ['page' => $page, 'hasMore' => false]];
+        }
     }
 
     /**
@@ -436,20 +475,28 @@ class CatalogController extends Controller
         // search results: when the requested page goes past the pool, it is
         // extended with the next search pages on the fly, so infinite scroll
         // genuinely keeps going until the upstream results run out.
-        $pool = $this->ensureCategoryPool($config['tab'], $slug, $page * $perPage);
-
-        // Serve-time guard: drops adult/hentai items (verdicts are cached, so
-        // this also purges pools built before the guard existed). The
-        // animation/anime categories additionally require the metadata to
-        // confirm the title really is animation, so search junk (Nollywood
-        // videos, songs, wrestling clips…) never pollutes the category.
         $animeHint = in_array($slug, ['animation', 'anime'], true);
-        $items = ContentFilter::apply(array_slice($pool['items'], ($page - 1) * $perPage, $perPage));
-        $items = array_values(array_filter(
-            $items,
-            fn (array $item) => $animeHint ? $this->animationGate($item) : $this->metadataGuard($item, false)
-        ));
-        $hasMore = count($pool['items']) > $page * $perPage || ! $pool['exhausted'];
+
+        try {
+            $pool = $this->ensureCategoryPool($config['tab'], $slug, $page * $perPage);
+
+            // Serve-time guard: drops adult/hentai items (verdicts are cached, so
+            // this also purges pools built before the guard existed). The
+            // animation/anime categories additionally require the metadata to
+            // confirm the title really is animation, so search junk (Nollywood
+            // videos, songs, wrestling clips…) never pollutes the category.
+            $items = ContentFilter::apply(array_slice($pool['items'], ($page - 1) * $perPage, $perPage));
+            $items = array_values(array_filter(
+                $items,
+                fn (array $item) => $animeHint ? $this->animationGate($item) : $this->metadataGuard($item, false)
+            ));
+            $hasMore = count($pool['items']) > $page * $perPage || ! $pool['exhausted'];
+        } catch (\Throwable $e) {
+            report($e);
+
+            $items = [];
+            $hasMore = false;
+        }
 
         return response()->json(['data' => [
             'title' => $config['title'],
@@ -566,11 +613,17 @@ class CatalogController extends Controller
     /** Live TV channels, extracted from the landing page's liveList (best-effort). */
     public function channels(): JsonResponse
     {
-        $data = $this->repo->remember(
-            'catalog:channels',
-            $this->ttl(),
-            fn () => ['channels' => $this->buildChannels()],
-        );
+        try {
+            $data = $this->repo->remember(
+                'catalog:channels',
+                $this->ttl(),
+                fn () => ['channels' => $this->buildChannels()],
+            );
+        } catch (\Throwable $e) {
+            report($e);
+
+            $data = ['channels' => []];
+        }
 
         return response()->json(['data' => $data]);
     }
@@ -618,7 +671,10 @@ class CatalogController extends Controller
         })->values()->all();
 
         return response()->json(['data' => [
-            'items' => ContentFilter::apply($items),
+            'items' => array_values(array_filter(
+                ContentFilter::apply($items),
+                fn (array $item) => $this->searchGate($item)
+            )),
             'total' => $total,
             'pager' => ['page' => $page, 'perPage' => $perPage, 'hasMore' => $page * $perPage < $total],
         ]]);
@@ -705,18 +761,38 @@ class CatalogController extends Controller
     /** Popular / hot lists for discovery widgets. */
     public function discover(): JsonResponse
     {
-        $data = $this->repo->remember('catalog:discover', $this->ttl(), function () {
-            return [
-                'hotMovies' => $this->flattenTab(2),
-                'hotSeries' => $this->flattenTab(5),
-            ];
-        });
+        try {
+            $data = $this->repo->remember('catalog:discover', $this->ttl(), fn () => $this->buildDiscover());
+        } catch (\Throwable $e) {
+            report($e);
+
+            $data = ['hotMovies' => [], 'hotSeries' => []];
+        }
 
         $data['hotMovies'] = ContentFilter::apply($data['hotMovies'] ?? []);
         $data['hotSeries'] = ContentFilter::apply($data['hotSeries'] ?? []);
         $data['popular'] = array_map(fn ($i) => $i['title'], array_slice($data['hotMovies'], 0, 10));
 
         return response()->json(['data' => $data]);
+    }
+
+    /**
+     * Discovery snapshot payload (shared with the background rebuilder).
+     *
+     * @return array{hotMovies:array<int,array<string,mixed>>,hotSeries:array<int,array<string,mixed>>}
+     */
+    public function buildDiscover(): array
+    {
+        return [
+            'hotMovies' => array_values(array_filter(
+                $this->flattenTab(2),
+                fn (array $item) => $this->searchGate($item)
+            )),
+            'hotSeries' => array_values(array_filter(
+                $this->flattenTab(5),
+                fn (array $item) => $this->searchGate($item)
+            )),
+        ];
     }
 
     /** Rich detail-page data (persisted per subject for resilience). */
@@ -742,24 +818,31 @@ class CatalogController extends Controller
         $cacheKey = 'catalog:detail:'.$validated['subjectId'];
 
         if (! $request->boolean('debug')) {
-            if ($this->repo->hasFresh($cacheKey, $this->ttl())) {
-                $data = $this->repo->remember(
-                    $cacheKey,
-                    $this->ttl(),
-                    fn () => $this->buildDetail($validated),
-                    isEmpty: fn ($d) => empty($d['item']) || ($d['detailAvailable'] ?? false) === false,
-                );
-            } else {
-                // Direct build: a complete payload (seasons/cast/dubs) is
-                // returned synchronously. It is fast for any pre-warmed title
-                // and correct for the rest; the warm only refills cache.
-                $data = $this->repo->remember(
-                    $cacheKey,
-                    $this->ttl(),
-                    fn () => $this->buildDetail($validated),
-                    isEmpty: fn ($d) => empty($d['item']) || ($d['detailAvailable'] ?? false) === false,
-                );
-                $this->spawnDetailWarm($validated['subjectId'], (int) ($validated['subjectType'] ?? 0));
+            try {
+                if ($this->repo->hasFresh($cacheKey, $this->ttl())) {
+                    $data = $this->repo->remember(
+                        $cacheKey,
+                        $this->ttl(),
+                        fn () => $this->buildDetail($validated),
+                        isEmpty: fn ($d) => empty($d['item']) || ($d['detailAvailable'] ?? false) === false,
+                    );
+                } else {
+                    // Direct build: a complete payload (seasons/cast/dubs) is
+                    // returned synchronously. It is fast for any pre-warmed title
+                    // and correct for the rest; the warm only refills cache.
+                    $data = $this->repo->remember(
+                        $cacheKey,
+                        $this->ttl(),
+                        fn () => $this->buildDetail($validated),
+                        isEmpty: fn ($d) => empty($d['item']) || ($d['detailAvailable'] ?? false) === false,
+                    );
+                    $this->spawnDetailWarm($validated['subjectId'], (int) ($validated['subjectType'] ?? 0));
+                }
+            } catch (\Throwable $e) {
+                // Never a blank page: fall back to an unavailable shell.
+                report($e);
+
+                $data = ['item' => null, 'detailAvailable' => false];
             }
         } else {
             $data = $this->buildDetail($validated, true);
@@ -772,6 +855,15 @@ class CatalogController extends Controller
         // Adult/porn titles are never displayed (same as moviebox.ph, whose own
         // surfaces are clean): a deep link to one is treated as unavailable.
         if (isset($data['item']) && ContentFilter::isBlocked($data['item'])) {
+            abort(404, 'Content unavailable.');
+        }
+
+        // "XXX: The Animation"-style hentai with a clean title: the metadata
+        // gate must confirm real animation before the detail page opens.
+        if (isset($data['item'])
+            && preg_match('/anim/i', (string) ($data['item']['title'] ?? '')) === 1
+            && ! $this->animationGate($data['item'])
+        ) {
             abort(404, 'Content unavailable.');
         }
 
@@ -1554,7 +1646,7 @@ class CatalogController extends Controller
      *
      * @return array<int,array<string,mixed>>
      */
-    protected function buildChannels(): array
+    public function buildChannels(): array
     {
         try {
             $data = $this->client->home(0);

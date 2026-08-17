@@ -263,7 +263,41 @@ export class Player {
             this.scheduleHide();
         });
 
+        // Two stalls in a row on the same source = the pipe cannot sustain it:
+        // drop to the next-lower MP4 quality (adaptive DASH/HLS rely on ABR).
+        this._stallCount = 0;
+        this._stallTimer = null;
+        v.addEventListener('waiting', () => this.onStall());
+        v.addEventListener('playing', () => {
+            clearTimeout(this._stallTimer);
+            this._stallTimer = setTimeout(() => { this._stallCount = 0; }, 30000);
+        });
+
         this.updateVolumeUi();
+    }
+
+    onStall() {
+        if (!this._started) return; // startup stalls are the watchdog's job
+        clearTimeout(this._stallTimer);
+        this._stallTimer = setTimeout(() => {
+            if (this.video.readyState >= 3) return; // recovered before the check
+            this._stallCount += 1;
+            if (this._stallCount < 2) return;
+            this._stallCount = 0;
+            this.downgradeQuality();
+        }, 1200);
+    }
+
+    // Move to the next-lower MP4 source (sources are ordered desc by resolution).
+    downgradeQuality() {
+        if (this.dash || this.hls) return; // adaptive streams self-adjust
+        const ordered = [...this.currentSources].sort((a, b) =>
+            Number(b.resolution || 0) - Number(a.resolution || 0)
+        );
+        const idx = ordered.findIndex((s) => this._activeSource && s.url === this._activeSource.url);
+        if (idx < 0 || idx >= ordered.length - 1) return;
+        const next = ordered[idx + 1];
+        if (next && next.url) this.setMp4(next);
     }
 
     updateProgress() {
@@ -489,6 +523,7 @@ export class Player {
         if (typeof source === 'string') source = { url: source };
         this.destroyHls();
         clearTimeout(this._watchdog);
+        this._stallCount = 0;
         this._activeSource = source;
         const url = this.mp4UrlFor(source);
         this._triedRemux = !!(source && source.remux && url === source.remux);
