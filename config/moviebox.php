@@ -70,6 +70,11 @@ return [
     // Outbound request timeout, seconds.
     'timeout' => (int) env('MOVIEBOX_TIMEOUT', 30),
 
+    // Shorter timeout for page-data API calls (home / trending / detail …):
+    // a slow upstream must fail fast so the stale-if-error snapshots keep the
+    // pages fast instead of hanging on a stuck API host.
+    'api_timeout' => (int) env('MOVIEBOX_API_TIMEOUT', 10),
+
     // Host suffixes the DASH/HLS stream proxy (/api/mv/...) is allowed to fetch
     // from. Prevents the proxy being used as an open relay.
     'cdn_proxy_allow' => array_values(array_filter(array_map('trim', explode(',', (string) env(

@@ -6,6 +6,7 @@ use App\Models\CatalogItem;
 use App\Models\CatalogSnapshot;
 use App\Support\ContentFilter;
 use Closure;
+use Illuminate\Support\Facades\Cache;
 use Throwable;
 
 /**
@@ -32,12 +33,29 @@ class CatalogRepository
             return json_decode($snapshot->payload, true);
         }
 
+        // Stampede guard: only one worker rebuilds an expired key. The others
+        // serve the last good snapshot immediately instead of piling onto the
+        // upstream API (which would saturate the PHP-FPM pool when it stalls).
+        try {
+            $lock = Cache::lock('snapshot:refresh:'.$key, 120);
+            if (! $lock->get()) {
+                if ($snapshot) {
+                    return json_decode($snapshot->payload, true);
+                }
+            }
+        } catch (Throwable $e) {
+            // No lock store available — proceed without the guard.
+            $lock = null;
+        }
+
         try {
             $data = $fresh();
 
             if (! $isEmpty($data)) {
                 $this->store($key, $data);
                 $this->persistItems($data);
+
+                $lock?->release();
 
                 return $data;
             }
@@ -56,6 +74,8 @@ class CatalogRepository
             }
 
             throw $e;
+        } finally {
+            $lock?->release();
         }
     }
 

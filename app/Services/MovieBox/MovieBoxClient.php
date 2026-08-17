@@ -79,7 +79,7 @@ class MovieBoxClient
         $this->activeBase = $this->hostPool[0] ?? 'https://api6.aoneroom.com';
         // h5_host may be the bare domain or already carry the API prefix.
         $this->h5Base = rtrim(preg_replace('#/wefeed-h5api-bff$#', '', (string) ($config['h5_host'] ?? 'https://h5-api.aoneroom.com')), '/');
-        $this->timeout = (int) $config['timeout'];
+        $this->timeout = (int) $config['api_timeout'];
         $this->proxy = $config['proxy'] ?? null;
         $this->userAgent = $config['user_agent'];
         $this->clientInfo = $config['client_info'];
