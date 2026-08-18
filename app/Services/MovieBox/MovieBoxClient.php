@@ -999,8 +999,16 @@ class MovieBoxClient
 
         $lastResponse = null;
         $retryableResponses = 0;
+        $exceptions = 0;
 
         foreach ($this->hostPool as $base) {
+            // A host that recently timed out is skipped entirely for a few
+            // minutes: otherwise a hung api6 (first in the pool) would cost
+            // its full timeout on every request instead of just once.
+            if (Cache::get($this->hostDownKey($base))) {
+                continue;
+            }
+
             try {
                 $client = $this->buildClient($method, $path, $params, $body, $playMode);
                 $response = $method === 'GET'
@@ -1008,6 +1016,14 @@ class MovieBoxClient
                     : $client->withBody($body ?? '', 'application/json; charset=utf-8')->post($base.$pathWithQuery);
             } catch (Throwable $e) {
                 report($e);
+
+                // Timeout/refused: quarantine the host, and bound the cascade
+                // just like the retryable-status path so a full outage cannot
+                // turn into a 7×timeout walk (up to ~70s per request).
+                Cache::put($this->hostDownKey($base), true, 300);
+                if (++$exceptions >= (int) config('moviebox.api_retries', 1) + 1) {
+                    break;
+                }
 
                 continue;
             }
@@ -1017,6 +1033,7 @@ class MovieBoxClient
 
             if (! in_array($response->status(), self::RETRY_STATUS, true)) {
                 $this->activeBase = $base;
+                Cache::forget($this->hostDownKey($base));
 
                 return [$base, $response];
             }
@@ -1035,6 +1052,11 @@ class MovieBoxClient
         }
 
         return [$this->activeBase, $lastResponse];
+    }
+
+    protected function hostDownKey(string $base): string
+    {
+        return 'moviebox:host-down:'.md5($base);
     }
 
     protected function buildClient(string $method, string $path, array $params, ?string $body, bool $playMode): PendingRequest
