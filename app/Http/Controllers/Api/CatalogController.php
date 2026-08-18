@@ -1154,7 +1154,7 @@ class CatalogController extends Controller
     protected function riskyTitle(string $clean): bool
     {
         return preg_match(
-            '/\b(?:anim|hentai|ecchi|erot|sex|xxx|taboo|milf|anal|adulte?|soeur|belle-m[eè]re|18\+|step)\b/iu',
+            '/\b(?:anim|hentai|ecchi|erot|sex|xxx|taboo|milf|anal|adulte?|soeur|belle-m[eè]re|18\+|step)\b|the\s+animation/iu',
             $clean
         ) === 1;
     }
