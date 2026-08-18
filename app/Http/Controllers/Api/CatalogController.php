@@ -1128,15 +1128,22 @@ class CatalogController extends Controller
      */
     protected function searchGate(array $item): bool
     {
+        // Items carrying genres are already filtered for free by ContentFilter:
+        // the upstream tags adult content with the genre "Adulte" (and the
+        // search-sourced pools all carry genres) — nothing to verify here.
+        if (! empty($item['genres'])) {
+            return true;
+        }
+
         $clean = trim(preg_replace('/\s+/u', ' ', (string) preg_replace('/\[[^\]]*\]/u', '', (string) ($item['title'] ?? ''))));
         if ($clean === '') {
             return true;
         }
 
-        // Suspicion-triggered gate: a clean title passes instantly (zero
-        // upstream cost); only titles carrying an adult/animation marker are
-        // verified against metadata, so page builds never walk the metadata
-        // APIs per item. Verdicts are cached for a day.
+        // Suspicion-triggered gate for genre-less rows (h5 editorial sections):
+        // a clean title passes instantly; only titles carrying an adult or
+        // animation marker are verified against metadata. Verdicts are cached
+        // for a day.
         if (! $this->riskyTitle($clean)) {
             return true;
         }
