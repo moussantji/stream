@@ -108,6 +108,30 @@ class CatalogRepository
         return $snapshot !== null && $this->isFresh($snapshot, $ttl);
     }
 
+    /** Any stored payload for the key (fresh or stale) — null when absent. */
+    public function snapshotPayload(string $key): ?array
+    {
+        $snapshot = $this->find($key);
+
+        return $snapshot ? json_decode($snapshot->payload, true) : null;
+    }
+
+    /** Drop a snapshot (used when a rebuild must never poison the cache). */
+    public function deleteKey(string $key): void
+    {
+        try {
+            CatalogSnapshot::where('cache_key', $key)->delete();
+        } catch (Throwable $e) {
+            report($e);
+        }
+    }
+
+    /** Whether a fresh snapshot exists (no payload decode — detail fast path). */
+    public function isFreshSnapshot(string $key, int $ttl): bool
+    {
+        return $this->hasFresh($key, $ttl);
+    }
+
     /** Write a snapshot directly (no freshness semantics of its own). */
     public function storeRaw(string $key, mixed $data, int $ttl = 0): void
     {

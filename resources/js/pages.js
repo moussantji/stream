@@ -549,6 +549,24 @@ export async function detailPage(app, params) {
         return;
     }
 
+    // First paint may be the fast local payload (no seasons/cast yet) while the
+    // server warms the full build in the background — silently refetch once so
+    // the enriched data (seasons, cast, trailer) replaces it when ready.
+    if (!data.detailAvailable) {
+        setTimeout(async () => {
+            if (!app.isConnected) return;
+            try {
+                const richer = await api.detail(query);
+                if (richer && richer.detailAvailable) renderDetail(app, richer, params);
+            } catch { /* keep the fast paint */ }
+        }, 12000);
+    }
+
+    renderDetail(app, data, params);
+}
+
+// Full detail view: metadata, seasons, cast, recommendations, player warm.
+async function renderDetail(app, data, params) {
     const { item, isSeries, seasons, cast, recommendations } = data;
     const trailer = data.trailer;
     clear(app);
@@ -575,6 +593,7 @@ export async function detailPage(app, params) {
     });
 
     const firstSeason = seasons[0];
+    const playLabel = isSeries ? `Play S${firstSeason?.season ?? 1} E1` : 'Play';
 
     // Audio versions (dubs). Each dub is a separate subjectId, so switching
     // language means playing a different subject. Default to French if present.
@@ -620,7 +639,7 @@ export async function detailPage(app, params) {
         item.description ? el('p', { class: 'detail-desc', text: item.description }) : null,
         versionRow,
         el('div', { class: 'detail-actions' }, [
-            el('button', { class: 'btn btn-primary', html: `${PLAY_SVG} <span>${isSeries ? 'Play S' + firstSeason?.season + ' E1' : 'Play'}</span>`, style: 'display:flex;gap:8px;align-items:center', onclick: play }),
+            el('button', { class: 'btn btn-primary', html: `${PLAY_SVG} <span>${playLabel}</span>`, style: 'display:flex;gap:8px;align-items:center', onclick: play }),
             favBtn,
         ]),
     ]);
@@ -920,6 +939,53 @@ async function buildEpisodeSidebar(side, item, activeSeason, activeEpisode) {
     }
 
     if (!seasons.length) {
+        // The first visit is painted from the fast local payload while the
+        // server warms the full build — retry once so the episode list fills
+        // in as soon as the enriched snapshot is ready.
+        setTimeout(async () => {
+            if (!side.isConnected) return;
+            try {
+                const richer = await api.detail({
+                    subjectId: item.subjectId,
+                    detailPath: item.detailPath,
+                    subjectType: item.subjectType,
+                    title: item.title,
+                    cover: item.cover,
+                });
+                const full = richer?.seasons?.length ? richer.seasons : [];
+                if (!full.length) return;
+
+                clear(body);
+                const retryWrap = el('div', { class: 'episode-list' });
+                const retryRender = (season) => {
+                    clear(retryWrap);
+                    season.episodes.forEach((ep) => {
+                        retryWrap.appendChild(el('button', {
+                            class: `episode-btn ${season.season === activeSeason && ep === activeEpisode ? 'active' : ''}`,
+                            text: `E${ep}`,
+                            onclick: () => navigate(watchHref(item, season.season, ep)),
+                        }));
+                    });
+                };
+                if (full.length > 1) {
+                    const tabs = el('div', { class: 'season-tabs' }, full.map((s) =>
+                        el('button', {
+                            class: `season-tab ${s.season === activeSeason ? 'active' : ''}`,
+                            text: `Saison ${s.season}`,
+                            onclick: (e) => {
+                                tabs.querySelectorAll('.season-tab').forEach((t) => t.classList.remove('active'));
+                                e.target.classList.add('active');
+                                retryRender(s);
+                            },
+                        })));
+                    body.appendChild(tabs);
+                }
+                body.appendChild(retryWrap);
+                const current = full.find((s) => s.season === activeSeason) || full[0];
+                retryRender(current);
+            } catch { /* keep the empty state */ }
+        }, 12000);
+
         clear(body);
         body.appendChild(emptyState('Aucun épisode à afficher'));
         return;

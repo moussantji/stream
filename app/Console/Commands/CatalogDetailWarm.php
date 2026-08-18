@@ -26,6 +26,16 @@ class CatalogDetailWarm extends Command
                 ['subjectId' => $subjectId, 'subjectType' => $subjectType, 'title' => '', 'cover' => ''],
                 false,
             ]);
+
+            // A failed build (upstream unavailable, empty detail) must never
+            // poison the snapshot: only complete payloads are persisted, and
+            // an existing stale one is dropped so the next visit rebuilds.
+            if (($payload['detailAvailable'] ?? false) !== true) {
+                $repo->deleteKey('catalog:detail:'.$subjectId);
+
+                return $this->retryLater($subjectId);
+            }
+
             $repo->storeRaw('catalog:detail:'.$subjectId, $payload, 0);
             Cache::forget('catalog:detail-warm:'.$subjectId);
 
@@ -34,13 +44,20 @@ class CatalogDetailWarm extends Command
             return 0;
         } catch (Throwable $e) {
             report($e);
-            Cache::forget('catalog:detail-warm:'.$subjectId);
-            $this->releaseSlot($subjectId);
+            $this->retryLater($subjectId);
 
             $this->error($e->getMessage());
 
             return 1;
         }
+    }
+
+    private function retryLater(string $subjectId): int
+    {
+        Cache::forget('catalog:detail-warm:'.$subjectId);
+        $this->releaseSlot($subjectId);
+
+        return 1;
     }
 
     private function releaseSlot(string $subjectId): void

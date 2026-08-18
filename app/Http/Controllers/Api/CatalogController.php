@@ -817,35 +817,40 @@ class CatalogController extends Controller
 
         $cacheKey = 'catalog:detail:'.$validated['subjectId'];
 
-        if (! $request->boolean('debug')) {
-            try {
-                if ($this->repo->hasFresh($cacheKey, $this->ttl())) {
-                    $data = $this->repo->remember(
-                        $cacheKey,
-                        $this->ttl(),
-                        fn () => $this->buildDetail($validated),
-                        isEmpty: fn ($d) => empty($d['item']) || ($d['detailAvailable'] ?? false) === false,
-                    );
-                } else {
-                    // Direct build: a complete payload (seasons/cast/dubs) is
-                    // returned synchronously. It is fast for any pre-warmed title
-                    // and correct for the rest; the warm only refills cache.
-                    $data = $this->repo->remember(
-                        $cacheKey,
-                        $this->ttl(),
-                        fn () => $this->buildDetail($validated),
-                        isEmpty: fn ($d) => empty($d['item']) || ($d['detailAvailable'] ?? false) === false,
-                    );
-                    $this->spawnDetailWarm($validated['subjectId'], (int) ($validated['subjectType'] ?? 0));
-                }
-            } catch (\Throwable $e) {
-                // Never a blank page: fall back to an unavailable shell.
-                report($e);
-
-                $data = ['item' => null, 'detailAvailable' => false];
+        try {
+            $stale = $this->repo->snapshotPayload($cacheKey);
+            // A stored payload that never resolved upstream (empty detail) is
+            // treated as missing so it can never be served as a "complete"
+            // page — the warm command no longer persists those, but older
+            // poisoned rows may still linger in the table.
+            if (is_array($stale) && ($stale['detailAvailable'] ?? true) === false) {
+                $stale = null;
             }
-        } else {
-            $data = $this->buildDetail($validated, true);
+
+            if ($this->repo->isFreshSnapshot($cacheKey, $this->ttl())) {
+                $data = $this->repo->remember(
+                    $cacheKey,
+                    $this->ttl(),
+                    fn () => $this->buildDetail($validated),
+                    isEmpty: fn ($d) => empty($d['item']) || ($d['detailAvailable'] ?? false) === false,
+                );
+            } elseif ($stale !== null) {
+                // Stale but complete: serve it instantly, refill the cache in
+                // the background — the visitor never waits on the upstream.
+                $data = $stale;
+                $this->spawnDetailWarm($validated['subjectId'], (int) ($validated['subjectType'] ?? 0));
+            } else {
+                // Never seen before: paint instantly from the URL/local catalog
+                // (zero upstream calls); the background warm completes the
+                // metadata so the next visit returns the full payload.
+                $data = $this->buildFastDetail($validated);
+                $this->spawnDetailWarm($validated['subjectId'], (int) ($validated['subjectType'] ?? 0));
+            }
+        } catch (\Throwable $e) {
+            // Never a blank page: fall back to an unavailable shell.
+            report($e);
+
+            $data = ['item' => null, 'detailAvailable' => false];
         }
 
         if (! empty($data['recommendations'])) {
@@ -1774,6 +1779,61 @@ class CatalogController extends Controller
     }
 
     /** Fire a detached worker that resolves and caches the full detail. */
+    /**
+     * Instant first-paint payload: no upstream call at all. The item is rebuilt
+     * from the local persisted catalog (genres/year/rating/description) or, at
+     * worst, from the URL hints — the background warm then completes the full
+     * build (seasons/cast/dubs/trailer) into the snapshot for the next visit.
+     *
+     * @return array{item:array<string,mixed>,isSeries:bool,seasons:array,cast:array,dubs:array,trailer:null,recommendations:array,detailAvailable:false}
+     */
+    protected function buildFastDetail(array $validated): array
+    {
+        $subjectId = $validated['subjectId'];
+        $subjectType = (int) ($validated['subjectType'] ?? 0);
+
+        $local = CatalogItem::query()
+            ->where('subject_id', $subjectId)
+            ->first();
+
+        $item = [
+            'subjectId' => $subjectId,
+            'subjectType' => $subjectType,
+            'typeLabel' => SubjectType::resolve($subjectType)->label(),
+            'title' => $validated['title'] ?? $local->title ?? 'Untitled',
+            'displayTitle' => TextSanitizer::displayTitle($validated['title'] ?? $local->title ?? 'Untitled'),
+            'description' => $local->description ?? null,
+            'cover' => $validated['cover'] ?? $local->cover ?? null,
+            'coverSmall' => $local->cover ?? null,
+            'genres' => is_array($local->genres ?? null) ? $local->genres : [],
+            'releaseDate' => null,
+            'year' => $local->year ?? null,
+            'durationSeconds' => $local->duration_seconds ?? null,
+            'imdbRating' => $local->imdb_rating ?? null,
+            'country' => $local->country ?? null,
+            'seasonCount' => null,
+            'detailPath' => $local->detail_path ?? $validated['detailPath'] ?? null,
+            'hasResource' => true,
+        ];
+
+        $recommendations = [];
+        if (! empty($item['genres'])) {
+            $recommendations = $this->recommendationsFromLocal($item, 12);
+        }
+
+        return [
+            'item' => $item,
+            'isSeries' => $subjectType === SubjectType::TV_SERIES->value
+                || (int) ($item['seasonCount'] ?? 0) > 0,
+            'seasons' => [],
+            'cast' => [],
+            'dubs' => [],
+            'trailer' => null,
+            'recommendations' => $recommendations,
+            'detailAvailable' => false,
+        ];
+    }
+
     protected function spawnDetailWarm(string $subjectId, int $subjectType): void
     {
         if (! Cache::add('catalog:detail-warm:'.$subjectId, true, 30)) {
