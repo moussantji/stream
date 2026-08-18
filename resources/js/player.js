@@ -189,7 +189,15 @@ export class Player {
             clearTimeout(this._waitT);
             this._waitT = setTimeout(() => { this.spinner.hidden = false; }, 500);
         });
-        v.addEventListener('playing', () => { this._started = true; clearTimeout(this._watchdog); this.hideSpinner(); });
+        v.addEventListener('playing', () => {
+            this._started = true;
+            clearTimeout(this._watchdog);
+            this.hideSpinner();
+            // A slow-but-working pipe must not keep the error overlay visible:
+            // hide it as soon as real playback starts.
+            this.errorEl.hidden = true;
+            this.bigBtn.style.display = '';
+        });
         v.addEventListener('canplay', () => this.hideSpinner());
         v.addEventListener('timeupdate', () => this.hideSpinner());
         v.addEventListener('error', () => this.onVideoError());
@@ -590,14 +598,16 @@ export class Player {
 
     // If an adaptive stream is selected but the video hasn't started within the
     // grace period, it's stuck (missing HEVC decoder, bad manifest, …) — fall
-    // back to a downloadable MP4 instead of looping on the spinner forever.
+    // back to a downloadable MP4 instead of looping on the spinner forever. The
+    // grace is generous: the proxy on a slow host can take 15s+ to push the
+    // first bytes on a cold pipe.
     startWatchdog() {
         clearTimeout(this._watchdog);
         this._watchdog = setTimeout(() => {
             if (!this._started && this.video.currentTime === 0) {
                 this.onVideoError();
             }
-        }, 8000);
+        }, 20000);
     }
 
     async setHls(url) {

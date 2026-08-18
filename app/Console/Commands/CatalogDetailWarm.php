@@ -37,6 +37,12 @@ class CatalogDetailWarm extends Command
             }
 
             $repo->storeRaw('catalog:detail:'.$subjectId, $payload, 0);
+
+            // Pre-resolve the stream payload for the default episode so the
+            // first "Lecture" click is a cache hit instead of a cold multi-call
+            // resolution (the slow part of starting playback).
+            app(\App\Http\Controllers\Api\StreamController::class)->warmPlay($subjectId, $subjectType);
+
             Cache::forget('catalog:detail-warm:'.$subjectId);
 
             $this->releaseSlot($subjectId);

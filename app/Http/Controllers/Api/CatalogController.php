@@ -1363,7 +1363,14 @@ class CatalogController extends Controller
     {
         $media = $this->anilist()->search($clean);
         if ($media !== null) {
-            if (($media['isAdult'] ?? false) === true) {
+            // "The Animation"/"The Motion Picture" is how hentai OVAs are named
+            // — but a handful of legit series carry the same suffix, and AniList
+            // flags borderline mainstream titles adult. For suffixed titles only
+            // the unambiguous markers (Hentai genre, strict adult tags) block;
+            // the bare isAdult flag does not.
+            $suffixed = preg_match('/(?:the\s+animation|the\s+motion\s+picture)$/iu', $clean) === 1;
+
+            if (($media['isAdult'] ?? false) === true && ! $suffixed) {
                 return true;
             }
             $genres = array_map('mb_strtolower', (array) ($media['genres'] ?? []));
