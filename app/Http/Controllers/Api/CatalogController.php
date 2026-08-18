@@ -367,10 +367,7 @@ class CatalogController extends Controller
             $res = $this->client->search($query, $typeValue, $page, 20);
 
             return [
-                'items' => array_values(array_filter(
-                    ItemNormalizer::many($res['items'] ?? []),
-                    fn (array $item) => $this->searchGate($item)
-                )),
+                'items' => array_values(ContentFilter::apply(ItemNormalizer::many($res['items'] ?? []))),
                 'pager' => $this->pager($res, $page, 20),
             ];
         } catch (\Throwable $e) {
@@ -488,7 +485,7 @@ class CatalogController extends Controller
             $items = ContentFilter::apply(array_slice($pool['items'], ($page - 1) * $perPage, $perPage));
             $items = array_values(array_filter(
                 $items,
-                fn (array $item) => $animeHint ? $this->animationGate($item) : $this->metadataGuard($item, false)
+                fn (array $item) => $this->searchGate($item)
             ));
             $hasMore = count($pool['items']) > $page * $perPage || ! $pool['exhausted'];
         } catch (\Throwable $e) {
@@ -1131,11 +1128,57 @@ class CatalogController extends Controller
      */
     protected function searchGate(array $item): bool
     {
-        if (preg_match('/anim/i', (string) ($item['title'] ?? '')) === 1) {
-            return $this->animationGate($item);
+        $clean = trim(preg_replace('/\s+/u', ' ', (string) preg_replace('/\[[^\]]*\]/u', '', (string) ($item['title'] ?? ''))));
+        if ($clean === '') {
+            return true;
         }
 
-        return $this->metadataGuard($item, false);
+        // Suspicion-triggered gate: a clean title passes instantly (zero
+        // upstream cost); only titles carrying an adult/animation marker are
+        // verified against metadata, so page builds never walk the metadata
+        // APIs per item. Verdicts are cached for a day.
+        if (! $this->riskyTitle($clean)) {
+            return true;
+        }
+
+        $kind = (int) ($item['subjectType'] ?? 0) === 2 ? 'tv' : 'movie';
+        $key = 'guard:v2:suspect:'.$kind.':'.md5(mb_strtolower($clean));
+
+        return Cache::remember($key, 86400, fn () => $this->verifySuspect($item, $clean));
+    }
+
+    /**
+     * Title markers that justify a metadata check. Wide on purpose: a false
+     * trigger only costs one cached lookup (rare), never a wrongful block.
+     */
+    protected function riskyTitle(string $clean): bool
+    {
+        return preg_match(
+            '/\b(?:anim|hentai|ecchi|erot|sex|xxx|taboo|milf|anal|adulte?|soeur|belle-m[eè]re|18\+|step)\b/iu',
+            $clean
+        ) === 1;
+    }
+
+    /**
+     * Verify a suspect title with a single cheap lookup: AniList for
+     * animation-suffixed names (hentai OVAs), iTunes for the rest. Unresolved
+     * titles are kept — the blocklist already caught the explicit ones.
+     *
+     * @param  array<string,mixed>  $item
+     */
+    protected function verifySuspect(array $item, string $clean): bool
+    {
+        if (preg_match('/anim/iu', $clean) === 1) {
+            $verdict = $this->animeIsAdult($clean);
+
+            return $verdict === null || ! $verdict;
+        }
+
+        if ($this->itunesIsAdult($clean, (int) ($item['subjectType'] ?? 0) === 2 ? 'tv' : 'movie')) {
+            return false;
+        }
+
+        return true;
     }
 
     /**
