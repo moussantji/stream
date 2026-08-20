@@ -39,6 +39,10 @@ return [
     // fixed 5-tile panel that ignores pagination). The pool auto-extends by
     // fetching deeper search pages (category_search_depth) as the user scrolls.
     'category_page_size' => max(10, (int) env('MOVIEBOX_CATEGORY_PAGE_SIZE', 20)),
+    // Films & series pages are single-shot: the whole pool is built until it
+    // holds this many qualifying (top-rated & recent) titles, then returned
+    // in one response.
+    'category_pool_cap' => max(50, (int) env('MOVIEBOX_CATEGORY_POOL_CAP', 300)),
     'category_search_depth' => max(1, (int) env('MOVIEBOX_CATEGORY_SEARCH_DEPTH', 8)),
     'category_queries' => [
         'films' => array_values(array_filter(array_map('trim', explode(',', (string) env(
@@ -144,6 +148,23 @@ return [
         ))
     ))),
 
+    // Title-only hard filter: any title containing one of these phrases is
+    // dropped from every surface (home, categories, search, suggestions,
+    // detail) with no metadata check. "The Animation" is the naming pattern
+    // of hentai OVAs ("XXX: The Animation") — always blocked.
+    'hard_block_titles' => array_values(array_filter(array_map(
+        fn ($w) => mb_strtolower(trim($w)),
+        explode(',', (string) env('MOVIEBOX_HARD_BLOCK_TITLES', 'the animation'))
+    ))),
+
+    // Subject types never displayed anywhere (home, search, categories,
+    // suggestions, detail, recommendations): 6 = MUSIC (songs/music videos
+    // like Summer Walker – "Come Thru"). Comma-separated ints.
+    'blocked_subject_types' => array_values(array_filter(array_map(
+        fn ($t) => (int) trim($t),
+        explode(',', (string) env('MOVIEBOX_BLOCKED_SUBJECT_TYPES', '6'))
+    ))),
+
     // Optional outbound proxy.
     'proxy' => env('MOVIEBOX_PROXY') ?: null,
 
@@ -177,6 +198,8 @@ return [
     | titles). Each entry is "Row label|search query" (or just "query").
     | Set MOVIEBOX_HOME_QUERIES="" to fall back to the provider's landing page.
     */
+    'home_section_size' => (int) env('MOVIEBOX_HOME_SECTION_SIZE', 20),
+
     'home_queries' => (function () {
         $raw = env('MOVIEBOX_HOME_QUERIES');
         $entries = $raw !== null
@@ -210,6 +233,13 @@ return [
     'region' => strtoupper((string) env('MOVIEBOX_REGION', 'FR')),
     'language' => strtolower((string) env('MOVIEBOX_LANGUAGE', 'fr')),
     'timezone' => env('MOVIEBOX_TIMEZONE', 'Europe/Paris'),
+
+    // Top-rated & recent-only filter, applied on the provider's own fields
+    // (imdbRatingValue / releaseDate, no external metadata): an item is kept
+    // only when its API rating >= top_rating_min AND its release year
+    // >= top_year_min, then rows are sorted by rating then year.
+    'top_rating_min' => (float) env('MOVIEBOX_TOP_RATING_MIN', 7.0),
+    'top_year_min' => (int) env('MOVIEBOX_TOP_YEAR_MIN', 2024),
 
     // Android app identity used in request headers.
     'user_agent' => env(

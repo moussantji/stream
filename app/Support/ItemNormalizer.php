@@ -4,6 +4,7 @@ namespace App\Support;
 
 use App\Services\MovieBox\SubjectType;
 use App\Support\TextSanitizer;
+use App\Support\VersionFilter;
 
 /**
  * Flattens the various raw item shapes returned by the MovieBox backend
@@ -51,13 +52,23 @@ class ItemNormalizer
         $year = null;
         if (is_string($releaseDate) && strlen($releaseDate) >= 4) {
             $year = (int) substr($releaseDate, 0, 4);
+        } elseif (($y = (int) ($get('year') ?? 0)) >= 1900) {
+            $year = $y;
         }
 
-        $rating = self::floatOrNull($get('imdbRatingValue') ?? $get('imdbRate'));
+        $rating = self::floatOrNull($get('imdbRatingValue') ?? $get('imdbRate') ?? $get('imdbRating'));
 
         $rawTitle = (string) ($get('title') ?? $raw['title'] ?? '');
         $title = TextSanitizer::title($rawTitle !== '' ? $rawTitle : null);
         $cover = self::cover($raw, $subject);
+        $french = self::hasFrenchAudio($raw, $subject, $rawTitle.' '.$title);
+        $english = self::hasEnglishAudio($raw, $subject);
+
+        // "A Salad Bowl of Eccentrics [Hindi]" with French audio in its dubs
+        // is displayed as "[Français]" (or "[Anglais]" when only English
+        // audio is present) — the tag is rewritten, the title is never
+        // blocked.
+        $title = VersionFilter::languageize($title, $french ? 'fr' : ($english ? 'en' : null));
 
         return [
             'subjectId' => (string) $subjectId,
@@ -65,7 +76,8 @@ class ItemNormalizer
             'typeLabel' => SubjectType::resolve($type)->label(),
             'title' => $title,
             'displayTitle' => TextSanitizer::displayTitle($title),
-            'french' => self::hasFrenchAudio($raw, $subject, $rawTitle.' '.$title),
+            'french' => $french,
+            'english' => $english,
             'description' => TextSanitizer::description($get('description')),
             'cover' => $cover,
             // Small (card) variant of the CDN cover — ~128KB instead of 2.2MB.
@@ -177,6 +189,41 @@ class ItemNormalizer
                 $code = mb_strtolower((string) ($dub['lanCode'] ?? $dub['code'] ?? ''));
                 $name = mb_strtolower((string) ($dub['lanName'] ?? $dub['label'] ?? ''));
                 if (str_starts_with($code, 'fr') || str_contains($name, 'fran') || str_contains($name, 'french')) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Whether the title appears to have an English audio track (for the tag
+     * rewrite "[Hindi]" → "[Anglais]" when English is the actual audio):
+     * an English language field or an English entry in a dubs list.
+     *
+     * @param  array<string,mixed>  $raw
+     * @param  array<string,mixed>  $subject
+     */
+    protected static function hasEnglishAudio(array $raw, array $subject): bool
+    {
+        foreach (['language', 'lang', 'lanCode', 'audioLang', 'lanName'] as $key) {
+            $v = mb_strtolower((string) ($raw[$key] ?? $subject[$key] ?? ''));
+            if ($v === 'en' || $v === 'eng' || $v === 'engus' || str_starts_with($v, 'en-')
+                || str_contains($v, 'english') || str_contains($v, 'anglais')) {
+                return true;
+            }
+        }
+
+        $dubs = $raw['dubs'] ?? $subject['dubs'] ?? null;
+        if (is_array($dubs)) {
+            foreach ($dubs as $dub) {
+                if (! is_array($dub)) {
+                    continue;
+                }
+                $code = mb_strtolower((string) ($dub['lanCode'] ?? $dub['code'] ?? ''));
+                $name = mb_strtolower((string) ($dub['lanName'] ?? $dub['label'] ?? ''));
+                if (str_starts_with($code, 'en') || str_contains($name, 'english') || str_contains($name, 'anglais')) {
                     return true;
                 }
             }

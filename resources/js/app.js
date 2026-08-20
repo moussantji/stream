@@ -1,6 +1,6 @@
 import '../css/app.css';
 import { api } from './api.js';
-import { navigate, renderAuthArea, el, clear } from './ui.js';
+import { navigate, renderAuthArea, el, clear, shortDecode } from './ui.js';
 import { homePage, trendingPage, searchPage, detailPage, watchPage, libraryPage, categoryPage, channelsPage, localPage, adminPage } from './pages.js';
 import { setAuth, getToken, isAuthed } from './api.js';
 
@@ -35,8 +35,28 @@ function route() {
             return searchPage(appRoot, params);
         case path === '/title':
             return detailPage(appRoot, params);
+        case path.startsWith('/title/'):
+            return detailPage(appRoot, params, decodeURIComponent(path.slice('/title/'.length)));
+        case path.startsWith('/t/'): {
+            const code = path.slice('/t/'.length);
+            const decoded = shortDecode(code);
+            if (!decoded) break;
+            params.set('subjectId', decoded.subjectId);
+            params.set('subjectType', String(decoded.subjectType));
+            return detailPage(appRoot, params);
+        }
         case path === '/watch':
             return watchPage(appRoot, params);
+        case path.startsWith('/w/'): {
+            const parts = path.slice('/w/'.length).split('/');
+            const decoded = shortDecode(parts[0]);
+            if (!decoded) break;
+            params.set('subjectId', decoded.subjectId);
+            params.set('subjectType', String(decoded.subjectType));
+            params.set('season', parts[1] || '0');
+            params.set('episode', parts[2] || '0');
+            return watchPage(appRoot, params);
+        }
         case path === '/library':
             return libraryPage(appRoot);
         case path === '/admin':

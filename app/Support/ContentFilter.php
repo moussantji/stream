@@ -28,6 +28,9 @@ class ContentFilter
     /** @var array<int,string>|null */
     protected static ?array $hardKeywords = null;
 
+    /** @var array<int,string>|null */
+    protected static ?array $hardTitles = null;
+
     public const BLOCKED_CACHE_KEY = 'content:blocked_titles';
 
     /**
@@ -60,6 +63,29 @@ class ContentFilter
 
         $title = self::normalize((string) ($item['title'] ?? ''));
         $desc = self::normalize((string) ($item['description'] ?? ''));
+
+        // Subject types that are never displayed (e.g. 6 = MUSIC: songs and
+        // music videos that would otherwise show up as "films").
+        $type = (int) ($item['subjectType'] ?? 0);
+        foreach ((array) config('moviebox.blocked_subject_types', []) as $blocked) {
+            if ((int) $blocked === $type) {
+                return true;
+            }
+        }
+
+        // Foreign-dub-only releases ("Service Girl [Hindi]"): the tag is
+        // rewritten to "[Français]"/"[Anglais]" when that audio is confirmed
+        // (ItemNormalizer::languageize), so a leftover foreign-dub tag means
+        // the release has no French/English audio and is never displayed.
+        if (VersionFilter::hasForeignDub((string) ($item['title'] ?? ''))) {
+            return true;
+        }
+
+        // Title-only hard filter: phrases like "the animation" (hentai OVA
+        // naming pattern) always block the title, no metadata check needed.
+        if ($title !== '' && self::titleHardBlocked($title)) {
+            return true;
+        }
 
         // Censored spellings (f**k, f*ck, s*x, p*rn, f*** buddy) defeat keyword
         // matching after normalization *strips* the intercalated stars, so they
@@ -276,6 +302,49 @@ class ContentFilter
             fn ($w) => self::normalize((string) $w),
             (array) config('moviebox.hard_block_keywords', [])
         )));
+    }
+
+    /**
+     * Title phrases that always block an item (e.g. "the animation"), matched
+     * as raw substrings against the normalized title.
+     */
+    public static function titleHardBlocked(string $title): bool
+    {
+        $title = self::normalize($title);
+        if ($title === '') {
+            return false;
+        }
+
+        $phrases = self::$hardTitles ??= array_values(array_filter(array_map(
+            fn ($w) => self::normalize((string) $w),
+            (array) config('moviebox.hard_block_titles', [])
+        )));
+
+        foreach ($phrases as $phrase) {
+            if ($phrase !== '' && str_contains($title, $phrase)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * "Top-rated & recent only" gate, applied directly on the provider's own
+     * fields (imdbRatingValue → imdbRating, releaseDate → year — no external
+     * metadata, no anime-specific logic): the item is kept only when its API
+     * rating >= moviebox.top_rating_min AND its release year
+     * >= moviebox.top_year_min.
+     *
+     * @param  array<string,mixed>  $item
+     */
+    public static function isTopOnly(array $item): bool
+    {
+        $rating = (float) ($item['imdbRating'] ?? 0);
+        $year = (int) ($item['year'] ?? 0);
+
+        return $rating >= (float) config('moviebox.top_rating_min', 7.0)
+            && $year >= (int) config('moviebox.top_year_min', 2024);
     }
 
     /**

@@ -52,51 +52,112 @@ const PLUS_SVG = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" st
 const CHECK_SVG = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
 // ---------- HOME ----------
+const HIDDEN_HOME_SECTIONS = new Set(['IN Banner', '🔥Trending Now', 'Les plus regardés']);
+
+// SSR hydration: the server embeds the page payload as JSON in #page-data
+// (SSR pages: home, films, series, detail). The SPA consumes it once and
+// renders immediately — no API round-trip — then keeps its usual flow.
+let ssrData = null;
+try {
+    const node = document.getElementById('page-data');
+    if (node) {
+        const parsed = JSON.parse(node.textContent);
+        if (parsed && parsed.type && parsed.data) ssrData = parsed;
+        node.remove();
+    }
+} catch { /* not SSR or corrupted payload */ }
+
+function takePageData(type) {
+    if (!ssrData || ssrData.type !== type) return null;
+    const data = ssrData.data;
+    ssrData = null;
+    return data;
+}
+
 export async function homePage(app) {
     clear(app);
-    app.appendChild(skeletonRow());
-    app.appendChild(skeletonRow());
+    const pre = takePageData('home');
+    if (!pre) {
+        app.appendChild(skeletonRow());
+        app.appendChild(skeletonRow());
+    }
 
-    const [homeRes, trendingRes, historyRes] = await Promise.allSettled([
-        api.home(1),
+    // Launch all requests in parallel, but paint the home rows as soon as
+    // they arrive — never wait for trending/history before showing titles.
+    const homePromise = pre ? Promise.resolve(pre) : api.home(1);
+    const extrasPromise = Promise.allSettled([
         api.trending(1),
         isAuthed() ? api.history() : Promise.resolve([]),
     ]);
 
+    let homeRes = null;
+    let homeErr = null;
+    try {
+        homeRes = await homePromise;
+    } catch (e) {
+        homeErr = e;
+    }
+
     clear(app);
 
-    const sections = homeRes.status === 'fulfilled' ? (homeRes.value.sections || []) : [];
-    const trending = trendingRes.status === 'fulfilled' ? (trendingRes.value.items || []) : [];
-
-    if (!sections.length && !trending.length) {
-        app.appendChild(errorState(
-            homeRes.reason?.message || 'Could not load content from the provider.',
-            () => homePage(app),
-        ));
+    const sections = (homeRes?.sections || []).filter((s) => !HIDDEN_HOME_SECTIONS.has(s.title));
+    if (!sections.length) {
+        const [t, h] = await extrasPromise;
+        const trending = t.status === 'fulfilled' ? (t.value.items || []) : [];
+        if (!trending.length) {
+            clear(app);
+            app.appendChild(errorState(
+                homeErr?.message || 'Could not load content from the provider.',
+                () => homePage(app),
+            ));
+            return;
+        }
+        app.appendChild(row('Les plus regardés', trending));
+        attachHomeInfiniteScroll(app, null);
         return;
     }
 
-    const heroItem = (sections[0]?.items || trending)[0];
+    // Hero paints first (title + cover), then the rows appear one by one so
+    // the page renders progressively instead of all at once.
+    const heroItem = sections[0]?.items?.[0];
     if (heroItem) {
         const heroNode = hero(heroItem);
         app.appendChild(heroNode);
         loadHeroTrailer(heroNode);
     }
 
-    if (historyRes.status === 'fulfilled' && historyRes.value.length) {
-        app.appendChild(continueRow(historyRes.value));
+    // Progressive insertion: a few rows per frame so the browser paints
+    // titles/placeholders immediately while images fade in below.
+    const paintRows = async (rows) => {
+        for (let i = 0; i < rows.length; i++) {
+            app.appendChild(row(rows[i].title, rows[i].items));
+            if (i % 3 === 2) {
+                await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+            }
+        }
+    };
+    await paintRows(sections.map((s) => ({ title: s.title, items: s.items })));
+
+    // Continue-watching fills in when ready.
+    const [, h] = await extrasPromise;
+    if (h.status === 'fulfilled' && h.value.length) {
+        app.appendChild(continueRow(h.value));
     }
 
-    if (trending.length) app.appendChild(row('Les plus regardés', trending));
-    sections.forEach((s) => app.appendChild(row(s.title, s.items)));
+    attachHomeInfiniteScroll(app, homeRes);
+}
 
-    // Infinite scroll: keep fetching the next home page and appending rows.
+/**
+ * Infinite scroll for the home page: fetches the next pages of editorial
+ * rows and appends them when the sentinel enters the viewport.
+ */
+function attachHomeInfiniteScroll(app, homeRes) {
     const sentinel = el('div', { class: 'infinite-sentinel' });
     app.appendChild(sentinel);
 
     let page = 2;
     let loading = false;
-    let done = !homeRes.value?.pager?.hasMore;
+    let done = !homeRes?.pager?.hasMore;
     let observer = null;
     const seen = new Set();
 
@@ -106,7 +167,7 @@ export async function homePage(app) {
         sentinel.appendChild(el('div', { class: 'infinite-loader' }, [el('div', { class: 'spinner' })]));
         try {
             const data = await api.home(page);
-            const next = data.sections || [];
+            const next = (data.sections || []).filter((s) => !HIDDEN_HOME_SECTIONS.has(s.title));
             if (!next.length || !data.pager?.hasMore) done = true;
             next.forEach((s) => {
                 const items = (s.items || []).filter((i) => {
@@ -218,7 +279,7 @@ function onReachBottom(sentinel, cb) {
 
 // Paginated grid with ADVANCED client-side filters (genre / year / min rating /
 // sort) + INFINITE SCROLL. fetchPage(page) -> { items, pager: { hasMore } }.
-function filterableGrid(container, fetchPage, { emptyMsg = 'Rien à afficher.' } = {}) {
+function filterableGrid(container, fetchPage, { emptyMsg = 'Rien à afficher.', preload = null } = {}) {
     const genreSel = el('select', { class: 'select' }, [el('option', { value: '', text: 'Tous les genres' })]);
     const yearSel = el('select', { class: 'select' }, [el('option', { value: '', text: 'Toutes les années' })]);
     const ratingSel = el('select', { class: 'select' }, [
@@ -302,15 +363,31 @@ function filterableGrid(container, fetchPage, { emptyMsg = 'Rien à afficher.' }
         if (loading || done) return;
         loading = true;
         clear(sentinel);
+        // SSR hydration: the server already rendered the full pool, seed the
+        // grid from it without any network call.
+        if (preload && page === 1) {
+            const items = preload.items || [];
+            all = all.concat(items);
+            populateFilters();
+            render();
+            page += 1;
+            if (!preload.pager || !preload.pager.hasMore || !items.length) stop();
+            loading = false;
+            preload = null;
+            return;
+        }
         sentinel.appendChild(el('div', { class: 'infinite-loader' }, [el('div', { class: 'spinner' })]));
         try {
             const data = await fetchPage(page);
-            all = all.concat(data.items || []);
+            const items = data.items || [];
+            all = all.concat(items);
             populateFilters();
             render();
             page += 1;
             clear(sentinel);
-            if (!data.pager || !data.pager.hasMore) stop();
+            // Stop as soon as a page returns nothing (top-rated/recent pools
+            // are small): keeps infinite scroll from probing empty pages.
+            if (!data.pager || !data.pager.hasMore || !items.length) stop();
         } catch (e) {
             clear(sentinel);
             sentinel.appendChild(errorState(e.message, () => { loading = false; load(); }));
@@ -336,7 +413,8 @@ export async function categoryPage(app, tab, title) {
     clear(app);
     const container = el('div', { class: 'container' }, [el('h2', { class: 'section-title', text: title })]);
     app.appendChild(container);
-    filterableGrid(container, (page) => api.category(tab, page), { emptyMsg: 'Aucun contenu pour le moment.' });
+    const preload = takePageData(`category:${tab}`);
+    filterableGrid(container, (page) => api.category(tab, page), { emptyMsg: 'Aucun contenu pour le moment.', preload });
 }
 
 // ---------- LOCAL CATALOG (MySQL) ----------
@@ -509,8 +587,15 @@ export async function searchPage(app, params) {
 }
 
 // ---------- DETAIL ----------
-export async function detailPage(app, params) {
+export async function detailPage(app, params, slug) {
     clear(app);
+
+    const pre = takePageData('detail');
+    if (pre) {
+        // SSR: full payload embedded in the page — render immediately.
+        renderDetail(app, pre, params);
+        return;
+    }
 
     // Progressive paint: the title/cover are already in the URL, so show them
     // immediately while the full detail (metadata, seasons, cast) loads.
@@ -532,6 +617,19 @@ export async function detailPage(app, params) {
         app.appendChild(loadingState());
     }
 
+    // /title/{slug}: no subjectId in the URL — resolve it server-side first.
+    if (!params.get('subjectId') && slug) {
+        try {
+            const r = await api.resolve(slug);
+            params = new URLSearchParams(params);
+            params.set('subjectId', r.subjectId);
+        } catch (e) {
+            clear(app);
+            app.appendChild(errorState(e.message, () => detailPage(app, params, slug)));
+            return;
+        }
+    }
+
     const query = {
         subjectId: params.get('subjectId'),
         detailPath: params.get('detailPath'),
@@ -545,7 +643,7 @@ export async function detailPage(app, params) {
         data = await api.detail(query);
     } catch (e) {
         clear(app);
-        app.appendChild(errorState(e.message, () => detailPage(app, params)));
+        app.appendChild(errorState(e.message, () => detailPage(app, params, slug)));
         return;
     }
 
@@ -807,12 +905,38 @@ export async function watchPage(app, params) {
 
     const shell = el('div', { class: 'player-shell' }, [loadingState('Préparation du flux…')]);
     const toolbar = el('div', { class: 'player-toolbar' });
-    const shortTitle = displayTitle(item);
-    const label = season > 0 ? `${shortTitle} — S${season} E${episode}` : shortTitle;
+    const label = () => {
+        const shortTitle = displayTitle(item);
+        return season > 0 ? `${shortTitle} — S${season} E${episode}` : shortTitle;
+    };
+    const titleEl = el('h1', { class: 'watch-title', text: item.title ? label() : '' });
+
+    // Short /w/{code} URLs carry no title/cover/detailPath — resolve the item
+    // locally (instant, always works for catalog rows) and repaint the title
+    // when it lands; the full live detail is only a fallback for items the
+    // local store does not know yet.
+    if (!item.title || !item.cover || !item.detailPath) {
+        (async () => {
+            const apply = (src) => {
+                item.title = src.title || item.title;
+                item.cover = src.cover || item.cover;
+                item.detailPath = src.detailPath ?? item.detailPath;
+                titleEl.textContent = label();
+            };
+            try {
+                const row = await api.item(item.subjectId);
+                if (row && row.title) return apply(row);
+            } catch { /* fall through to the full detail */ }
+            try {
+                const d = await api.detail({ subjectId: item.subjectId, detailPath: item.detailPath, subjectType: item.subjectType, title: item.title, cover: item.cover });
+                if (d && d.item) apply(d.item);
+            } catch { /* keep whatever the URL gave us */ }
+        })();
+    }
 
     // Left column: video player + toolbar.
     const main = el('div', { class: 'watch-main' }, [
-        el('h1', { class: 'watch-title', text: label || 'Lecture en cours' }),
+        titleEl,
         shell,
         toolbar,
     ]);

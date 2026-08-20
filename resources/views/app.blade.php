@@ -5,8 +5,24 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <meta name="theme-color" content="#0b0b0f">
     <meta name="csrf-token" content="{{ csrf_token() }}">
-    <title>{{ config('app.name', 'MovieBox Stream') }}</title>
-    <meta name="description" content="Search, browse and stream movies and TV series.">
+    <title>{{ $page['title'] ?? config('app.name', 'MovieBox Stream') }}</title>
+    <meta name="description" content="{{ $page['description'] ?? 'Search, browse and stream movies and TV series.' }}">
+    @if (! empty($page['data']['item']))
+        <meta property="og:type" content="video.movie">
+        <meta property="og:title" content="{{ $page['data']['item']['displayTitle'] ?? $page['data']['item']['title'] ?? $page['title'] ?? '' }}">
+        <meta property="og:description" content="{{ mb_substr((string) ($page['data']['item']['description'] ?? ''), 0, 160) }}">
+        @if (! empty($page['data']['item']['cover']))
+            <meta property="og:image" content="{{ $page['data']['item']['cover'] }}">
+        @endif
+    @else
+        <meta property="og:type" content="website">
+        <meta property="og:title" content="{{ $page['title'] ?? config('app.name', 'MovieBox Stream') }}">
+    @endif
+    <meta property="og:site_name" content="{{ config('app.name', 'MovieBox Stream') }}">
+    <link rel="canonical" href="{{ url(request()->path()) }}">
+    @if (! empty($page['jsonLd']))
+        <script type="application/ld+json">@json($page['jsonLd'])</script>
+    @endif
     {{-- Warm the image/CDN connections so banners and posters paint sooner. --}}
     <link rel="preconnect" href="https://pbcdn.aoneroom.com" crossorigin>
     <link rel="preconnect" href="https://pacdn.aoneroom.com" crossorigin>
@@ -52,7 +68,12 @@
         </div>
     </header>
 
-    <main id="app" class="app-main" aria-live="polite"></main>
+    <main id="app" class="app-main" aria-live="polite">{!! $ssrHtml ?? '' !!}</main>
+
+    {{-- SSR page payload: the SPA hydrates from it without an extra API call. --}}
+    @if (! empty($page['data']))
+        <script id="page-data" type="application/json">{!! json_encode(['type' => $pageType ?? '', 'data' => $page['data']], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) !!}</script>
+    @endif
 
     <nav class="bottom-nav" id="bottom-nav" aria-label="Navigation">
         <a href="/" data-link data-nav="/">

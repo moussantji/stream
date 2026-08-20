@@ -72,28 +72,45 @@ export function displayTitle(item) {
     return translateTitleTags(item.title) || 'Untitled';
 }
 
+// Short title code: base62 token of subjectId+subjectType, mirroring
+// App\Support\ShortId (the trailing two digits of the raw string are the
+// subject type).
+const SHORT_ALPHABET = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+
+export function shortCode(subjectId, subjectType = 0) {
+    const raw = String(subjectId) + String(Number(subjectType) % 100).padStart(2, '0');
+    let num = BigInt(raw);
+    if (num === 0n) return '0';
+    let out = '';
+    while (num > 0n) {
+        out = SHORT_ALPHABET[Number(num % 62n)] + out;
+        num /= 62n;
+    }
+    return out;
+}
+
+export function shortDecode(code) {
+    let num = 0n;
+    for (const ch of String(code || '')) {
+        const v = SHORT_ALPHABET.indexOf(ch);
+        if (v < 0) return null;
+        num = num * 62n + BigInt(v);
+    }
+    const raw = num.toString();
+    if (raw.length < 3) return null;
+    return {
+        subjectId: raw.slice(0, -2),
+        subjectType: Number(raw.slice(-2)),
+    };
+}
+
 export function detailHref(item) {
-    const p = new URLSearchParams({
-        subjectId: item.subjectId,
-        detailPath: item.detailPath || '',
-        subjectType: item.subjectType ?? 0,
-    });
-    if (item.title) p.set('title', item.title);
-    if (item.cover) p.set('cover', item.cover);
-    return `/title?${p.toString()}`;
+    // Canonical short URL: /t/{code} — short and reversible, no long query.
+    return `/t/${shortCode(item.subjectId, item.subjectType ?? 0)}`;
 }
 
 export function watchHref(item, season = 0, episode = 0) {
-    const p = new URLSearchParams({
-        subjectId: item.subjectId,
-        detailPath: item.detailPath || '',
-        subjectType: item.subjectType ?? 0,
-        season,
-        episode,
-    });
-    if (item.title) p.set('title', item.title);
-    if (item.cover) p.set('cover', item.cover);
-    return `/watch?${p.toString()}`;
+    return `/w/${shortCode(item.subjectId, item.subjectType ?? 0)}/${season}/${episode}`;
 }
 
 const PLAY_ICON = '<svg viewBox="0 0 24 24" width="22" height="22" fill="#fff"><path d="M8 5v14l11-7z"/></svg>';

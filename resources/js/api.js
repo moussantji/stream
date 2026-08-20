@@ -130,6 +130,8 @@ export const api = {
     channels: () => unwrap(request('channels')),
     local: (params) => unwrap(request('local', { params })),
     detail: (params) => unwrap(request('detail', { params })),
+    item: (subjectId) => unwrap(request('item', { params: { subjectId } })),
+    resolve: (path) => unwrap(request('resolve', { params: { path } })),
     suggestions: (params) => unwrap(request('suggestions', { params })),
 
     // ---- Streaming ----

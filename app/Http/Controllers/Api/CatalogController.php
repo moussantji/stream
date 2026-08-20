@@ -64,6 +64,31 @@ class CatalogController extends Controller
         return $this->itunes ??= app(ItunesClient::class);
     }
 
+    /**
+     * Descending sort by API rating, then by release year (newest first).
+     *
+     * @param  array<string,mixed>  $a
+     * @param  array<string,mixed>  $b
+     */
+    protected static function rankDesc(array $a, array $b): int
+    {
+        $cmp = (float) ($b['imdbRating'] ?? 0) <=> (float) ($a['imdbRating'] ?? 0);
+
+        return $cmp !== 0 ? $cmp : ((int) ($b['year'] ?? 0) <=> (int) ($a['year'] ?? 0));
+    }
+
+    /** First non-empty string, else null. */
+    protected static function firstNonEmpty(mixed ...$values): ?string
+    {
+        foreach ($values as $value) {
+            if (is_string($value) && trim($value) !== '') {
+                return $value;
+            }
+        }
+
+        return null;
+    }
+
     // -----------------------------------------------------------------
     // Discovery
     // -----------------------------------------------------------------
@@ -71,8 +96,18 @@ class CatalogController extends Controller
     /** French-oriented home rows (persisted to MySQL, stale-if-error). */
     public function home(Request $request): JsonResponse
     {
-        $page = max(1, (int) $request->input('page', 1));
+        return response()->json(['data' => $this->homeData(max(1, (int) $request->input('page', 1)))]);
+    }
 
+    /**
+     * Home payload shared by the JSON API and the SSR web controller: rows
+     * filtered at serve time (cache stores unfiltered data) so admin blocklist
+     * / keyword changes hide titles immediately.
+     *
+     * @return array{sections:array<int,array<string,mixed>>,pager:array{page:int,hasMore:bool}}
+     */
+    public function homeData(int $page): array
+    {
         try {
             $data = $this->repo->remember(
                 'catalog:home:'.$page,
@@ -88,20 +123,168 @@ class CatalogController extends Controller
             $data = ['sections' => [], 'pager' => ['page' => $page, 'hasMore' => false]];
         }
 
-        // Filter at serve time (cache stores unfiltered data) so admin blocklist
-        // / keyword changes hide titles immediately.
+        $target = max(10, (int) config('moviebox.home_section_size', 20));
         $sections = [];
+        // Pool window for this page: page 1 pads from the top of each pool,
+        // page 2 from the next block, etc. — so the padding of later pages
+        // shows NEW titles instead of repeating page 1 (the client already
+        // drops duplicates across pages, which emptied the rows).
+        $poolOffset = ($page - 1) * $target;
+        // Seed with every subject shown on the previous pages (their cached
+        // snapshots), mirroring the client's cross-page dedup: feed items that
+        // repeat earlier pages are dropped server-side and replaced by fresh
+        // padding, so infinite-scroll rows stay full.
+        $pageSeen = [];
+        if ($page > 1) {
+            try {
+                $prior = \App\Models\CatalogSnapshot::query()
+                    ->where('cache_key', 'like', 'catalog:home:%')
+                    ->where('cache_key', '!=', 'catalog:home:'.$page)
+                    ->get(['payload']);
+                foreach ($prior as $snap) {
+                    $prev = json_decode((string) $snap->payload, true);
+                    foreach (($prev['sections'] ?? []) as $s) {
+                        foreach (($s['items'] ?? []) as $item) {
+                            $pageSeen[$item['subjectId'] ?? null] = true;
+                        }
+                    }
+                }
+            } catch (\Throwable $e) {
+                report($e);
+            }
+        }
         foreach (($data['sections'] ?? []) as $section) {
             $items = ContentFilter::apply($section['items'] ?? []);
+            // Top-rated & recent only, straight from the provider's own fields:
+            // rating >= 7 AND year >= 2024, sorted by rating then year.
+            $items = array_values(array_filter($items, fn (array $item) => ContentFilter::isTopOnly($item)));
+            usort($items, fn (array $a, array $b) => self::rankDesc($a, $b));
             if ($items !== []) {
-                $section['items'] = $items;
+                // Short editorial rows (the provider sends a handful of titles)
+                // are padded up to the target size with qualified titles of the
+                // same type, so every home section shows a full row.
+                $section['items'] = $this->fillHomeSection($items, (string) ($section['title'] ?? ''), $target, $poolOffset, $pageSeen);
                 $sections[] = $section;
             }
         }
         $data['sections'] = $sections;
         $data['pager'] = ['page' => $page, 'hasMore' => $sections !== [] && ($data['pager']['hasMore'] ?? false)];
 
-        return response()->json(['data' => $data]);
+        return $data;
+    }
+
+    /**
+     * Pad a home section up to $target titles with the qualified pool of the
+     * matching type (films / series / animation), de-duplicated by subject id.
+     * The provider's editorial rows only carry a handful of titles, so without
+     * this most home sections would render one or two cards after filtering.
+     *
+     * $poolOffset shifts the window into the pool so later pages pad with
+     * fresh titles instead of repeating page 1; $pageSeen accumulates every
+     * subject id already used on this page (feed items + padding), so two
+     * sections of the same page never show the same card.
+     *
+     * @param  array<int,array<string,mixed>>  $items
+     * @param  array<int,array<string,mixed>>  $poolSeen
+     * @return array<int,array<string,mixed>>
+     */
+    protected function fillHomeSection(array $items, string $title, int $target, int $poolOffset, array &$pageSeen): array
+    {
+        // Mirror the client's cross-section dedup: feed items already shown
+        // earlier on this page are dropped here too, so the padding fills the
+        // freed slots and the row renders full instead of leaving holes.
+        $items = array_values(array_filter($items, function (array $item) use (&$pageSeen): bool {
+            $id = $item['subjectId'] ?? null;
+            if (isset($pageSeen[$id])) {
+                return false;
+            }
+            $pageSeen[$id] = true;
+
+            return true;
+        }));
+        if (count($items) >= $target) {
+            return $items;
+        }
+
+        $lower = mb_strtolower($title);
+        $isAnime = str_contains($lower, 'anim') || str_contains($lower, 'enfant') || str_contains($lower, 'dessin');
+        $isSeries = ! $isAnime && (str_contains($lower, 'série') || str_contains($lower, 'serie') || str_contains($lower, 'émission') || str_contains($lower, 'emission'));
+
+        $candidates = [];
+        try {
+            if ($isAnime) {
+                // Anime rows keep their own curation rules: the animation pool
+                // (search-based, metadata-gated) — no rating/year gate, so the
+                // row can actually reach the target size. The search pool is
+                // small (and sometimes empty when its last rebuild failed), so
+                // it is supplemented with the persisted local anime titles —
+                // qualified (rating >= 7, year >= 2024) first, then the rest,
+                // matching the top-only character of the other rows.
+                $pool = $this->ensureCategoryPool(SubjectType::ANIME->value, 'animation', $target * 3, false);
+                foreach (ContentFilter::apply($pool['items']) as $item) {
+                    if ($this->searchGate($item)) {
+                        $candidates[] = $item;
+                    }
+                }
+
+                try {
+                    $local = CatalogItem::query()
+                        ->whereNotNull('cover')
+                        ->whereNotNull('payload')
+                        ->where(function ($q) {
+                            $q->where('subject_type', SubjectType::ANIME->value)
+                                ->orWhere('title', 'like', '%anim%');
+                        })
+                        ->orderByDesc('imdb_rating')
+                        ->limit(300)
+                        ->get();
+                    foreach ($local as $row) {
+                        $item = json_decode((string) $row->payload, true);
+                        if (! is_array($item) || empty($item['subjectId']) || ContentFilter::isBlocked($item)) {
+                            continue;
+                        }
+                        $candidates[] = $item;
+                    }
+                } catch (\Throwable $e) {
+                    report($e);
+                }
+
+                usort($candidates, fn (array $a, array $b) =>
+                    (ContentFilter::isTopOnly($b) <=> ContentFilter::isTopOnly($a))
+                    ?: ((float) ($b['imdbRating'] ?? 0) <=> (float) ($a['imdbRating'] ?? 0)));
+            } elseif ($isSeries) {
+                $pool = $this->ensureCategoryPool(SubjectType::TV_SERIES->value, 'series', $target * 3, true);
+                $candidates = array_values(array_filter($pool['items'], fn (array $item) => ContentFilter::isTopOnly($item)));
+            } else {
+                $pool = $this->ensureCategoryPool(SubjectType::MOVIES->value, 'films', $target * 3, true);
+                $candidates = array_values(array_filter($pool['items'], fn (array $item) => ContentFilter::isTopOnly($item)));
+            }
+        } catch (\Throwable $e) {
+            report($e);
+
+            $candidates = [];
+        }
+
+        // Window into the pool for this page; wraps around when exhausted so
+        // a long infinite scroll still finds candidates (seen-skip prevents
+        // duplicates).
+        $walk = array_merge(
+            array_slice($candidates, $poolOffset),
+            array_slice($candidates, 0, $poolOffset)
+        );
+
+        foreach ($walk as $item) {
+            if (isset($pageSeen[$item['subjectId'] ?? null])) {
+                continue;
+            }
+            $pageSeen[$item['subjectId'] ?? null] = true;
+            $items[] = $item;
+            if (count($items) >= $target) {
+                break;
+            }
+        }
+
+        return $items;
     }
 
     /**
@@ -462,32 +645,55 @@ class CatalogController extends Controller
     /** Category browse (films / séries / animation) from tab-operating (paginated). */
     public function category(Request $request): JsonResponse
     {
-        $slug = strtolower((string) $request->input('tab', 'films'));
-        $config = self::CATEGORIES[$slug] ?? self::CATEGORIES['films'];
-        $page = max(1, (int) $request->input('page', 1));
-        $perPage = max(10, min(40, (int) config('moviebox.category_page_size', 20)));
+        return response()->json(['data' => $this->categoryData(
+            strtolower((string) $request->input('tab', 'films')),
+            max(1, (int) $request->input('page', 1)),
+        )]);
+    }
 
-        // The raw upstream tab is a fixed 5-tile panel that ignores pagination.
-        // A category page is instead backed by an ever-growing pool of French
-        // search results: when the requested page goes past the pool, it is
-        // extended with the next search pages on the fly, so infinite scroll
-        // genuinely keeps going until the upstream results run out.
+    /**
+     * Category payload shared by the JSON API and the SSR web controller.
+     * Films & series pages are single-shot: the whole qualified pool is built
+     * (and cached) on the first request and returned in one response, so the
+     * client never paginates. The animation tab keeps its paginated pool
+     * (thousands of entries, filters client-side).
+     *
+     * @return array{title:string,items:array<int,array<string,mixed>>,pager:array{page:int,hasMore:bool}}
+     */
+    public function categoryData(string $slug, int $page): array
+    {
+        $config = self::CATEGORIES[$slug] ?? self::CATEGORIES['films'];
+        $perPage = max(10, min(40, (int) config('moviebox.category_page_size', 20)));
         $animeHint = in_array($slug, ['animation', 'anime'], true);
+        $oneShot = ! $animeHint;
 
         try {
-            $pool = $this->ensureCategoryPool($config['tab'], $slug, $page * $perPage);
+            $needed = $oneShot
+                ? (int) config('moviebox.category_pool_cap', 300)
+                : $page * $perPage;
+            $pool = $this->ensureCategoryPool($config['tab'], $slug, $needed, $oneShot);
 
             // Serve-time guard: drops adult/hentai items (verdicts are cached, so
             // this also purges pools built before the guard existed). The
             // animation/anime categories additionally require the metadata to
             // confirm the title really is animation, so search junk (Nollywood
             // videos, songs, wrestling clips…) never pollutes the category.
-            $items = ContentFilter::apply(array_slice($pool['items'], ($page - 1) * $perPage, $perPage));
-            $items = array_values(array_filter(
-                $items,
+            $all = array_values(array_filter(
+                ContentFilter::apply($pool['items']),
                 fn (array $item) => $this->searchGate($item)
             ));
-            $hasMore = count($pool['items']) > $page * $perPage || ! $pool['exhausted'];
+
+            // Films & series pages show only the provider's top-rated and
+            // recent titles (rating >= 7 AND year >= 2024, on the API's own
+            // fields), sorted by rating then year. The animation tab keeps
+            // its own curation rules.
+            if (! $animeHint) {
+                $all = array_values(array_filter($all, fn (array $item) => ContentFilter::isTopOnly($item)));
+                usort($all, fn (array $a, array $b) => self::rankDesc($a, $b));
+            }
+
+            $items = $oneShot ? $all : array_slice($all, ($page - 1) * $perPage, $perPage);
+            $hasMore = $oneShot ? false : (count($all) > $page * $perPage || ! $pool['exhausted']);
         } catch (\Throwable $e) {
             report($e);
 
@@ -495,30 +701,45 @@ class CatalogController extends Controller
             $hasMore = false;
         }
 
-        return response()->json(['data' => [
+        return [
             'title' => $config['title'],
             'items' => $items,
             'pager' => ['page' => $page, 'hasMore' => $hasMore],
-        ]]);
+        ];
     }
 
     /**
      * Return the category pool, extending it with deeper search pages until it
      * holds at least $needed items (or the upstream results are exhausted).
+     * When $qualifiedOnly is set, "enough" means enough items passing the
+     * top-rated/recent filter, so films & series pages always fill a page.
      *
      * @return array{items:array<int,array<string,mixed>>,exhausted:bool}
      */
-    protected function ensureCategoryPool(int $tabId, string $slug, int $needed): array
+    protected function ensureCategoryPool(int $tabId, string $slug, int $needed, bool $qualifiedOnly = false): array
     {
         $key = "catalog:category-pool:{$tabId}";
         $maxDepth = max(1, (int) config('moviebox.category_search_depth', 5));
+
+        $usableCount = function (array $items) use ($qualifiedOnly): int {
+            if (! $qualifiedOnly) {
+                return count($items);
+            }
+
+            return count(array_filter($items, fn (array $i) => ContentFilter::isTopOnly($i)));
+        };
 
         $data = Cache::get($key);
         if (! is_array($data)) {
             $data = [
                 'items' => [],
                 'depth' => 0,
-                'type' => in_array($tabId, [2, 5], true) ? SubjectType::TV_SERIES->value : SubjectType::MOVIES->value,
+                // Subject type of the tab: films and animation pools are
+                // movies (1), series/emissions pools are TV series (2) — the
+                // upstream search matches these enum values exactly.
+                'type' => in_array($slug, ['series', 'emissions'], true)
+                    ? SubjectType::TV_SERIES->value
+                    : SubjectType::MOVIES->value,
                 'queries' => array_values(array_filter((array) config("moviebox.category_queries.$slug", []))),
                 'exhausted' => false,
             ];
@@ -538,7 +759,10 @@ class CatalogController extends Controller
             }
         }
 
-        while (count($data['items']) < $needed && ! $data['exhausted'] && $data['depth'] < $maxDepth) {
+        while ($usableCount($data['items']) < $needed
+            && ! $data['exhausted']
+            && $data['depth'] < $maxDepth
+            && empty($data['local_loaded'])) {
             $page = $data['depth'] + 1;
 
             // All queries of this depth run in ONE concurrent H5 batch (the
@@ -553,53 +777,63 @@ class CatalogController extends Controller
                     if ($sid === null) {
                         continue;
                     }
+                    // Normalize here so pools carry the API's rating/year
+                    // (imdbRatingValue/releaseDate) and the display shape the
+                    // frontend expects (coverSmall, french, displayTitle…).
+                    $normalized = ItemNormalizer::one($item);
+                    if ($normalized === null) {
+                        continue;
+                    }
+                    $sid = $normalized['subjectId'];
                     if (! isset($data['seen'][$sid])) {
                         $data['seen'][$sid] = true;
-                        $data['items'][] = $item;
+                        $data['items'][] = $normalized;
                         $extended = true;
                     }
                 }
             }
             $data['depth'] += 1;
-            if (! $extended) {
-                // The H5 French-queryable pool is bounded (~150 titles); extend
-                // with the persisted local catalog so scrolling keeps going.
-                if (empty($data['local_loaded'])) {
-                    $data['local_loaded'] = true;
-                    $local = CatalogItem::query()
-                        ->orderByDesc('seen_count')
-                        ->limit(600)
-                        ->get();
-                    foreach ($local as $row) {
-                        $normalized = ItemNormalizer::one([
-                            'subjectId' => (string) $row->subject_id,
-                            'subjectType' => (int) $row->subject_type,
-                            'title' => $row->title,
-                            'cover' => $row->cover,
-                            'description' => $row->description,
-                            'genres' => $row->genres,
-                            'imdbRating' => $row->imdb_rating,
-                            'releaseDate' => $row->release_date,
-                            'year' => $row->year,
-                            'durationSeconds' => $row->duration_seconds,
-                            'country' => $row->country,
-                            'detailPath' => $row->detail_path,
-                            'hasResource' => true,
-                        ]);
-                        if ($normalized === null) {
-                            continue;
-                        }
-                        $sid = $normalized['subjectId'];
-                        if (! isset($data['seen'][$sid])) {
-                            $data['seen'][$sid] = true;
-                            $data['items'][] = $normalized;
-                            $extended = true;
-                        }
+
+            // The H5 French-queryable pool is bounded (~150 titles); extend
+            // with the persisted local catalog when the pool still can't
+            // satisfy the page (raw count, or qualified count when the
+            // top-rated/recent filter is active).
+            if ($usableCount($data['items']) < $needed && empty($data['local_loaded'])) {
+                $data['local_loaded'] = true;
+                $local = CatalogItem::query()
+                    ->where('subject_type', $data['type'])
+                    ->orderByDesc('seen_count')
+                    ->limit($qualifiedOnly ? 2000 : 600)
+                    ->get();
+                foreach ($local as $row) {
+                    $normalized = ItemNormalizer::one([
+                        'subjectId' => (string) $row->subject_id,
+                        'subjectType' => (int) $row->subject_type,
+                        'title' => $row->title,
+                        'cover' => $row->cover,
+                        'description' => $row->description,
+                        'genres' => $row->genres,
+                        'imdbRating' => $row->imdb_rating,
+                        'releaseDate' => $row->release_date,
+                        'year' => $row->year,
+                        'durationSeconds' => $row->duration_seconds,
+                        'country' => $row->country,
+                        'detailPath' => $row->detail_path,
+                        'hasResource' => true,
+                    ]);
+                    if ($normalized === null) {
+                        continue;
+                    }
+                    $sid = $normalized['subjectId'];
+                    if (! isset($data['seen'][$sid])) {
+                        $data['seen'][$sid] = true;
+                        $data['items'][] = $normalized;
+                        $extended = true;
                     }
                 }
-                if (! $extended) {
-                    $data['exhausted'] = true;
-                }
+            }
+            if (! $extended && $data['local_loaded']) {
+                $data['exhausted'] = true;
             }
             Cache::put($key, $data, $this->ttl());
         }
@@ -710,11 +944,82 @@ class CatalogController extends Controller
         );
 
         $data['items'] = VersionFilter::apply($data['items'] ?? []);
+        // Serve-time filter: the cached payload may predate the latest blocked
+        // keywords / subject types, so re-run the filter on every request.
+        $data['items'] = ContentFilter::apply($data['items'] ?? []);
         // Metadata gate at serve time: titles like "XXX: The Animation"
         // (mostly hentai) must be confirmed as real animation or are dropped.
         $data['items'] = array_values(array_filter($data['items'], fn (array $item) => $this->searchGate($item)));
 
+        // Loose local fallback: the upstream search matches the query literally,
+        // so "from francais" finds nothing while the title is stored as
+        // "From [Version française]". When upstream yields nothing, match every
+        // word of the query against the local titles (the DB collation is
+        // accent- and case-insensitive, so "francais" matches "française").
+        if (($data['items'] ?? []) === []) {
+            $local = $this->localSearch($q, $type, $perPage * 2);
+            if ($local !== []) {
+                $data['items'] = $local;
+                $data['pager'] = ['page' => $page, 'perPage' => $perPage, 'hasMore' => false];
+            }
+        }
+
         return response()->json(['data' => $data]);
+    }
+
+    /**
+     * Local catalog search: every query word must appear in the title (accent-
+     * and case-insensitive via the DB collation), same serve-time filters as
+     * the upstream search.
+     *
+     * @return array<int,array<string,mixed>>
+     */
+    protected function localSearch(string $q, SubjectType $type, int $limit = 20): array
+    {
+        $words = array_values(array_filter(
+            preg_split('/\s+/u', mb_strtolower(trim($q))),
+            fn (string $w) => mb_strlen($w) > 1
+        ));
+
+        if ($words === []) {
+            return [];
+        }
+
+        try {
+            $query = CatalogItem::query();
+            if ($type !== SubjectType::ALL) {
+                $query->where('subject_type', $type->value);
+            }
+            foreach ($words as $w) {
+                $query->where('title', 'like', '%'.$w.'%');
+            }
+            $rows = $query->orderByDesc('seen_count')->limit($limit)->get();
+        } catch (\Throwable $e) {
+            report($e);
+
+            return [];
+        }
+
+        $items = $rows->map(function (CatalogItem $r) {
+            $payload = is_array($r->payload) ? $r->payload : [];
+
+            return $payload + [
+                'subjectId' => $r->subject_id,
+                'subjectType' => $r->subject_type,
+                'typeLabel' => SubjectType::resolve($r->subject_type)->label(),
+                'title' => $r->title,
+                'cover' => $r->cover,
+                'year' => $r->year,
+                'imdbRating' => $r->imdb_rating,
+                'genres' => $r->genres ?? [],
+                'detailPath' => $r->detail_path,
+            ];
+        })->values()->all();
+
+        $items = VersionFilter::apply($items);
+        $items = ContentFilter::apply($items);
+
+        return array_values(array_filter($items, fn (array $item) => $this->searchGate($item)));
     }
 
     /** Autocomplete suggestions (not persisted — cheap + volatile). */
@@ -802,47 +1107,34 @@ class CatalogController extends Controller
             'cover' => ['sometimes', 'string'],
         ]);
 
+        return response()->json(['data' => $this->detailData($validated)]);
+    }
+
+    /**
+     * Detail payload shared by the JSON API and the SSR web controller: cached
+     * full build when fresh, stale-if-error, fast local paint otherwise — all
+     * gates (blocklist, adult, animation) apply on both surfaces.
+     *
+     * @param  array<string,mixed>  $validated
+     * @return array<string,mixed>
+     */
+    public function detailData(array $validated): array
+    {
         if (BlockedTitle::query()->where('term', $validated['subjectId'])->exists()) {
             abort(404, 'Content unavailable.');
         }
 
         // Debug bypasses the cache and includes a probe of the raw detail keys
         // so the real trailer field can be identified.
-        if ($request->boolean('debug')) {
-            return response()->json(['data' => $this->buildDetail($validated, true)]);
+        if (($validated['debug'] ?? false) === true) {
+            return $this->buildDetail($validated, true);
         }
 
-        $cacheKey = 'catalog:detail:'.$validated['subjectId'];
-
         try {
-            $stale = $this->repo->snapshotPayload($cacheKey);
-            // A stored payload that never resolved upstream (empty detail) is
-            // treated as missing so it can never be served as a "complete"
-            // page — the warm command no longer persists those, but older
-            // poisoned rows may still linger in the table.
-            if (is_array($stale) && ($stale['detailAvailable'] ?? true) === false) {
-                $stale = null;
-            }
-
-            if ($this->repo->isFreshSnapshot($cacheKey, $this->ttl())) {
-                $data = $this->repo->remember(
-                    $cacheKey,
-                    $this->ttl(),
-                    fn () => $this->buildDetail($validated),
-                    isEmpty: fn ($d) => empty($d['item']) || ($d['detailAvailable'] ?? false) === false,
-                );
-            } elseif ($stale !== null) {
-                // Stale but complete: serve it instantly, refill the cache in
-                // the background — the visitor never waits on the upstream.
-                $data = $stale;
-                $this->spawnDetailWarm($validated['subjectId'], (int) ($validated['subjectType'] ?? 0));
-            } else {
-                // Never seen before: paint instantly from the URL/local catalog
-                // (zero upstream calls); the background warm completes the
-                // metadata so the next visit returns the full payload.
-                $data = $this->buildFastDetail($validated);
-                $this->spawnDetailWarm($validated['subjectId'], (int) ($validated['subjectType'] ?? 0));
-            }
+            // No snapshot layer for details: always fetch live upstream so a
+            // stored row can never mask real metadata (poisoned "Untitled"
+            // snapshots) nor the URL-provided title/cover.
+            $data = $this->buildDetail($validated);
         } catch (\Throwable $e) {
             // Never a blank page: fall back to an unavailable shell.
             report($e);
@@ -869,7 +1161,77 @@ class CatalogController extends Controller
             abort(404, 'Content unavailable.');
         }
 
-        return response()->json(['data' => $data]);
+        return $data;
+    }
+
+    /**
+     * Resolve a detail slug (detailPath) to a subjectId: local catalog first,
+     * upstream H5 detail as fallback. Mapping is cached for a day.
+     */
+    public function resolveSubjectId(string $path): ?string
+    {
+        if (trim($path) === '') {
+            return null;
+        }
+
+        return Cache::remember('catalog:resolve:'.md5($path), 86400, function () use ($path) {
+            $sid = CatalogItem::query()->where('detail_path', $path)->value('subject_id');
+            if ($sid !== null) {
+                return (string) $sid;
+            }
+
+            try {
+                $detail = $this->client->h5Detail($path);
+                $sid = $detail['subjectId'] ?? $detail['item']['subjectId'] ?? null;
+
+                return $sid !== null ? (string) $sid : null;
+            } catch (\Throwable $e) {
+                report($e);
+
+                return null;
+            }
+        });
+    }
+
+    /** Resolve endpoint: slug -> subjectId for client-side navigation. */
+    public function resolve(Request $request): JsonResponse
+    {
+        $path = trim((string) $request->input('path', ''));
+        $subjectId = $this->resolveSubjectId($path);
+
+        if ($subjectId === null) {
+            abort(404, 'Unknown title.');
+        }
+
+        return response()->json(['data' => ['subjectId' => $subjectId, 'detailPath' => $path]]);
+    }
+
+    /** Lightweight local-catalog lookup by subjectId: title, cover, detailPath. */
+    public function item(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'subjectId' => ['required', 'string', 'max:64'],
+        ]);
+
+        $row = CatalogItem::query()->where('subject_id', $validated['subjectId'])->first();
+
+        if ($row === null) {
+            return response()->json(['data' => null]);
+        }
+
+        $payload = is_array($row->payload) ? $row->payload : [];
+
+        return response()->json(['data' => $payload + [
+            'subjectId' => $row->subject_id,
+            'subjectType' => $row->subject_type,
+            'typeLabel' => SubjectType::resolve($row->subject_type)->label(),
+            'title' => $row->title,
+            'cover' => $row->cover,
+            'year' => $row->year,
+            'imdbRating' => $row->imdb_rating,
+            'genres' => $row->genres ?? [],
+            'detailPath' => $row->detail_path,
+        ]]);
     }
 
     /** Health probe for the MovieBox backend connection + local storage stats. */
@@ -1128,6 +1490,12 @@ class CatalogController extends Controller
      */
     protected function searchGate(array $item): bool
     {
+        // Title hard block: "The Animation" hentai OVA pattern always drops,
+        // with no metadata round-trip.
+        if (ContentFilter::titleHardBlocked((string) ($item['title'] ?? ''))) {
+            return false;
+        }
+
         // Items carrying genres are already filtered for free by ContentFilter:
         // the upstream tags adult content with the genre "Adulte" (and the
         // search-sourced pools all carry genres) — nothing to verify here.
@@ -1199,6 +1567,12 @@ class CatalogController extends Controller
      */
     protected function animationGate(array $item): bool
     {
+        // Title hard block: "The Animation" is the hentai OVA naming pattern —
+        // always dropped, no metadata lookup.
+        if (ContentFilter::titleHardBlocked((string) ($item['title'] ?? ''))) {
+            return false;
+        }
+
         $clean = trim(preg_replace('/\s+/u', ' ', (string) preg_replace('/\[[^\]]*\]/u', '', (string) ($item['title'] ?? ''))));
         if ($clean === '') {
             return false;
@@ -1835,76 +2209,6 @@ class CatalogController extends Controller
         return $out;
     }
 
-    /** Fire a detached worker that resolves and caches the full detail. */
-    /**
-     * Instant first-paint payload: no upstream call at all. The item is rebuilt
-     * from the local persisted catalog (genres/year/rating/description) or, at
-     * worst, from the URL hints — the background warm then completes the full
-     * build (seasons/cast/dubs/trailer) into the snapshot for the next visit.
-     *
-     * @return array{item:array<string,mixed>,isSeries:bool,seasons:array,cast:array,dubs:array,trailer:null,recommendations:array,detailAvailable:false}
-     */
-    protected function buildFastDetail(array $validated): array
-    {
-        $subjectId = $validated['subjectId'];
-        $subjectType = (int) ($validated['subjectType'] ?? 0);
-
-        $local = CatalogItem::query()
-            ->where('subject_id', $subjectId)
-            ->first();
-
-        $item = [
-            'subjectId' => $subjectId,
-            'subjectType' => $subjectType,
-            'typeLabel' => SubjectType::resolve($subjectType)->label(),
-            'title' => $validated['title'] ?? $local->title ?? 'Untitled',
-            'displayTitle' => TextSanitizer::displayTitle($validated['title'] ?? $local->title ?? 'Untitled'),
-            'description' => $local->description ?? null,
-            'cover' => $validated['cover'] ?? $local->cover ?? null,
-            'coverSmall' => $local->cover ?? null,
-            'genres' => is_array($local->genres ?? null) ? $local->genres : [],
-            'releaseDate' => null,
-            'year' => $local->year ?? null,
-            'durationSeconds' => $local->duration_seconds ?? null,
-            'imdbRating' => $local->imdb_rating ?? null,
-            'country' => $local->country ?? null,
-            'seasonCount' => null,
-            'detailPath' => $local->detail_path ?? $validated['detailPath'] ?? null,
-            'hasResource' => true,
-        ];
-
-        $recommendations = [];
-        if (! empty($item['genres'])) {
-            $recommendations = $this->recommendationsFromLocal($item, 12);
-        }
-
-        return [
-            'item' => $item,
-            'isSeries' => $subjectType === SubjectType::TV_SERIES->value
-                || (int) ($item['seasonCount'] ?? 0) > 0,
-            'seasons' => [],
-            'cast' => [],
-            'dubs' => [],
-            'trailer' => null,
-            'recommendations' => $recommendations,
-            'detailAvailable' => false,
-        ];
-    }
-
-    protected function spawnDetailWarm(string $subjectId, int $subjectType): void
-    {
-        if (! Cache::add('catalog:detail-warm:'.$subjectId, true, 30)) {
-            return; // already warming
-        }
-
-        @shell_exec(sprintf(
-            'nohup %s artisan catalog:detail-warm %s %d > /dev/null 2>&1 &',
-            escapeshellarg(PHP_BINARY),
-            escapeshellarg($subjectId),
-            (int) $subjectType
-        ));
-    }
-
     protected function buildDetail(array $validated, bool $debug = false): array
     {
         $subjectId = $validated['subjectId'];
@@ -1934,10 +2238,10 @@ class CatalogController extends Controller
             'subjectId' => $subjectId,
             'subjectType' => (int) ($validated['subjectType'] ?? 0),
             'typeLabel' => SubjectType::resolve($validated['subjectType'] ?? 0)->label(),
-            'title' => $validated['title'] ?? 'Untitled',
-            'displayTitle' => TextSanitizer::displayTitle($validated['title'] ?? 'Untitled'),
+            'title' => self::firstNonEmpty($validated['title'] ?? null, 'Untitled'),
+            'displayTitle' => TextSanitizer::displayTitle(self::firstNonEmpty($validated['title'] ?? null, 'Untitled')),
             'description' => null,
-            'cover' => $validated['cover'] ?? null,
+            'cover' => self::firstNonEmpty($validated['cover'] ?? null),
             'genres' => [],
             'releaseDate' => null,
             'year' => null,

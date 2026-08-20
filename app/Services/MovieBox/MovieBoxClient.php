@@ -246,7 +246,25 @@ class MovieBoxClient
                         report($e);
                     }
                 }
-                $results[$keyword] = ['items' => []];
+
+                // Fallback to the signed mobile API (same path as search()):
+                // the H5 search endpoint is flaky and its subjects carry no
+                // imdbRatingValue/releaseDate, so pools built on it can't be
+                // ranked by rating/year.
+                try {
+                    $data = $this->postData(
+                        self::SEARCH,
+                        ['keyword' => $keyword, 'page' => $page, 'perPage' => $perPage, 'subjectType' => $subjectType],
+                        context: 'search'
+                    );
+                    if ($this->cacheTtl > 0) {
+                        Cache::put("moviebox:v3:$key", $data, $this->cacheTtl);
+                    }
+                    $results[$keyword] = $data;
+                } catch (Throwable $e) {
+                    report($e);
+                    $results[$keyword] = ['items' => []];
+                }
             }
         }
 

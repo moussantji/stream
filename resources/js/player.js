@@ -197,6 +197,7 @@ export class Player {
             // hide it as soon as real playback starts.
             this.errorEl.hidden = true;
             this.bigBtn.style.display = '';
+            this.scheduleDashAudioCheck();
         });
         v.addEventListener('canplay', () => this.hideSpinner());
         v.addEventListener('timeupdate', () => this.hideSpinner());
@@ -553,6 +554,26 @@ export class Player {
         }, { once: true });
     }
 
+    // DASH streams whose audio buffer is rejected by the browser decode pipeline
+    // (typically a HEVC video + AAC combo whose audio append silently fails)
+    // play the picture with no sound and never fire a `video error`. A couple of
+    // seconds into playback, verify the media actually carries an audio track and
+    // drop to the H.264 MP4 when it doesn't, so the sound comes back.
+    scheduleDashAudioCheck() {
+        if (!this.dash || this._triedAdaptiveFallback) return;
+        clearTimeout(this._dashAudioCheckT);
+        this._dashAudioCheckT = setTimeout(() => {
+            if (!this.dash || this._triedAdaptiveFallback) return;
+            const v = this.video;
+            if (v.audioTracks && v.audioTracks.length === 0 && v.currentTime > 0.3 && !v.paused) {
+                this._triedAdaptiveFallback = true;
+                this.destroyDash();
+                const mp4 = this.currentSources.find((s) => !isHevcSource(s)) || this.currentSources[0];
+                if (mp4 && mp4.url) this.setMp4(mp4);
+            }
+        }, 2000);
+    }
+
     // If playback fails (error, or metadata loaded but no video track), retry
     // through the hvc1 remux when the source is HEVC, else try the next
     // lower-quality source; if an adaptive (DASH/HLS) stream was playing, fall
@@ -651,10 +672,14 @@ export class Player {
                 },
             });
             this.dash.on(dashjs.MediaPlayer.events.ERROR, (event) => {
-                // The main "can't play at all" cases: no codec support or an
-                // unparsable manifest — fall back to an MP4 source.
+                // The main "can't play at all" cases: no codec support, an
+                // unparsable manifest, or an audio/video buffer the browser
+                // refused to append (which otherwise shows a silent picture) —
+                // fall back to an MP4 source.
                 const code = event && event.error && event.error.code;
-                if (code === 'capabilityError' || code === 'manifestError') {
+                if (code === 'capabilityError' || code === 'manifestError'
+                    || code === 'bufferError' || code === 'bufferAppendError'
+                    || code === 'fragmentedMediaSettingsError') {
                     this.onVideoError();
                 }
             });
@@ -678,10 +703,18 @@ export class Player {
             });
             this.video.appendChild(track);
         });
-        // Hide all tracks initially (custom CC control drives visibility).
-        Array.from(this.video.textTracks).forEach((t) => { t.mode = 'hidden'; });
+        // French subtitles are on by default when available; otherwise every
+        // track starts hidden (the custom CC control drives visibility).
+        const tracks = Array.from(this.video.textTracks);
+        const fr = tracks.findIndex((t) => (t.language || '').toLowerCase().startsWith('fr'));
+        if (fr >= 0) {
+            this.activeTrack = fr;
+            tracks[fr].mode = 'showing';
+            this.ccBtn.classList.add('active');
+        } else {
+            tracks.forEach((t) => { t.mode = 'hidden'; });
+        }
         this.ccBtn.hidden = this.subtitles.length === 0;
-        this.ccBtn.classList.remove('active');
     }
 
     cycleSubtitle() {
@@ -701,12 +734,13 @@ export class Player {
     play() { return this.video.play().catch(() => {}); }
 
     destroyHls() { if (this.hls) { this.hls.destroy(); this.hls = null; } }
-    destroyDash() { if (this.dash) { try { this.dash.reset(); } catch { /* */ } this.dash = null; } }
+    destroyDash() { clearTimeout(this._dashAudioCheckT); if (this.dash) { try { this.dash.reset(); } catch { /* */ } this.dash = null; } }
 
     destroy() {
         clearInterval(this._progressTimer);
         clearTimeout(this._hideTimer);
         clearTimeout(this._watchdog);
+        clearTimeout(this._dashAudioCheckT);
         document.removeEventListener('click', this._docClick);
         document.removeEventListener('fullscreenchange', this._fsChange);
         this.destroyHls();

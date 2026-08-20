@@ -34,6 +34,14 @@ class StreamController extends Controller
         if (BlockedTitle::query()->where('term', $v['subjectId'])->exists()) {
             abort(404, 'Content unavailable.');
         }
+        // Music and other blocked subject types are never playable (they are
+        // already hidden from every display surface; this blocks deep links).
+        $type = (int) ($v['subjectType'] ?? 0);
+        foreach ((array) config('moviebox.blocked_subject_types', []) as $blocked) {
+            if ((int) $blocked === $type) {
+                abort(404, 'Content unavailable.');
+            }
+        }
         // The debug payload (upstream diagnostics) is only built on an explicit
         // ?debug=1 request, which also bypasses the endpoint cache below.
         $debug = $request->boolean('debug');
@@ -1567,6 +1575,7 @@ class StreamController extends Controller
             'season' => ['sometimes', 'integer', 'min:0'],
             'episode' => ['sometimes', 'integer', 'min:0'],
             'title' => ['sometimes', 'nullable', 'string', 'max:300'],
+            'subjectType' => ['sometimes', 'integer', 'min:0', 'max:9'],
         ]);
 
         return [
@@ -1574,6 +1583,7 @@ class StreamController extends Controller
             'season' => (int) ($validated['season'] ?? 0),
             'episode' => (int) ($validated['episode'] ?? 0),
             'title' => trim((string) ($validated['title'] ?? '')),
+            'subjectType' => (int) ($validated['subjectType'] ?? 0),
         ];
     }
 
